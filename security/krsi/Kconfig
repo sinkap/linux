@@ -1,0 +1,9 @@
+config SECURITY_KRSI
+	bool "KRSI LSM support"
+	depends on SECURITY
+	default n
+	help
+	  This selects the Kernel Runtime Security Instrumentation LSM which allows dynamic
+	  instrumentation of the security hooks with eBPF programs.
+
+	  If you are unsure how to answer this question, answer N.
