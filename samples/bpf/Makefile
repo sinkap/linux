@@ -4,8 +4,6 @@ BPF_SAMPLES_PATH ?= $(abspath $(srctree)/$(src))
 TOOLS_PATH := $(BPF_SAMPLES_PATH)/../../tools
 
 # List of programs to build
-hostprogs-y := test_lru_dist
-hostprogs-y += sock_example
 hostprogs-y += fds_example
 hostprogs-y += sockex1
 hostprogs-y += lsm
@@ -15,7 +13,6 @@ hostprogs-y += tracex1
 hostprogs-y += tracex2
 hostprogs-y += tracex3
 hostprogs-y += tracex4
-hostprogs-y += tracex5
 hostprogs-y += tracex6
 hostprogs-y += tracex7
 hostprogs-y += test_probe_write_user
@@ -27,7 +24,6 @@ hostprogs-y += map_perf_test
 hostprogs-y += test_overhead
 hostprogs-y += test_cgrp2_array_pin
 hostprogs-y += test_cgrp2_attach
-hostprogs-y += test_cgrp2_attach2
 hostprogs-y += test_cgrp2_sock
 hostprogs-y += test_cgrp2_sock2
 hostprogs-y += xdp1
@@ -49,12 +45,10 @@ hostprogs-y += xdp_rxq_info
 hostprogs-y += syscall_tp
 hostprogs-y += cpustat
 hostprogs-y += xdp_adjust_tail
-hostprogs-y += xdpsock
 hostprogs-y += xdp_fwd
 hostprogs-y += task_fd_query
 hostprogs-y += xdp_sample_pkts
 hostprogs-y += ibumad
-hostprogs-y += hbm
 
 # Libbpf dependencies
 LIBBPF = $(TOOLS_PATH)/lib/bpf/libbpf.a
@@ -107,7 +101,6 @@ xdp_rxq_info-objs := xdp_rxq_info_user.o
 syscall_tp-objs := bpf_load.o syscall_tp_user.o
 cpustat-objs := bpf_load.o cpustat_user.o
 xdp_adjust_tail-objs := xdp_adjust_tail_user.o
-xdpsock-objs := xdpsock_user.o
 xdp_fwd-objs := xdp_fwd_user.o
 task_fd_query-objs := bpf_load.o task_fd_query_user.o $(TRACE_HELPERS)
 xdp_sample_pkts-objs := xdp_sample_pkts_user.o $(TRACE_HELPERS)
