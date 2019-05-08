@@ -1,3 +1,3 @@
 obj-$(CONFIG_SECURITY_KRSI) := krsi.o
 
-bpf-y := krsi_lsm.o
+krsi-y := krsi_fs.o krsi.o ops.o

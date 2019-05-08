@@ -1,6 +1,7 @@
 config SECURITY_KRSI
 	bool "KRSI LSM support"
 	depends on SECURITY
+	select SECURITYFS
 	default n
 	help
 	  This selects the Kernel Runtime Security Instrumentation LSM which allows dynamic
