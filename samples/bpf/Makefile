@@ -8,6 +8,7 @@ hostprogs-y := test_lru_dist
 hostprogs-y += sock_example
 hostprogs-y += fds_example
 hostprogs-y += sockex1
+hostprogs-y += lsm
 hostprogs-y += sockex2
 hostprogs-y += sockex3
 hostprogs-y += tracex1
@@ -63,6 +64,7 @@ TRACE_HELPERS := ../../tools/testing/selftests/bpf/trace_helpers.o
 
 fds_example-objs := fds_example.o
 sockex1-objs := sockex1_user.o
+lsm-objs := lsm_user.o $(TRACE_HELPERS)
 sockex2-objs := sockex2_user.o
 sockex3-objs := bpf_load.o sockex3_user.o
 tracex1-objs := bpf_load.o tracex1_user.o
@@ -115,6 +117,7 @@ hbm-objs := bpf_load.o hbm.o $(CGROUP_HELPERS)
 # Tell kbuild to always build the programs
 always := $(hostprogs-y)
 always += sockex1_kern.o
+always += lsm_kern.o
 always += sockex2_kern.o
 always += sockex3_kern.o
 always += tracex1_kern.o
@@ -181,6 +184,7 @@ HOSTCFLAGS_bpf_load.o += -I$(objtree)/usr/include -Wno-unused-variable
 HOSTCFLAGS_trace_helpers.o += -I$(srctree)/tools/lib/bpf/
 
 HOSTCFLAGS_trace_output_user.o += -I$(srctree)/tools/lib/bpf/
+HOSTCFLAGS_lsm_user.o += -I$(srctree)/tools/lib/bpf/
 HOSTCFLAGS_offwaketime_user.o += -I$(srctree)/tools/lib/bpf/
 HOSTCFLAGS_spintest_user.o += -I$(srctree)/tools/lib/bpf/
 HOSTCFLAGS_trace_event_user.o += -I$(srctree)/tools/lib/bpf/
