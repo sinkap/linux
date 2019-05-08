@@ -184,7 +184,7 @@ HOSTCFLAGS_bpf_load.o += -I$(objtree)/usr/include -Wno-unused-variable
 HOSTCFLAGS_trace_helpers.o += -I$(srctree)/tools/lib/bpf/
 
 HOSTCFLAGS_trace_output_user.o += -I$(srctree)/tools/lib/bpf/
-HOSTCFLAGS_lsm_user.o += -I$(srctree)/tools/lib/bpf/
+HOSTCFLAGS_lsm_user.o += -I$(srctree)/tools/lib/bpf/ -I$(srctree)/tools/include/uapi -static -DDEBUG
 HOSTCFLAGS_offwaketime_user.o += -I$(srctree)/tools/lib/bpf/
 HOSTCFLAGS_spintest_user.o += -I$(srctree)/tools/lib/bpf/
 HOSTCFLAGS_trace_event_user.o += -I$(srctree)/tools/lib/bpf/
@@ -193,6 +193,7 @@ HOSTCFLAGS_task_fd_query_user.o += -I$(srctree)/tools/lib/bpf/
 HOSTCFLAGS_xdp_sample_pkts_user.o += -I$(srctree)/tools/lib/bpf/
 
 KBUILD_HOSTLDLIBS		+= $(LIBBPF) -lelf
+HOSTLDFLAGS_lsm 		+= -static
 HOSTLDLIBS_tracex4		+= -lrt
 HOSTLDLIBS_trace_output	+= -lrt
 HOSTLDLIBS_map_perf_test	+= -lrt
