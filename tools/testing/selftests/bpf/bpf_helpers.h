@@ -291,6 +291,8 @@ static int (*bpf_get_numa_node_id)(void) =
 static int (*bpf_probe_read_str)(void *ctx, __u32 size,
 				 const void *unsafe_ptr) =
 	(void *) BPF_FUNC_probe_read_str;
+static int (*krsi_get_bprm_envs)(void *ctx, void *buf, __u32 size) =
+	(void *) BPF_FUNC_krsi_get_bprm_envs;
 static unsigned int (*bpf_get_socket_uid)(void *ctx) =
 	(void *) BPF_FUNC_get_socket_uid;
 static unsigned int (*bpf_set_hash)(void *ctx, __u32 hash) =
