@@ -16,6 +16,7 @@
 #include "krsi_fs.h"
 
 enum krsi_hook_type {
+	BPRM_CHECK_SECURITY,
 	__MAX_KRSI_HOOK_TYPE,
 };
 

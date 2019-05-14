@@ -20,3 +20,5 @@
  *
  *   KRSI_HOOK_INIT(TYPE, LSM_HOOK, KRSI_HOOK_FN)
  */
+KRSI_HOOK_INIT(BPRM_CHECK_SECURITY, bprm_check_security,
+	       krsi_bprm_check_security)
