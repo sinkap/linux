@@ -17,6 +17,8 @@
 #include <linux/bpf.h>
 #include <linux/security.h>
 #include <linux/krsi.h>
+#include <linux/binfmts.h>
+#include <linux/highmem.h>
 
 #include "include/krsi_init.h"
 #include "include/krsi_fs.h"
@@ -78,12 +80,123 @@ static bool krsi_prog_is_valid_access(int off, int size,
 					 const struct bpf_prog *prog,
 					 struct bpf_insn_access_aux *info)
 {
+	if (off < 0 || off >= sizeof(struct linux_binprm))
+		return false;
 	if (type != BPF_READ)
 		return false;
 	if (off % size != 0)
 		return false;
 	return true;
+	/*
+	 * Assertion for 32 bit to make sure last 8 byte access
+	 * (BPF_DW) to the last 4 byte member is disallowed.
+	 */
+	if (off + size > sizeof(struct linux_binprm))
+		return false;
+
+	return true;
 }
+
+static struct page *get_arg_page(struct linux_binprm *bprm, unsigned long pos)
+{
+	struct page *page;
+	int ret;
+	unsigned int gup_flags = FOLL_FORCE;
+
+	/*
+	 * We are doing an exec().  'current' is the process
+	 * doing the exec and bprm->mm is the new process's mm.
+	 */
+	ret = get_user_pages_remote(current, bprm->mm, pos, 1, gup_flags,
+			&page, NULL, NULL);
+	if (ret <= 0)
+		return NULL;
+
+	return page;
+}
+
+static int bprm_dump_env(struct linux_binprm *bprm, char *buffer)
+{
+	int i = 0;
+	unsigned long offset;
+	char *kaddr;
+	struct page *page;
+	unsigned long p = bprm->p;
+	int argc = bprm->argc;
+	int envc = bprm->envc;
+
+	if (!bprm->envc)
+	        return 0;
+
+
+	do {
+	        offset = p & ~PAGE_MASK;
+	        page = get_arg_page(bprm, p);
+	        if (!page)
+			return -EFAULT;
+		kaddr = kmap_atomic(page);
+
+	        for (; offset < PAGE_SIZE; offset++, p++) {
+	                char c = kaddr[offset];
+	                if (c) {
+	                        if (argc)
+	                                continue;
+	                        if (envc) {
+	                                buffer[i++] = c;
+	                                if (unlikely(i) > PAGE_SIZE)
+						return -ENAMETOOLONG;
+	                                continue;
+	                        }
+	                }
+	                if (argc) {
+	                        argc--;
+	                        continue;
+	                }
+	                if (envc) {
+	                        buffer[i++] = c;
+	                        if (unlikely(i) > PAGE_SIZE)
+					return -ENAMETOOLONG;
+	                        envc--;
+	                        continue;
+	                }
+	        }
+	        kunmap_atomic(kaddr);
+	        put_page(page);
+	} while (offset == PAGE_SIZE && envc != 0);
+
+	return i - 1;
+
+}
+
+BPF_CALL_3(krsi_get_bprm_envs, struct linux_binprm *, bprm, void *, dest,
+	   u32, size)
+{
+	int len;
+	char *buffer;
+
+	buffer = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!buffer)
+	        return -ENOMEM;
+
+	len = bprm_dump_env(bprm, buffer);
+	if (len < 0) {
+		goto out;
+	}
+	memcpy(dest, buffer, len);
+
+out:
+	kfree(buffer);
+	return len;
+}
+
+static const struct bpf_func_proto krsi_get_bprm_envs_proto = {
+	.func		= krsi_get_bprm_envs,
+	.gpl_only	= true,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
+	.arg3_type	= ARG_CONST_SIZE_OR_ZERO,
+};
 
 BPF_CALL_5(krsi_event_output, void *, log,
 	   struct bpf_map *, map, u64, flags, void *, data, u64, size)
@@ -112,6 +225,8 @@ krsi_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 	switch (func_id) {
 	case BPF_FUNC_map_lookup_elem:
 		return &bpf_map_lookup_elem_proto;
+	case BPF_FUNC_krsi_get_bprm_envs:
+		return &krsi_get_bprm_envs_proto;
 	case BPF_FUNC_perf_event_output:
 		return &krsi_event_output_proto;
 	default:
