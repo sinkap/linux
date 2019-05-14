@@ -16,6 +16,7 @@
 #include <linux/mount.h>
 #include <linux/filter.h>
 #include <linux/bpf.h>
+#include <linux/binfmts.h>
 
 #include "include/krsi_init.h"
 
@@ -25,6 +26,13 @@ struct krsi_hook krsi_hooks_list[] = {
 	#include "include/hooks.h"
 	#undef KRSI_HOOK_INIT
 };
+
+static int krsi_bprm_check_security(struct linux_binprm *bprm)
+{
+	int ret;
+	KRSI_RUN_PROGS(BPRM_CHECK_SECURITY, bprm, ret);
+	return 0;
+}
 
 static struct security_hook_list krsi_hooks[] __lsm_ro_after_init = {
 	#define KRSI_HOOK_INIT(TYPE, NAME, IMPL) LSM_HOOK_INIT(NAME, IMPL),
