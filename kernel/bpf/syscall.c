@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2011-2014 PLUMgrid, http://plumgrid.com
  */
+#include <crypto/sha2.h>
 #include <linux/bpf.h>
 #include <linux/bpf-cgroup.h>
 #include <linux/bpf_trace.h>
@@ -4992,6 +4993,35 @@ done:
 	return 0;
 }
 
+static int bpf_map_get_hash(struct bpf_map *map, bpfptr_t hash_buf, u32 hash_buf_len)
+{
+	void *hash;
+	int err;
+
+	if (hash_buf_len < SHA256_DIGEST_SIZE)
+		return -EINVAL;
+	if (!map->ops->map_get_hash)
+		return -EINVAL;
+
+	hash = kvmalloc(SHA256_DIGEST_SIZE, GFP_USER | __GFP_NOWARN);
+	if (!hash)
+		return -ENOMEM;
+
+	err = map->ops->map_get_hash(map, SHA256_DIGEST_SIZE, hash);
+	if (err != 0)
+		goto free_value;
+
+	err = -EFAULT;
+	if (copy_to_bpfptr(hash_buf, hash, SHA256_DIGEST_SIZE) != 0)
+		goto free_value;
+
+	return SHA256_DIGEST_SIZE;
+free_value:
+	kvfree(hash);
+	return err;
+}
+
+
 static int bpf_map_get_info_by_fd(struct file *file,
 				  struct bpf_map *map,
 				  const union bpf_attr *attr,
@@ -5010,6 +5040,8 @@ static int bpf_map_get_info_by_fd(struct file *file,
 	info_len = min_t(u32, sizeof(info), info_len);
 
 	memset(&info, 0, sizeof(info));
+	if (copy_from_bpfptr(&info, uinfo, info_len))
+		return -EFAULT;
 
 	info.type = map->map_type;
 	info.id = map->id;
@@ -5033,6 +5065,16 @@ static int bpf_map_get_info_by_fd(struct file *file,
 		err = bpf_map_offload_info_fill(&info, map);
 		if (err)
 			return err;
+	}
+
+	if (info.hash) {
+		bpfptr_t uhash = make_bpfptr(info.hash, uattr.is_kernel);
+
+		err = bpf_map_get_hash(map, uhash, info.hash_len);
+		if (err < 0)
+			return err;
+
+		info.hash_len = err;
 	}
 
 	if (copy_to_bpfptr(uinfo, &info, info_len) ||
