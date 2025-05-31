@@ -65,6 +65,11 @@ static inline int copy_to_bpfptr_offset(bpfptr_t dst, size_t offset,
 	return copy_to_sockptr_offset((sockptr_t) dst, offset, src, size);
 }
 
+static inline int copy_to_bpfptr(bpfptr_t dst, const void *src, size_t size)
+{
+	return copy_to_sockptr_offset((sockptr_t) dst, 0, src, size);
+}
+
 static inline void *kvmemdup_bpfptr_noprof(bpfptr_t src, size_t len)
 {
 	void *p = kvmalloc_noprof(len, GFP_USER | __GFP_NOWARN);

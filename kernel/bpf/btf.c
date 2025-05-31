@@ -8011,59 +8011,60 @@ struct btf *btf_get_by_fd(int fd)
 
 int btf_get_info_by_fd(const struct btf *btf,
 		       const union bpf_attr *attr,
-		       union bpf_attr __user *uattr)
+		       bpfptr_t uattr)
 {
-	struct bpf_btf_info __user *uinfo;
+	bpfptr_t uinfo = make_bpfptr(attr->info.info, uattr.is_kernel);
 	struct bpf_btf_info info;
 	u32 info_copy, btf_copy;
-	void __user *ubtf;
-	char __user *uname;
+	bpfptr_t ubtf;
+	bpfptr_t uname;
 	u32 uinfo_len, uname_len, name_len;
 	int ret = 0;
 
-	uinfo = u64_to_user_ptr(attr->info.info);
 	uinfo_len = attr->info.info_len;
 
 	info_copy = min_t(u32, uinfo_len, sizeof(info));
 	memset(&info, 0, sizeof(info));
-	if (copy_from_user(&info, uinfo, info_copy))
+	if (copy_from_bpfptr(&info, uinfo, info_copy))
 		return -EFAULT;
 
 	info.id = btf->id;
-	ubtf = u64_to_user_ptr(info.btf);
+	ubtf = make_bpfptr(info.btf, uattr.is_kernel);
 	btf_copy = min_t(u32, btf->data_size, info.btf_size);
-	if (copy_to_user(ubtf, btf->data, btf_copy))
+	if (copy_to_bpfptr(ubtf, btf->data, btf_copy))
 		return -EFAULT;
 	info.btf_size = btf->data_size;
 
 	info.kernel_btf = btf->kernel_btf;
 
-	uname = u64_to_user_ptr(info.name);
+	uname = make_bpfptr(info.name, uattr.is_kernel);
 	uname_len = info.name_len;
-	if (!uname ^ !uname_len)
+	if (bpfptr_is_null(uname) ^ !uname_len)
 		return -EINVAL;
 
 	name_len = strlen(btf->name);
 	info.name_len = name_len;
 
-	if (uname) {
+	if (!bpfptr_is_null(uname)) {
 		if (uname_len >= name_len + 1) {
-			if (copy_to_user(uname, btf->name, name_len + 1))
+			if (copy_to_bpfptr(uname, btf->name, name_len + 1))
 				return -EFAULT;
 		} else {
 			char zero = '\0';
 
-			if (copy_to_user(uname, btf->name, uname_len - 1))
+			if (copy_to_bpfptr(uname, btf->name, uname_len - 1))
 				return -EFAULT;
-			if (put_user(zero, uname + uname_len - 1))
+			if (copy_to_bpfptr_offset(uname, uname_len - 1, &zero, sizeof(zero)))
 				return -EFAULT;
 			/* let user-space know about too short buffer */
 			ret = -ENOSPC;
 		}
 	}
 
-	if (copy_to_user(uinfo, &info, info_copy) ||
-	    put_user(info_copy, &uattr->info.info_len))
+	if (copy_to_bpfptr(uinfo, &info, info_copy) ||
+	    copy_to_bpfptr_offset(uattr,
+				  offsetof(union bpf_attr, info.info_len),
+				  &info_copy, sizeof(info_copy)))
 		return -EFAULT;
 
 	return ret;

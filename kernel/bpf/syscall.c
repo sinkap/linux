@@ -4698,24 +4698,26 @@ static int set_info_rec_size(struct bpf_prog_info *info)
 static int bpf_prog_get_info_by_fd(struct file *file,
 				   struct bpf_prog *prog,
 				   const union bpf_attr *attr,
-				   union bpf_attr __user *uattr)
+				   bpfptr_t uattr)
 {
-	struct bpf_prog_info __user *uinfo = u64_to_user_ptr(attr->info.info);
+	bpfptr_t uinfo = make_bpfptr(attr->info.info, uattr.is_kernel);
 	struct btf *attach_btf = bpf_prog_get_target_btf(prog);
 	struct bpf_prog_info info;
 	u32 info_len = attr->info.info_len;
 	struct bpf_prog_kstats stats;
-	char __user *uinsns;
+	bpfptr_t uinsns;
 	u32 ulen;
 	int err;
 
-	err = bpf_check_uarg_tail_zero(USER_BPFPTR(uinfo), sizeof(info), info_len);
-	if (err)
-		return err;
+	if (!bpfptr_is_kernel(uinfo)) {
+		err = bpf_check_uarg_tail_zero(uinfo, sizeof(info), info_len);
+		if (err)
+			return err;
+	}
 	info_len = min_t(u32, sizeof(info), info_len);
 
 	memset(&info, 0, sizeof(info));
-	if (copy_from_user(&info, uinfo, info_len))
+	if (copy_from_bpfptr(&info, uinfo, info_len))
 		return -EFAULT;
 
 	info.type = prog->type;
@@ -4733,12 +4735,14 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	info.nr_map_ids = prog->aux->used_map_cnt;
 	ulen = min_t(u32, info.nr_map_ids, ulen);
 	if (ulen) {
-		u32 __user *user_map_ids = u64_to_user_ptr(info.map_ids);
+		bpfptr_t user_map_ids = make_bpfptr(info.map_ids, uattr.is_kernel);
 		u32 i;
 
 		for (i = 0; i < ulen; i++)
-			if (put_user(prog->aux->used_maps[i]->id,
-				     &user_map_ids[i])) {
+			if (copy_to_bpfptr_offset(
+				    user_map_ids, i,
+				    &prog->aux->used_maps[i]->id,
+				    sizeof(prog->aux->used_maps[i]->id))) {
 				mutex_unlock(&prog->aux->used_maps_mutex);
 				return -EFAULT;
 			}
@@ -4782,9 +4786,9 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 		insns_sanitized = bpf_insn_prepare_dump(prog, file->f_cred);
 		if (!insns_sanitized)
 			return -ENOMEM;
-		uinsns = u64_to_user_ptr(info.xlated_prog_insns);
+		uinsns = make_bpfptr(info.xlated_prog_insns, info.xlated_prog_len);
 		ulen = min_t(u32, info.xlated_prog_len, ulen);
-		fault = copy_to_user(uinsns, insns_sanitized, ulen);
+		fault = copy_to_bpfptr(uinsns, insns_sanitized, ulen);
 		kfree(insns_sanitized);
 		if (fault)
 			return -EFAULT;
@@ -4814,7 +4818,7 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 
 	if (info.jited_prog_len && ulen) {
 		if (bpf_dump_raw_ok(file->f_cred)) {
-			uinsns = u64_to_user_ptr(info.jited_prog_insns);
+			uinsns = make_bpfptr(info.jited_prog_insns, uattr.is_kernel);
 			ulen = min_t(u32, info.jited_prog_len, ulen);
 
 			/* for multi-function programs, copy the JITed
@@ -4829,15 +4833,15 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 					len = prog->aux->func[i]->jited_len;
 					len = min_t(u32, len, free);
 					img = (u8 *) prog->aux->func[i]->bpf_func;
-					if (copy_to_user(uinsns, img, len))
+					if (copy_to_bpfptr(uinsns, img, len))
 						return -EFAULT;
-					uinsns += len;
+					bpfptr_add(&uinsns, len);
 					free -= len;
 					if (!free)
 						break;
 				}
 			} else {
-				if (copy_to_user(uinsns, prog->bpf_func, ulen))
+				if (copy_to_bpfptr(uinsns, prog->bpf_func, ulen))
 					return -EFAULT;
 			}
 		} else {
@@ -4850,25 +4854,27 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	if (ulen) {
 		if (bpf_dump_raw_ok(file->f_cred)) {
 			unsigned long ksym_addr;
-			u64 __user *user_ksyms;
+			bpfptr_t user_ksyms;
 			u32 i;
 
 			/* copy the address of the kernel symbol
 			 * corresponding to each function
 			 */
 			ulen = min_t(u32, info.nr_jited_ksyms, ulen);
-			user_ksyms = u64_to_user_ptr(info.jited_ksyms);
+			user_ksyms = make_bpfptr(info.jited_ksyms, uattr.is_kernel);
 			if (prog->aux->func_cnt) {
 				for (i = 0; i < ulen; i++) {
 					ksym_addr = (unsigned long)
 						prog->aux->func[i]->bpf_func;
-					if (put_user((u64) ksym_addr,
-						     &user_ksyms[i]))
+					if (copy_to_bpfptr_offset(
+						    user_ksyms, i, &ksym_addr,
+						    sizeof(ksym_addr)))
 						return -EFAULT;
 				}
 			} else {
 				ksym_addr = (unsigned long) prog->bpf_func;
-				if (put_user((u64) ksym_addr, &user_ksyms[0]))
+				if (copy_to_bpfptr(user_ksyms, &ksym_addr,
+						   sizeof(ksym_addr)))
 					return -EFAULT;
 			}
 		} else {
@@ -4910,11 +4916,11 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	ulen = info.nr_func_info;
 	info.nr_func_info = prog->aux->func_info_cnt;
 	if (info.nr_func_info && ulen) {
-		char __user *user_finfo;
+		bpfptr_t user_finfo;
 
-		user_finfo = u64_to_user_ptr(info.func_info);
+		user_finfo = make_bpfptr(info.func_info, uattr.is_kernel);
 		ulen = min_t(u32, info.nr_func_info, ulen);
-		if (copy_to_user(user_finfo, prog->aux->func_info,
+		if (copy_to_bpfptr(user_finfo, prog->aux->func_info,
 				 info.func_info_rec_size * ulen))
 			return -EFAULT;
 	}
@@ -4922,11 +4928,11 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	ulen = info.nr_line_info;
 	info.nr_line_info = prog->aux->nr_linfo;
 	if (info.nr_line_info && ulen) {
-		__u8 __user *user_linfo;
+		bpfptr_t user_linfo;
 
-		user_linfo = u64_to_user_ptr(info.line_info);
+		user_linfo = make_bpfptr(info.line_info, uattr.is_kernel);
 		ulen = min_t(u32, info.nr_line_info, ulen);
-		if (copy_to_user(user_linfo, prog->aux->linfo,
+		if (copy_to_bpfptr(user_linfo, prog->aux->linfo,
 				 info.line_info_rec_size * ulen))
 			return -EFAULT;
 	}
@@ -4939,14 +4945,14 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	if (info.nr_jited_line_info && ulen) {
 		if (bpf_dump_raw_ok(file->f_cred)) {
 			unsigned long line_addr;
-			__u64 __user *user_linfo;
+			bpfptr_t user_linfo;
 			u32 i;
 
-			user_linfo = u64_to_user_ptr(info.jited_line_info);
+			user_linfo = make_bpfptr(info.jited_line_info, uattr.is_kernel);
 			ulen = min_t(u32, info.nr_jited_line_info, ulen);
 			for (i = 0; i < ulen; i++) {
 				line_addr = (unsigned long)prog->aux->jited_linfo[i];
-				if (put_user((__u64)line_addr, &user_linfo[i]))
+				if (copy_to_bpfptr_offset(user_linfo, i, &line_addr, sizeof(line_addr)))
 					return -EFAULT;
 			}
 		} else {
@@ -4977,8 +4983,10 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	}
 
 done:
-	if (copy_to_user(uinfo, &info, info_len) ||
-	    put_user(info_len, &uattr->info.info_len))
+	if (copy_to_bpfptr(uinfo, &info, info_len) ||
+	    copy_to_bpfptr_offset(uattr,
+				  offsetof(union bpf_attr, info.info_len),
+				  &info_len, sizeof(info_len)))
 		return -EFAULT;
 
 	return 0;
@@ -4987,19 +4995,22 @@ done:
 static int bpf_map_get_info_by_fd(struct file *file,
 				  struct bpf_map *map,
 				  const union bpf_attr *attr,
-				  union bpf_attr __user *uattr)
+				  bpfptr_t uattr)
 {
-	struct bpf_map_info __user *uinfo = u64_to_user_ptr(attr->info.info);
+	bpfptr_t uinfo = make_bpfptr(attr->info.info, uattr.is_kernel);
 	struct bpf_map_info info;
 	u32 info_len = attr->info.info_len;
 	int err;
 
-	err = bpf_check_uarg_tail_zero(USER_BPFPTR(uinfo), sizeof(info), info_len);
-	if (err)
-		return err;
+	if (!bpfptr_is_kernel(uinfo)) {
+		err = bpf_check_uarg_tail_zero(uinfo, sizeof(info), info_len);
+		if (err)
+			return err;
+	}
 	info_len = min_t(u32, sizeof(info), info_len);
 
 	memset(&info, 0, sizeof(info));
+
 	info.type = map->map_type;
 	info.id = map->id;
 	info.key_size = map->key_size;
@@ -5024,8 +5035,8 @@ static int bpf_map_get_info_by_fd(struct file *file,
 			return err;
 	}
 
-	if (copy_to_user(uinfo, &info, info_len) ||
-	    put_user(info_len, &uattr->info.info_len))
+	if (copy_to_bpfptr(uinfo, &info, info_len) ||
+	    copy_to_bpfptr_offset(uattr, offsetof(union bpf_attr, info.info_len), &info_len, sizeof(info_len)))
 		return -EFAULT;
 
 	return 0;
@@ -5034,15 +5045,18 @@ static int bpf_map_get_info_by_fd(struct file *file,
 static int bpf_btf_get_info_by_fd(struct file *file,
 				  struct btf *btf,
 				  const union bpf_attr *attr,
-				  union bpf_attr __user *uattr)
+				  bpfptr_t uattr)
 {
-	struct bpf_btf_info __user *uinfo = u64_to_user_ptr(attr->info.info);
+	bpfptr_t uinfo = make_bpfptr(attr->info.info, uattr.is_kernel);
 	u32 info_len = attr->info.info_len;
 	int err;
 
-	err = bpf_check_uarg_tail_zero(USER_BPFPTR(uinfo), sizeof(*uinfo), info_len);
-	if (err)
-		return err;
+	if (!bpfptr_is_kernel(uinfo)) {
+		err = bpf_check_uarg_tail_zero(
+			uinfo, sizeof(struct bpf_btf_info), info_len);
+		if (err)
+			return err;
+	}
 
 	return btf_get_info_by_fd(btf, attr, uattr);
 }
@@ -5050,20 +5064,23 @@ static int bpf_btf_get_info_by_fd(struct file *file,
 static int bpf_link_get_info_by_fd(struct file *file,
 				  struct bpf_link *link,
 				  const union bpf_attr *attr,
-				  union bpf_attr __user *uattr)
+				  bpfptr_t uattr)
 {
-	struct bpf_link_info __user *uinfo = u64_to_user_ptr(attr->info.info);
+	bpfptr_t uinfo = make_bpfptr(attr->info.info, uattr.is_kernel);
 	struct bpf_link_info info;
 	u32 info_len = attr->info.info_len;
 	int err;
 
-	err = bpf_check_uarg_tail_zero(USER_BPFPTR(uinfo), sizeof(info), info_len);
-	if (err)
-		return err;
+	if (!bpfptr_is_kernel(uinfo)) {
+		err = bpf_check_uarg_tail_zero(
+			uinfo, sizeof(struct bpf_btf_info), info_len);
+		if (err)
+			return err;
+	}
 	info_len = min_t(u32, sizeof(info), info_len);
 
 	memset(&info, 0, sizeof(info));
-	if (copy_from_user(&info, uinfo, info_len))
+	if (copy_from_bpfptr(&info, uinfo, info_len))
 		return -EFAULT;
 
 	info.type = link->type;
@@ -5077,8 +5094,8 @@ static int bpf_link_get_info_by_fd(struct file *file,
 			return err;
 	}
 
-	if (copy_to_user(uinfo, &info, info_len) ||
-	    put_user(info_len, &uattr->info.info_len))
+	if (copy_to_bpfptr(uinfo, &info, info_len) ||
+	    copy_to_bpfptr_offset(uattr, offsetof(union bpf_attr, info.info_len), &info_len, sizeof(info_len)))
 		return -EFAULT;
 
 	return 0;
@@ -5087,8 +5104,7 @@ static int bpf_link_get_info_by_fd(struct file *file,
 
 #define BPF_OBJ_GET_INFO_BY_FD_LAST_FIELD info.info
 
-static int bpf_obj_get_info_by_fd(const union bpf_attr *attr,
-				  union bpf_attr __user *uattr)
+static int bpf_obj_get_info_by_fd(const union bpf_attr *attr, bpfptr_t uattr)
 {
 	if (CHECK_ATTR(BPF_OBJ_GET_INFO_BY_FD))
 		return -EINVAL;
@@ -5098,11 +5114,9 @@ static int bpf_obj_get_info_by_fd(const union bpf_attr *attr,
 		return -EBADFD;
 
 	if (fd_file(f)->f_op == &bpf_prog_fops)
-		return bpf_prog_get_info_by_fd(fd_file(f), fd_file(f)->private_data, attr,
-					      uattr);
+		return bpf_prog_get_info_by_fd(fd_file(f), fd_file(f)->private_data, attr, uattr);
 	else if (fd_file(f)->f_op == &bpf_map_fops)
-		return bpf_map_get_info_by_fd(fd_file(f), fd_file(f)->private_data, attr,
-					     uattr);
+		return bpf_map_get_info_by_fd(fd_file(f), fd_file(f)->private_data, attr, uattr);
 	else if (fd_file(f)->f_op == &btf_fops)
 		return bpf_btf_get_info_by_fd(fd_file(f), fd_file(f)->private_data, attr, uattr);
 	else if (fd_file(f)->f_op == &bpf_link_fops || fd_file(f)->f_op == &bpf_link_fops_poll)
@@ -5872,7 +5886,7 @@ static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 		err = bpf_map_get_fd_by_id(&attr);
 		break;
 	case BPF_OBJ_GET_INFO_BY_FD:
-		err = bpf_obj_get_info_by_fd(&attr, uattr.user);
+		err = bpf_obj_get_info_by_fd(&attr, uattr);
 		break;
 	case BPF_RAW_TRACEPOINT_OPEN:
 		err = bpf_raw_tracepoint_open(&attr);
@@ -5967,6 +5981,7 @@ BPF_CALL_3(bpf_sys_bpf, int, cmd, union bpf_attr *, attr, u32, attr_size)
 	case BPF_BTF_LOAD:
 	case BPF_LINK_CREATE:
 	case BPF_RAW_TRACEPOINT_OPEN:
+	case BPF_OBJ_GET_INFO_BY_FD:
 		break;
 	default:
 		return -EINVAL;
