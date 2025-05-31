@@ -23,6 +23,7 @@
 #include <linux/err.h>
 #include <linux/perf_event.h>
 #include <linux/sizes.h>
+#include <linux/keyctl.h>
 
 #include <bpf/bpf.h>
 #include <bpf/btf.h>
@@ -1875,6 +1876,8 @@ static int try_loader(struct gen_loader_opts *gen)
 {
 	struct bpf_load_and_run_opts opts = {};
 	struct bpf_loader_ctx *ctx;
+	__s64 sig_size;
+	char sig_buf[BPF_MAX_SIG_SIZE];
 	int ctx_sz = sizeof(*ctx) + 64 * max(sizeof(struct bpf_map_desc),
 					     sizeof(struct bpf_prog_desc));
 	int log_buf_sz = (1u << 24) - 1;
@@ -1898,6 +1901,30 @@ static int try_loader(struct gen_loader_opts *gen)
 	opts.insns = gen->insns;
 	opts.insns_sz = gen->insns_sz;
 	fds_before = count_open_fds();
+
+	if (sign_progs) {
+		if (!use_loader) {
+			p_err("-L must be specified for signing support");
+			return -EINVAL;
+		}
+
+		if (private_key_path == NULL || cert_path == NULL) {
+			p_err("invalid private key or x509 cert, not signing the program");
+			return -EINVAL;
+		}
+
+		sig_size = bpf_data_sign(private_key_path, cert_path,
+					 opts.insns, opts.insns_sz, sig_buf,
+					 4096);
+		if (sig_size < 0)
+			p_err("failed to create a signature");
+
+		if (sig_size > 0) {
+			opts.signature = sig_buf;
+			opts.signature_size = sig_size;
+			opts.system_keyring_id = 1;
+		}
+	}
 	err = bpf_load_and_run(&opts);
 	fd_delta = count_open_fds() - fds_before;
 	if (err < 0 || verifier_logs) {

@@ -84,6 +84,9 @@ extern bool relaxed_maps;
 extern bool use_loader;
 extern struct btf *base_btf;
 extern struct hashmap *refs_table;
+extern bool sign_progs;
+extern const char *private_key_path;
+extern const char *cert_path;
 
 void __printf(1, 2) p_err(const char *fmt, ...);
 void __printf(1, 2) p_info(const char *fmt, ...);
@@ -171,6 +174,11 @@ int map_parse_fd(int *argc, char ***argv);
 int map_parse_fds(int *argc, char ***argv, int **fds);
 int map_parse_fd_and_info(int *argc, char ***argv, struct bpf_map_info *info,
 			  __u32 *info_len);
+
+#define BPF_MAX_SIG_SIZE 4096
+__s64 bpf_data_sign(const char *private_key_path, const char *x509_cert_path,
+		    const void *data, size_t data_size, void *sig_buf,
+		    size_t max_sig_len);
 
 struct bpf_prog_linfo;
 #if defined(HAVE_LLVM_SUPPORT) || defined(HAVE_LIBBFD_SUPPORT)

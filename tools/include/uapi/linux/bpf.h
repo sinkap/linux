@@ -1590,8 +1590,8 @@ union bpf_attr {
 
 		__aligned_u64 	signature;
 		__u32 		signature_size;
-		u32 user_keyring_serial;
-		u64 system_keyring_id;
+		__u32 user_keyring_serial;
+		__u64 system_keyring_id;
 	};
 
 	struct { /* anonymous struct used by BPF_OBJ_* commands */
