@@ -1352,23 +1352,11 @@ __bpf_kfunc void bpf_key_put(struct bpf_key *bkey)
 }
 
 #ifdef CONFIG_SYSTEM_DATA_VERIFICATION
-/**
- * bpf_verify_pkcs7_signature - verify a PKCS#7 signature
- * @data_p: data to verify
- * @sig_p: signature of the data
- * @trusted_keyring: keyring with keys trusted for signature verification
- *
- * Verify the PKCS#7 signature *sig_ptr* against the supplied *data_ptr*
- * with keys in a keyring referenced by *trusted_keyring*.
- *
- * Return: 0 on success, a negative value on error.
- */
-__bpf_kfunc int bpf_verify_pkcs7_signature(struct bpf_dynptr *data_p,
-			       struct bpf_dynptr *sig_p,
-			       struct bpf_key *trusted_keyring)
+
+int __bpf_verify_pkcs7_signature(struct bpf_dynptr_kern *data_ptr,
+				 struct bpf_dynptr_kern *sig_ptr,
+				 struct bpf_key *trusted_keyring)
 {
-	struct bpf_dynptr_kern *data_ptr = (struct bpf_dynptr_kern *)data_p;
-	struct bpf_dynptr_kern *sig_ptr = (struct bpf_dynptr_kern *)sig_p;
 	const void *data, *sig;
 	u32 data_len, sig_len;
 	int ret;
@@ -1394,8 +1382,28 @@ __bpf_kfunc int bpf_verify_pkcs7_signature(struct bpf_dynptr *data_p,
 
 	return verify_pkcs7_signature(data, data_len, sig, sig_len,
 				      trusted_keyring->key,
-				      VERIFYING_UNSPECIFIED_SIGNATURE, NULL,
+				      VERIFYING_BPF_SIGNATURE, NULL,
 				      NULL);
+}
+
+/**
+ * bpf_verify_pkcs7_signature - verify a PKCS#7 signature
+ * @data_p: data to verify
+ * @sig_p: signature of the data
+ * @trusted_keyring: keyring with keys trusted for signature verification
+ *
+ * Verify the PKCS#7 signature *sig_ptr* against the supplied *data_ptr*
+ * with keys in a keyring referenced by *trusted_keyring*.
+ *
+ * Return: 0 on success, a negative value on error.
+ */
+__bpf_kfunc int bpf_verify_pkcs7_signature(struct bpf_dynptr *data_p,
+			       struct bpf_dynptr *sig_p,
+			       struct bpf_key *trusted_keyring)
+{
+	return __bpf_verify_pkcs7_signature((struct bpf_dynptr_kern *)data_p,
+					    (struct bpf_dynptr_kern *)sig_p,
+					    trusted_keyring);
 }
 #endif /* CONFIG_SYSTEM_DATA_VERIFICATION */
 

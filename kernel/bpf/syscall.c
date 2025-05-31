@@ -2755,8 +2755,46 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
 	}
 }
 
+static int bpf_prog_verify_signature(struct bpf_prog *prog, union bpf_attr *attr, bpfptr_t uattr)
+{
+	bpfptr_t usig = make_bpfptr(attr->signature, uattr.is_kernel);
+	struct bpf_dynptr_kern sig_ptr, insns_ptr;
+	struct bpf_key *key;
+	void *sig;
+	int err = 0;
+
+	if (attr->user_keyring_serial && attr->system_keyring_id)
+		return -EINVAL;
+
+	sig = kvmemdup_bpfptr(usig, attr->signature_size);
+	if (!sig)
+		return -ENOMEM;
+
+	bpf_dynptr_init(&sig_ptr, sig, BPF_DYNPTR_TYPE_LOCAL, 0,
+			attr->signature_size);
+	bpf_dynptr_init(&insns_ptr, prog->insnsi, BPF_DYNPTR_TYPE_LOCAL, 0,
+			prog->len * sizeof(struct bpf_insn));
+
+	if (attr->user_keyring_serial)
+		key = bpf_lookup_user_key(attr->user_keyring_serial, 0);
+	else if (attr->system_keyring_id)
+		key = bpf_lookup_system_key(attr->system_keyring_id);
+
+	if (IS_ERR(key)) {
+		err = PTR_ERR(key);
+		goto free_sig;
+	}
+
+	err =  __bpf_verify_pkcs7_signature(&insns_ptr, &sig_ptr, key);
+
+	bpf_key_put(key);
+free_sig:
+	kvfree(sig);
+	return err;
+}
+
 /* last field in 'union bpf_attr' used by this command */
-#define BPF_PROG_LOAD_LAST_FIELD fd_array_cnt
+#define BPF_PROG_LOAD_LAST_FIELD system_keyring_id
 
 static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 {
@@ -2919,6 +2957,12 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 
 	/* eBPF programs must be GPL compatible to use GPL-ed functions */
 	prog->gpl_compatible = license_is_gpl_compatible(license) ? 1 : 0;
+
+	if (attr->signature) {
+		err = bpf_prog_verify_signature(prog, attr, uattr);
+		if (err)
+			goto free_prog;
+	}
 
 	prog->orig_prog = NULL;
 	prog->jited = 0;
