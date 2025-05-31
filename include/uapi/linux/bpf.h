@@ -1587,6 +1587,11 @@ union bpf_attr {
 		 * continuous.
 		 */
 		__u32		fd_array_cnt;
+
+		__aligned_u64 	signature;
+		__u32 		signature_size;
+		__u32 user_keyring_serial;
+		__u64 system_keyring_id;
 	};
 
 	struct { /* anonymous struct used by BPF_OBJ_* commands */
