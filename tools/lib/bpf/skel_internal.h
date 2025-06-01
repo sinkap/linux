@@ -314,6 +314,10 @@ static inline int bpf_load_and_run(struct bpf_load_and_run_opts *opts)
 {
 	const size_t prog_load_attr_sz = offsetofend(union bpf_attr, system_keyring_id);
 	const size_t test_run_attr_sz = offsetofend(union bpf_attr, test);
+	struct bpf_map_info info = {};
+	__u32 ilen = sizeof(info);
+	__u64 sha[4];
+	int i;
 	int map_fd = -1, prog_fd = -1, key = 0, err;
 	union bpf_attr attr;
 
@@ -330,6 +334,16 @@ static inline int bpf_load_and_run(struct bpf_load_and_run_opts *opts)
 		set_err;
 		goto out;
 	}
+
+	info.hash = (__u64) sha;
+	info.hash_len = sizeof(sha);
+
+	err = bpf_obj_get_info_by_fd(map_fd, &info, &ilen);
+	if (err < 0)
+		goto out;
+
+	for (i = 0; i < 4; i++)
+		printf("sha from kernel[%d] = %llu\n", i, sha[i]);
 
 	memset(&attr, 0, prog_load_attr_sz);
 	attr.prog_type = BPF_PROG_TYPE_SYSCALL;
