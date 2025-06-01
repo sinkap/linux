@@ -235,6 +235,11 @@ OPTIONS
     creating the maps, and loading the programs (see **bpftool prog tracelog**
     as a way to dump those messages).
 
+-S <signing_key.pem> <cert.x509>, --sign <signing_key.pem> <cert.x509>
+    Generate a PCKS#7 signature blob in the skeleton for the loader
+    programs using the supplied signing key and x509 certificate and will
+    implicitly enable loader programs i.e.  **--use-loader**.
+
 EXAMPLES
 ========
 **# bpftool prog show**
