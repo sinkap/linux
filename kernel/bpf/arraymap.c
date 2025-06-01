@@ -182,6 +182,8 @@ static int array_map_get_hash(struct bpf_map *map, u32 hash_buf_size,
 
 	bpf_sha256(array->value, (u64)array->elem_size * array->map.max_entries,
 	       hash_buf);
+
+	// Check here if the map is frozen, we will memoize it if is frozen.
 	memcpy(array->map.sha, hash_buf, sizeof(array->map.sha));
 	return 0;
 }

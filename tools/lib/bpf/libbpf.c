@@ -8629,7 +8629,9 @@ static int bpf_object_load(struct bpf_object *obj, int extra_log_level, const ch
 	 * permit cross-endian creation of "light skeleton".
 	 */
 	if (obj->gen_loader) {
-		bpf_gen__init(obj->gen_loader, extra_log_level, obj->nr_programs, obj->nr_maps);
+		bpf_gen__init(obj->gen_loader, extra_log_level,
+			      obj->nr_programs, obj->nr_maps);
+		bpf_gen__signature_match(obj->gen_loader);
 	} else if (!is_native_endianness(obj)) {
 		pr_warn("object '%s': loading non-native endianness is unsupported\n", obj->name);
 		return libbpf_err(-LIBBPF_ERRNO__ENDIAN);
@@ -14160,4 +14162,9 @@ void bpf_object__destroy_skeleton(struct bpf_object_skeleton *s)
 	free(s->maps);
 	free(s->progs);
 	free(s);
+}
+
+int bpf_gen_hash_insn_offset(struct bpf_object *obj, int index)
+{
+	return obj->gen_loader->hash_insn_offset[index];
 }

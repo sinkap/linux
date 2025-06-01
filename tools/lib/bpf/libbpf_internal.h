@@ -735,5 +735,6 @@ int elf_resolve_pattern_offsets(const char *binary_path, const char *pattern,
 				 unsigned long **poffsets, size_t *pcnt);
 
 int probe_fd(int fd);
+int bpf_gen_hash_insn_offset(struct bpf_object *obj, int index);
 
 #endif /* __LIBBPF_LIBBPF_INTERNAL_H */

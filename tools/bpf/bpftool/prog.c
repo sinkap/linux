@@ -20,6 +20,9 @@
 #include <sys/syscall.h>
 #include <dirent.h>
 
+#include <openssl/evp.h>
+#include <openssl/err.h>
+
 #include <linux/err.h>
 #include <linux/perf_event.h>
 #include <linux/sizes.h>
@@ -1872,7 +1875,66 @@ static int count_open_fds(void)
 	return cnt;
 }
 
-static int try_loader(struct gen_loader_opts *gen)
+
+// Function to print errors from the OpenSSL error stack
+static void handle_openssl_errors(void)
+{
+    ERR_print_errors_fp(stderr);
+    abort();
+}
+
+static void compute_sha256(const void *data, size_t data_size, __u64 *sha_out)
+{
+	EVP_MD_CTX *mdctx;
+	const EVP_MD *md;
+	unsigned char digest[32]; // SHA256 produces a 32-byte (256-bit) hash
+	unsigned int digest_len;
+
+	// 1. Create and initialize a message digest context
+	mdctx = EVP_MD_CTX_new();
+	if (mdctx == NULL) {
+		handle_openssl_errors();
+	}
+
+	// 2. Specify the digest algorithm (SHA256)
+	md = EVP_sha256();
+	if (md == NULL) {
+		handle_openssl_errors();
+	}
+
+	// 3. Initialize the digest operation
+	if (EVP_DigestInit_ex(mdctx, md, NULL) != 1) {
+		EVP_MD_CTX_free(mdctx);
+		handle_openssl_errors();
+	}
+
+	// 4. Provide the data to be hashed (using the generic data pointer and size)
+	if (EVP_DigestUpdate(mdctx, data, data_size) != 1) {
+		EVP_MD_CTX_free(mdctx);
+		handle_openssl_errors();
+	}
+
+	// 5. Finalize the hash and retrieve the 32-byte digest
+	if (EVP_DigestFinal_ex(mdctx, digest, &digest_len) != 1) {
+		EVP_MD_CTX_free(mdctx);
+		handle_openssl_errors();
+	}
+
+	// 6. Clean up the context
+	EVP_MD_CTX_free(mdctx);
+
+	// Ensure the digest length is correct for SHA256
+	if (digest_len != 32) {
+		fprintf(stderr, "SHA256 digest length is not 32 bytes!\n");
+		abort();
+	}
+
+	// 7. Copy the 32-byte digest into the __u64[4] output array.
+	// This is the safest and most portable way to handle the type conversion.
+	memcpy(sha_out, digest, 32);
+}
+
+static int try_loader(struct gen_loader_opts *gen, struct bpf_object *obj)
 {
 	struct bpf_load_and_run_opts opts = {};
 	struct bpf_loader_ctx *ctx;
@@ -1883,6 +1945,8 @@ static int try_loader(struct gen_loader_opts *gen)
 	int log_buf_sz = (1u << 24) - 1;
 	int err, fds_before, fd_delta;
 	char *log_buf = NULL;
+	__u64 sha[4];
+	int i;
 
 	ctx = alloca(ctx_sz);
 	memset(ctx, 0, ctx_sz);
@@ -1901,6 +1965,19 @@ static int try_loader(struct gen_loader_opts *gen)
 	opts.insns = gen->insns;
 	opts.insns_sz = gen->insns_sz;
 	fds_before = count_open_fds();
+
+	compute_sha256(opts.data, opts.data_sz, sha);
+
+	for (i = 0; i < 4; i++) {
+		struct bpf_insn *insn =
+			(struct bpf_insn *)(opts.insns +
+					    bpf_gen_hash_insn_offset(obj, i));
+		assert(insn[0].imm == -8055);
+		assert(insn[1].imm == -8055);
+		insn[0].imm = (__u32)sha[i];
+		insn[1].imm = sha[i] >> 32;
+		printf("sha from user[%d] = %llu at %d\n", i, sha[i], bpf_gen_hash_insn_offset(obj, i));
+	}
 
 	if (sign_progs) {
 		if (!use_loader) {
@@ -1977,7 +2054,7 @@ static int do_loader(int argc, char **argv)
 		dump_xlated_plain(&dd, (void *)gen.insns, gen.insns_sz, false, false);
 		kernel_syms_destroy(&dd);
 	}
-	err = try_loader(&gen);
+	err = try_loader(&gen, obj);
 err_close_obj:
 	bpf_object__close(obj);
 	return err;

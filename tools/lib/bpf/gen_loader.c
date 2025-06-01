@@ -557,6 +557,34 @@ void bpf_gen__map_create(struct bpf_gen *gen,
 		emit_sys_close_stack(gen, stack_off(inner_map_fd));
 }
 
+void bpf_gen__signature_match(struct bpf_gen *gen)
+{
+
+	__s64 off =
+		-(gen->insn_cur - gen->insn_start - gen->cleanup_label) / 8 - 1;
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		emit2(gen, BPF_LD_IMM64_RAW_FULL(BPF_REG_1, BPF_PSEUDO_MAP_IDX,
+						 0, 0, 0, 0));
+		emit(gen, BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_1, i * sizeof(__u64)));
+		// Lower bytes first.
+		gen->hash_insn_offset[i] = gen->insn_cur - gen->insn_start;
+		emit2(gen,
+		      BPF_LD_IMM64_RAW_FULL(BPF_REG_3, 0, 0, 0, -8055, -8055));
+
+		debug_regs(gen, BPF_REG_2, BPF_REG_3, "R2=%%llu, R3=%%llu");
+		if (is_simm16(off)) {
+			emit(gen, BPF_MOV64_IMM(BPF_REG_7, -8055));
+			emit(gen,
+			     BPF_JMP_REG(BPF_JNE, BPF_REG_2, BPF_REG_3, off));
+		} else {
+			gen->error = -ERANGE;
+			emit(gen, BPF_JMP_IMM(BPF_JA, 0, 0, -1));
+		}
+	}
+}
+
 void bpf_gen__record_attach_target(struct bpf_gen *gen, const char *attach_name,
 				   enum bpf_attach_type type)
 {
