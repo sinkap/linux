@@ -525,6 +525,7 @@ int main(int argc, char **argv)
 			break;
 		case 'S':
 			sign_progs = true;
+			use_loader = true;
 			private_key_path = optarg;
 			cert_path = argv[optind];
 			optind++;

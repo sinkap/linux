@@ -51,6 +51,7 @@ static inline void *u64_to_ptr(__u64 ptr)
 	})
 
 #define ERR_MAX_LEN	1024
+#define MAX_SIG_SIZE	1024
 
 #define BPF_TAG_FMT	"%02hhx%02hhx%02hhx%02hhx%02hhx%02hhx%02hhx%02hhx"
 
@@ -174,11 +175,6 @@ int map_parse_fd(int *argc, char ***argv);
 int map_parse_fds(int *argc, char ***argv, int **fds);
 int map_parse_fd_and_info(int *argc, char ***argv, struct bpf_map_info *info,
 			  __u32 *info_len);
-
-#define BPF_MAX_SIG_SIZE 4096
-__s64 bpf_data_sign(const char *private_key_path, const char *x509_cert_path,
-		    const void *data, size_t data_size, void *sig_buf,
-		    size_t max_sig_len);
 
 struct bpf_prog_linfo;
 #if defined(HAVE_LLVM_SUPPORT) || defined(HAVE_LIBBFD_SUPPORT)

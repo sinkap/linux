@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <openssl/sha.h>
 #include <libelf.h>
 #include "relo_core.h"
 
@@ -735,6 +736,11 @@ int elf_resolve_pattern_offsets(const char *binary_path, const char *pattern,
 				 unsigned long **poffsets, size_t *pcnt);
 
 int probe_fd(int fd);
-int bpf_gen_hash_insn_offset(struct bpf_object *obj, int index);
+
+#define SHA256_DWORD_SIZE SHA256_DIGEST_LENGTH / sizeof(__u64)
+__s64 libbpf_data_sign(const char *private_key_path, const char *x509_cert_path,
+		    const void *data, size_t data_size, void *sig_buf,
+		    size_t max_sig_len);
+int libbpf_sha256(const void *data, size_t data_size, __u64 sha_out[4]);
 
 #endif /* __LIBBPF_LIBBPF_INTERNAL_H */

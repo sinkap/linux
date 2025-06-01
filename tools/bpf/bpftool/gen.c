@@ -689,7 +689,7 @@ static int gen_trace(struct bpf_object *obj, const char *obj_name, const char *h
 {
 	DECLARE_LIBBPF_OPTS(gen_loader_opts, opts);
 	struct bpf_map *map;
-	char sig_buf[BPF_MAX_SIG_SIZE];
+	char sig_buf[MAX_SIG_SIZE];
 	__s64 sig_len;
 	char ident[256];
 	int err = 0;
@@ -715,8 +715,8 @@ static int gen_trace(struct bpf_object *obj, const char *obj_name, const char *h
 			return -EINVAL;
 		}
 
-		sig_len = bpf_data_sign(private_key_path, cert_path, opts.insns,
-					opts.insns_sz, sig_buf, BPF_MAX_SIG_SIZE);
+		sig_len = libbpf_data_sign(private_key_path, cert_path, opts.insns,
+					opts.insns_sz, sig_buf, MAX_SIG_SIZE);
 
 		if (sig_len < 0)
 			p_err("failed to create a signature");

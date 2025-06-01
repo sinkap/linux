@@ -110,6 +110,7 @@ static void emit2(struct bpf_gen *gen, struct bpf_insn insn1, struct bpf_insn in
 
 static int add_data(struct bpf_gen *gen, const void *data, __u32 size);
 static void emit_sys_close_blob(struct bpf_gen *gen, int blob_off);
+static void bpf_gen__signature_match(struct bpf_gen *gen);
 
 void bpf_gen__init(struct bpf_gen *gen, int log_level, int nr_progs, int nr_maps)
 {
@@ -152,6 +153,8 @@ void bpf_gen__init(struct bpf_gen *gen, int log_level, int nr_progs, int nr_maps
 	/* R7 contains the error code from sys_bpf. Copy it into R0 and exit. */
 	emit(gen, BPF_MOV64_REG(BPF_REG_0, BPF_REG_7));
 	emit(gen, BPF_EXIT_INSN());
+	if (gen->opts->gen_hash)
+		bpf_gen__signature_match(gen);
 }
 
 static int add_data(struct bpf_gen *gen, const void *data, __u32 size)
@@ -368,6 +371,28 @@ static void emit_sys_close_blob(struct bpf_gen *gen, int blob_off)
 	__emit_sys_close(gen);
 }
 
+static int compute_sha_udpate_offsets(struct bpf_gen *gen)
+{
+	__u64 sha[SHA256_DWORD_SIZE];
+	int i, err;
+
+	err = libbpf_sha256(gen->data_start, gen->data_cur - gen->data_start, sha);
+	if (err < 0) {
+		pr_warn("sha256 computation of the metadata failed");
+		return err;
+	}
+	for (i = 0; i < SHA256_DWORD_SIZE; i++) {
+		struct bpf_insn *insn =
+			(struct bpf_insn *)(gen->insn_start + gen->hash_insn_offset[i]);
+		// assert(insn[0].imm == -8055);
+		// assert(insn[1].imm == -8055);
+		insn[0].imm = (__u32)sha[i];
+		insn[1].imm = sha[i] >> 32;
+		printf("sha from user[%d] = %llu at %d\n", i, sha[i], gen->hash_insn_offset[i]);
+	}
+	return 0;
+}
+
 int bpf_gen__finish(struct bpf_gen *gen, int nr_progs, int nr_maps)
 {
 	int i;
@@ -394,6 +419,12 @@ int bpf_gen__finish(struct bpf_gen *gen, int nr_progs, int nr_maps)
 			      blob_fd_array_off(gen, i));
 	emit(gen, BPF_MOV64_IMM(BPF_REG_0, 0));
 	emit(gen, BPF_EXIT_INSN());
+	if (gen->opts->gen_hash) {
+		gen->error = compute_sha_udpate_offsets(gen);
+		if (gen->error)
+			return gen->error;
+	}
+
 	pr_debug("gen: finish %s\n", errstr(gen->error));
 	if (!gen->error) {
 		struct gen_loader_opts *opts = gen->opts;
@@ -557,7 +588,7 @@ void bpf_gen__map_create(struct bpf_gen *gen,
 		emit_sys_close_stack(gen, stack_off(inner_map_fd));
 }
 
-void bpf_gen__signature_match(struct bpf_gen *gen)
+static void bpf_gen__signature_match(struct bpf_gen *gen)
 {
 
 	__s64 off =
