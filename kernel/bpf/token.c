@@ -135,19 +135,9 @@ int bpf_token_create(union bpf_attr *attr)
 		return err;
 
 	userns = sb->s_user_ns;
-	/*
-	 * Enforce that creators of BPF tokens are in the same user
-	 * namespace as the BPF FS instance. This makes reasoning about
-	 * permissions a lot easier and we can always relax this later.
-	 */
-	if (current_user_ns() != userns)
-		return -EPERM;
+
 	if (!ns_capable(userns, CAP_BPF))
 		return -EPERM;
-
-	/* Creating BPF token in init_user_ns doesn't make much sense. */
-	if (current_user_ns() == &init_user_ns)
-		return -EOPNOTSUPP;
 
 	mnt_opts = sb->s_fs_info;
 	if (mnt_opts->delegate_cmds == 0 &&

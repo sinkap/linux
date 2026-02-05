@@ -72,6 +72,7 @@ struct bpf_load_and_run_opts {
 	void *signature;
 	__u32 signature_sz;
 	__s32 keyring_id;
+	__s32 token_fd;
 	void *excl_prog_hash;
 	__u32 excl_prog_hash_sz;
 };
@@ -400,6 +401,9 @@ static inline int bpf_load_and_run(struct bpf_load_and_run_opts *opts)
 		pr_warn("signatures are not supported from bpf_preload\n");
 #endif
 	attr.keyring_id = opts->keyring_id;
+	attr.map_token_fd = opts->token_fd;
+	attr.prog_token_fd = opts->token_fd;
+	attr.btf_token_fd = opts->token_fd;
 	memcpy(attr.prog_name, "__loader.prog", sizeof("__loader.prog"));
 	attr.fd_array = (long) &map_fd;
 	attr.log_level = opts->ctx->log_level;

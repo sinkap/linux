@@ -829,6 +829,7 @@ static int gen_trace(struct bpf_object *obj, const char *obj_name, const char *h
 			opts.excl_prog_hash = (void *)opts_excl_hash;		\n\
 			opts.excl_prog_hash_sz = sizeof(opts_excl_hash) - 1;	\n\
 			opts.keyring_id = skel->keyring_id;			\n\
+			opts.token_fd = skel->token_fd;				\n\
 		");
 	}
 
@@ -1411,6 +1412,10 @@ static int do_skeleton(int argc, char **argv)
 		codegen("\
 		\n\
 			__s32 keyring_id;				   \n\
+		");
+		codegen("\
+		\n\
+			__s32 token_fd;					   \n\
 		");
 	}
 
