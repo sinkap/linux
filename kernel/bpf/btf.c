@@ -29,6 +29,8 @@
 #include <linux/sysfs.h>
 #include <linux/overflow.h>
 
+struct btf *btf_vmlinux;
+
 #include <net/netfilter/nf_bpf_link.h>
 
 #include <net/sock.h>
@@ -6032,7 +6034,6 @@ errout_free:
 
 extern char __start_BTF[];
 extern char __stop_BTF[];
-extern struct btf *btf_vmlinux;
 
 #define BPF_MAP_TYPE(_id, _ops)
 #define BPF_LINK_TYPE(_id, _name)

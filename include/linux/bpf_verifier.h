@@ -1004,6 +1004,9 @@ struct bpf_verifier_impl {
 			      u16 btf_fd_idx, u8 **func_addr);
 	void (*free_kfunc_btf_tab)(struct bpf_kfunc_btf_tab *tab);
 	bool (*prog_has_kfunc_call)(const struct bpf_prog *prog);
+	int (*map_set_for_each_callback_args)(struct bpf_verifier_env *env,
+					      struct bpf_func_state *caller,
+					      struct bpf_func_state *callee);
 
 	struct module *owner;
 	const char *name;

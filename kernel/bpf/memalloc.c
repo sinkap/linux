@@ -1043,3 +1043,5 @@ void bpf_mem_alloc_set_dtor(struct bpf_mem_alloc *ma, void (*dtor)(void *obj, vo
  */
 EXPORT_SYMBOL_NS_GPL(bpf_mem_alloc_percpu_init, "BPF_VERIFIER_INTERNAL");
 EXPORT_SYMBOL_NS_GPL(bpf_mem_alloc_percpu_unit_init, "BPF_VERIFIER_INTERNAL");
+
+struct bpf_mem_alloc bpf_global_percpu_ma;

@@ -86,6 +86,13 @@ static bool stub_prog_has_kfunc_call(const struct bpf_prog *prog)
 	return false;
 }
 
+static int stub_map_set_for_each_callback_args(struct bpf_verifier_env *env,
+					       struct bpf_func_state *caller,
+					       struct bpf_func_state *callee)
+{
+	return -ENOENT;
+}
+
 /* Pre-registration fallback.  Active until the built-in verifier
  * registers itself via subsys_initcall.  Owner is NULL so dispatch
  * takes no try_module_get() reference.
@@ -100,6 +107,7 @@ static struct bpf_verifier_impl stub_verifier_impl = {
 	.get_kfunc_addr		= stub_get_kfunc_addr,
 	.free_kfunc_btf_tab	= stub_free_kfunc_btf_tab,
 	.prog_has_kfunc_call	= stub_prog_has_kfunc_call,
+	.map_set_for_each_callback_args = stub_map_set_for_each_callback_args,
 	.owner			= NULL,
 	.name			= "stub",
 	.abi_version		= BPF_VERIFIER_ABI_VERSION,
@@ -353,3 +361,12 @@ bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
 	return ret;
 }
 EXPORT_SYMBOL_NS_GPL(bpf_prog_has_kfunc_call, "BPF_VERIFIER_INTERNAL");
+
+int map_set_for_each_callback_args(struct bpf_verifier_env *env,
+				   struct bpf_func_state *caller,
+				   struct bpf_func_state *callee)
+{
+	return rcu_dereference_check(active_verifier, 1)
+		->map_set_for_each_callback_args(env, caller, callee);
+}
+EXPORT_SYMBOL_NS_GPL(map_set_for_each_callback_args, "BPF_VERIFIER_INTERNAL");

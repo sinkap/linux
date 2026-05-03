@@ -9206,7 +9206,7 @@ static int check_func_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	return 0;
 }
 
-int map_set_for_each_callback_args(struct bpf_verifier_env *env,
+int map_set_for_each_callback_args_impl(struct bpf_verifier_env *env,
 				   struct bpf_func_state *caller,
 				   struct bpf_func_state *callee)
 {
@@ -19652,6 +19652,7 @@ static struct bpf_verifier_impl bpf_builtin_verifier_impl = {
 	.get_kfunc_addr		= bpf_get_kfunc_addr_impl,
 	.free_kfunc_btf_tab	= bpf_free_kfunc_btf_tab_impl,
 	.prog_has_kfunc_call	= bpf_prog_has_kfunc_call_impl,
+	.map_set_for_each_callback_args = map_set_for_each_callback_args_impl,
 #ifdef MODULE
 	.owner			= THIS_MODULE,
 	.name			= "builtin-mod",

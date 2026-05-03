@@ -6627,3 +6627,14 @@ EXPORT_SYMBOL_NS_GPL(bpf_map_offload_ops, "BPF_VERIFIER_INTERNAL");
 EXPORT_SYMBOL_NS_GPL(bpf_map_write_active, "BPF_VERIFIER_INTERNAL");
 EXPORT_SYMBOL_NS_GPL(bpf_syscall_verifier_ops, "BPF_VERIFIER_INTERNAL");
 EXPORT_SYMBOL_NS_GPL(btf_record_find, "BPF_VERIFIER_INTERNAL");
+
+int bpf_prog_ctx_arg_info_init(struct bpf_prog *prog,
+			       const struct bpf_ctx_arg_aux *info, u32 cnt)
+{
+	prog->aux->ctx_arg_info = kmemdup_array(info, cnt, sizeof(*info), GFP_KERNEL_ACCOUNT);
+	prog->aux->ctx_arg_info_size = cnt;
+
+	return prog->aux->ctx_arg_info ? 0 : -ENOMEM;
+}
+
+EXPORT_SYMBOL_NS_GPL(bpf_prog_ctx_arg_info_init, "BPF_VERIFIER_INTERNAL");

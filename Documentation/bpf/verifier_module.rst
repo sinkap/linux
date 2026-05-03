@@ -148,8 +148,18 @@ What v1 does and doesn't deliver
   the built-in.  Used to validate the dispatch and drain paths
   end-to-end.
 
-**v1 does NOT yet deliver a fully loadable replacement verifier**,
-but it does most of the preparatory work:
+**v1 builds and loads as `bpf_verifier.ko`.**  Set
+``CONFIG_BPF_VERIFIER_REPLACEABLE=m`` to package the verifier set
+(``verifier.c``, ``liveness.c``, ``const_fold.c``, ``fixups.c``,
+``cfg.c``, ``states.c``, ``backtrack.c``, ``check_btf.c``) into a
+loadable module instead of building it into vmlinux.  The kernel boots
+with a stub verifier and ``bpf(BPF_PROG_LOAD)`` returns ``-ENOENT``
+until ``modprobe bpf_verifier`` registers the real implementation;
+``modprobe -r bpf_verifier`` reverts to the stub.  Verified end-to-end
+on x86_64 (bpftrace BEGIN probe loaded, JIT'd and ran through the
+loaded module verifier).
+
+The mechanism rests on:
 
 * 237 verifier-callable symbols across ``kernel/bpf/``,
   ``kernel/trace/``, ``kernel/events/``, ``arch/x86/``, ``net/core/``,
@@ -174,22 +184,22 @@ but it does most of the preparatory work:
   ``=y`` (the default) the verifier set is built into vmlinux as
   today.
 
-What still blocks ``CONFIG_BPF_VERIFIER_REPLACEABLE=m``:
+Known caveat: module BTF validation
+-----------------------------------
 
-* A handful of global *data* symbols defined in the verifier set are
-  read from vmlinux files: ``btf_vmlinux`` (read by ``btf.c`` and
-  ``bpf_struct_ops.c``), ``bpf_global_percpu_ma`` (read by
-  ``helpers.c``).  These need to be moved to vmlinux-resident files
-  (likely ``btf.c`` and ``memalloc.c``).
+When CONFIG_DEBUG_INFO_BTF_MODULES=y the kernel rejects
+``bpf_verifier.ko`` with ``failed to validate module [bpf_verifier]
+BTF: -22`` because the verifier set defines BPF-subsystem types that
+also appear in the vmlinux BTF, and the per-module BTF parser doesn't
+yet know how to reconcile the duplicates.  Workaround until that's
+addressed::
 
-* A few cross-boundary functions still live in the verifier set:
-  ``map_set_for_each_callback_args`` (referenced from map_ops vtables
-  in ``arraymap.c`` etc.), ``bpf_prog_ctx_arg_info_init`` (called
-  from ``bpf_iter.c``).  Same treatment: move to vmlinux or add to
-  the impl table.
+    objcopy --remove-section=.BTF kernel/bpf/bpf_verifier.ko \\
+            kernel/bpf/bpf_verifier.ko
 
-These are concrete, mechanical, and bounded.  Once they're done, the
-``=m`` build links cleanly and the ``.ko`` is loadable.
+The module loads and runs correctly with BTF stripped; only kfunc/BTF-
+typed-pointer facilities that depend on the *module's* BTF are
+affected, and the verifier set doesn't define any kfuncs of its own.
 
 The non-goals carry over from the design doc:
 

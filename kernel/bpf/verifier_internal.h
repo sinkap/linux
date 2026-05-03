@@ -263,6 +263,7 @@ void bpf_mark_reg_not_init(const struct bpf_verifier_env *env,
 			   struct bpf_reg_state *reg);
 void bpf_mark_reg_unknown_imprecise(struct bpf_reg_state *reg);
 int unbound_reg_init(void);
+extern struct btf *btf_vmlinux;
 void bpf_mark_all_scalars_precise(struct bpf_verifier_env *env,
 				  struct bpf_verifier_state *st);
 void bpf_clear_singular_ids(struct bpf_verifier_env *env, struct bpf_verifier_state *st);
@@ -615,3 +616,6 @@ bool bpf_prog_has_kfunc_call_impl(const struct bpf_prog *prog);
 #define bpf_get_kfunc_addr		bpf_get_kfunc_addr_impl
 #define bpf_free_kfunc_btf_tab		bpf_free_kfunc_btf_tab_impl
 #define bpf_prog_has_kfunc_call		bpf_prog_has_kfunc_call_impl
+int map_set_for_each_callback_args_impl(struct bpf_verifier_env *env,
+					struct bpf_func_state *caller,
+					struct bpf_func_state *callee);
