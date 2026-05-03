@@ -8,6 +8,7 @@
 #include <linux/types.h>
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
+#include "verifier_internal.h"
 #include <linux/math64.h>
 #include <linux/string.h>
 

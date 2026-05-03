@@ -3,6 +3,7 @@
 #include <linux/bpf.h>
 #include <linux/btf.h>
 #include <linux/bpf_verifier.h>
+#include "verifier_internal.h"
 #include <linux/filter.h>
 #include <linux/vmalloc.h>
 #include <linux/bsearch.h>

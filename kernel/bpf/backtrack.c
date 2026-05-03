@@ -2,6 +2,7 @@
 /* Copyright (c) 2026 Meta Platforms, Inc. and affiliates. */
 #include <linux/bpf.h>
 #include <linux/bpf_verifier.h>
+#include "verifier_internal.h"
 #include <linux/filter.h>
 #include <linux/bitmap.h>
 

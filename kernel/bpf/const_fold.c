@@ -2,6 +2,7 @@
 /* Copyright (c) 2026 Meta Platforms, Inc. and affiliates. */
 
 #include <linux/bpf_verifier.h>
+#include "verifier_internal.h"
 
 /*
  * Forward dataflow analysis to determine constant register values at every

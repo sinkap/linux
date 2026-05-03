@@ -2,6 +2,7 @@
 /* Copyright (c) 2025 Meta Platforms, Inc. and affiliates. */
 
 #include <linux/bpf_verifier.h>
+#include "verifier_internal.h"
 #include <linux/btf.h>
 #include <linux/hashtable.h>
 #include <linux/jhash.h>
