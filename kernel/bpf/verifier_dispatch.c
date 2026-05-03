@@ -57,6 +57,7 @@ static struct bpf_verifier_impl stub_verifier_impl = {
 	.check_attach_target	= stub_check_attach_target,
 	.owner			= NULL,
 	.name			= "stub",
+	.abi_version		= BPF_VERIFIER_ABI_VERSION,
 };
 
 static struct bpf_verifier_impl __rcu *active_verifier =
@@ -143,9 +144,21 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 int register_bpf_verifier(struct bpf_verifier_impl *impl)
 {
 	struct bpf_verifier_impl *cur;
+	u32 impl_major, kernel_major;
 
 	if (!impl || !impl->check || !impl->check_attach_target)
 		return -EINVAL;
+
+	impl_major = BPF_VERIFIER_ABI_GET_MAJOR(impl->abi_version);
+	kernel_major = BPF_VERIFIER_ABI_GET_MAJOR(BPF_VERIFIER_ABI_VERSION);
+	if (impl_major != kernel_major) {
+		pr_err("bpf: rejecting verifier '%s' with ABI %u.%u (kernel expects %u.x)\n",
+		       impl->name ?: "(unnamed)",
+		       impl_major,
+		       BPF_VERIFIER_ABI_GET_MINOR(impl->abi_version),
+		       kernel_major);
+		return -ENOEXEC;
+	}
 
 	mutex_lock(&verifier_register_mutex);
 	cur = rcu_dereference_protected(active_verifier,

@@ -19647,6 +19647,7 @@ static struct bpf_verifier_impl bpf_builtin_verifier_impl = {
 	.check_attach_target	= bpf_check_attach_target_impl,
 	.owner			= NULL,
 	.name			= "builtin",
+	.abi_version		= BPF_VERIFIER_ABI_VERSION,
 };
 
 static int __init bpf_builtin_verifier_init(void)

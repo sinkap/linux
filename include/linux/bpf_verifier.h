@@ -928,6 +928,29 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 			    struct bpf_attach_target_info *tgt_info);
 void bpf_free_kfunc_btf_tab(struct bpf_kfunc_btf_tab *tab);
 
+/*
+ * BPF verifier ABI version.
+ *
+ * Bump rules (see register_bpf_verifier()):
+ *   * MAJOR -- layout change to any type that crosses the
+ *     module<->vmlinux boundary (bpf_reg_state, bpf_verifier_log,
+ *     bpf_verifier_env, bpf_insn_aux_data, bpf_func_state,
+ *     bpf_verifier_state, bpf_subprog_info, bpf_retval_range), or
+ *     removal/signature change of a struct bpf_verifier_impl callback.
+ *     Modules built against a different MAJOR are rejected at
+ *     register_bpf_verifier() time.
+ *   * MINOR -- additive change only (e.g. a new optional callback
+ *     appended to struct bpf_verifier_impl).  Older modules continue
+ *     to load; a vmlinux that knows about a newer MINOR can detect the
+ *     module's missing fields and adapt.
+ */
+#define BPF_VERIFIER_ABI_MAJOR	1
+#define BPF_VERIFIER_ABI_MINOR	0
+#define BPF_VERIFIER_ABI_VERSION \
+	(((u32)BPF_VERIFIER_ABI_MAJOR << 16) | (u32)BPF_VERIFIER_ABI_MINOR)
+#define BPF_VERIFIER_ABI_GET_MAJOR(v)	((v) >> 16)
+#define BPF_VERIFIER_ABI_GET_MINOR(v)	((v) & 0xffff)
+
 /**
  * struct bpf_verifier_impl - Pluggable BPF verifier implementation
  * @check: bpf_check() implementation; takes the same arguments as the
@@ -938,6 +961,10 @@ void bpf_free_kfunc_btf_tab(struct bpf_kfunc_btf_tab *tab);
  *         reference for the duration of every call so module unload
  *         cannot race with in-flight verification.
  * @name: short identifier used in dmesg ("builtin", "v6.18-fix", ...).
+ * @abi_version: BPF_VERIFIER_ABI_VERSION the implementation was built
+ *               against.  The dispatcher rejects an impl whose MAJOR
+ *               disagrees with the running kernel's MAJOR -- struct
+ *               layouts crossing the boundary will not match.
  *
  * Registered via register_bpf_verifier() / unregister_bpf_verifier().
  * At any time exactly one implementation is active; the most recently
@@ -956,6 +983,7 @@ struct bpf_verifier_impl {
 				   struct bpf_attach_target_info *tgt_info);
 	struct module *owner;
 	const char *name;
+	u32 abi_version;
 };
 
 /**
