@@ -28,6 +28,19 @@ static bool bpf_verifier_log_attr_valid(const struct bpf_verifier_log *log)
 	return true;
 }
 
+/**
+ * bpf_vlog_init() - Initialize a verifier log for a verification session
+ * @log: log structure to initialize
+ * @log_level: verbosity level (BPF_LOG_LEVEL{1,2}, BPF_LOG_STATS, BPF_LOG_FIXED)
+ * @log_buf: user-space buffer that will receive the log
+ * @log_size: size of @log_buf in bytes
+ *
+ * Public verifier API. Called at the start of a verification session
+ * (bpf_check() and BTF parsing) to set up @log.
+ *
+ * Return: 0 on success, -EINVAL if @log_level/@log_buf/@log_size are
+ * inconsistent.
+ */
 int bpf_vlog_init(struct bpf_verifier_log *log, u32 log_level,
 		  char __user *log_buf, u32 log_size)
 {
@@ -57,6 +70,16 @@ static void bpf_vlog_update_len_max(struct bpf_verifier_log *log, u32 add_len)
 		log->len_max = len;
 }
 
+/**
+ * bpf_verifier_vlog() - Append a formatted message to the verifier log
+ * @log: target log
+ * @fmt: printf-style format string
+ * @args: format arguments
+ *
+ * Public verifier API. va_list variant of bpf_verifier_log_write(). At
+ * BPF_LOG_KERNEL level the message is routed to dmesg via pr_err()
+ * instead of @log->ubuf.
+ */
 void bpf_verifier_vlog(struct bpf_verifier_log *log, const char *fmt,
 		       va_list args)
 {
@@ -146,6 +169,15 @@ fail:
 	log->ubuf = NULL;
 }
 
+/**
+ * bpf_vlog_reset() - Truncate the verifier log back to a previous position
+ * @log: target log
+ * @new_pos: log position to truncate to (must be <= current end position)
+ *
+ * Public verifier API. Used by the verifier to discard speculative log
+ * output (for example after a verification path is pruned). For rotating
+ * logs, also writes a NUL terminator into the user buffer at @new_pos.
+ */
 void bpf_vlog_reset(struct bpf_verifier_log *log, u64 new_pos)
 {
 	char zero = 0;
@@ -223,6 +255,20 @@ static int bpf_vlog_reverse_ubuf(struct bpf_verifier_log *log, int start, int en
 	return 0;
 }
 
+/**
+ * bpf_vlog_finalize() - Finalize a verifier log and report the size used
+ * @log: log structure to finalize (may be NULL or have level == 0)
+ * @log_size_actual: out-param set to the number of bytes the log would
+ *                   have produced if the user buffer were large enough
+ *
+ * Public verifier API. Called at the end of a verification session.
+ * Rotates the user buffer so that its contents start at offset 0 when
+ * the rotating log wrapped, and reports back to userspace whether the
+ * log was truncated.
+ *
+ * Return: 0 on success, -ENOSPC if the user buffer was too small to hold
+ * the entire log, -EFAULT on user-buffer access errors.
+ */
 int bpf_vlog_finalize(struct bpf_verifier_log *log, u32 *log_size_actual)
 {
 	u32 sublen;
@@ -297,9 +343,15 @@ skip_log_rotate:
 	return 0;
 }
 
-/* log_level controls verbosity level of eBPF verifier.
- * bpf_verifier_log_write() is used to dump the verification trace to the log,
- * so the user can figure out what's wrong with the program
+/**
+ * bpf_verifier_log_write() - Append a formatted message to a verifier log
+ * @env: verifier environment whose log to write to
+ * @fmt: printf-style format string
+ *
+ * Public verifier API (EXPORT_SYMBOL_GPL). Convenience wrapper for callers
+ * that already hold a &struct bpf_verifier_env. Writes are dropped at
+ * level 0. Used by the verifier itself and by BTF (kernel/bpf/btf.c) to
+ * emit verification diagnostics.
  */
 __printf(2, 3) void bpf_verifier_log_write(struct bpf_verifier_env *env,
 					   const char *fmt, ...)
@@ -315,6 +367,16 @@ __printf(2, 3) void bpf_verifier_log_write(struct bpf_verifier_env *env,
 }
 EXPORT_SYMBOL_GPL(bpf_verifier_log_write);
 
+/**
+ * bpf_log() - Append a formatted message to a verifier log
+ * @log: target log
+ * @fmt: printf-style format string
+ *
+ * Public verifier API (EXPORT_SYMBOL_GPL). Variant of
+ * bpf_verifier_log_write() for callers that hold a &struct
+ * bpf_verifier_log directly (notably BTF code, which doesn't always have
+ * a verifier env).
+ */
 __printf(2, 3) void bpf_log(struct bpf_verifier_log *log,
 			    const char *fmt, ...)
 {
@@ -535,6 +597,18 @@ static void verbose_snum(struct bpf_verifier_env *env, s64 num)
 		verbose(env, "%#llx", num);
 }
 
+/**
+ * tnum_strn() - Format a tracked-number (tnum) as a printable string
+ * @str: output buffer
+ * @size: size of @str
+ * @a: tnum value to format
+ *
+ * Public verifier API (EXPORT_SYMBOL_GPL). Renders a fully-known tnum as
+ * a decimal/hex constant and a partially-known tnum as "(value; mask)".
+ *
+ * Return: number of bytes that would have been written, in the same
+ * convention as snprintf().
+ */
 int tnum_strn(char *str, size_t size, struct tnum a)
 {
 	/* print as a constant, if tnum is fully known */
