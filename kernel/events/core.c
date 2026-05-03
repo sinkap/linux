@@ -15378,3 +15378,8 @@ struct cgroup_subsys perf_event_cgrp_subsys = {
 #endif /* CONFIG_CGROUP_PERF */
 
 DEFINE_STATIC_CALL_RET0(perf_snapshot_branch_stack, perf_snapshot_branch_stack_t);
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(__SCK__perf_snapshot_branch_stack, "BPF_VERIFIER_INTERNAL");

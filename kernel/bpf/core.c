@@ -3503,3 +3503,31 @@ struct bpf_prog *bpf_prog_find_from_stack(void)
 }
 
 #endif
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(__bpf_free_used_btfs, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(__bpf_free_used_maps, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_global_ma_set, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_jit_add_poke_descriptor, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_jit_blind_constants, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_jit_prog_release_other, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_opcode_in_insntable, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_patch_call_args, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_patch_insn_single, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_prog_alloc_jited_linfo, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_prog_alloc_no_stats, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_prog_calc_tag, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_prog_jit_attempt_done, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_prog_kallsyms_add, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(__bpf_prog_select_runtime, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_remove_insns, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_user_rnd_init_once, "BPF_VERIFIER_INTERNAL");
+
+EXPORT_SYMBOL_NS_GPL(arch_bpf_timed_may_goto, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_jit_inlines_helper_call, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_jit_bypass_spec_v1, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_jit_bypass_spec_v4, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_jit_needs_zext, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_jit_supports_far_kfunc_call, "BPF_VERIFIER_INTERNAL");

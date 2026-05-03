@@ -12579,3 +12579,33 @@ static int init_subsystem(void)
 	return register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING, &bpf_sk_iter_kfunc_set);
 }
 late_initcall(init_subsystem);
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_dynptr_from_skb_rdonly, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_helper_changes_pkt_data, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_sock_common_is_valid_access, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_sock_convert_ctx_access, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_sock_is_valid_access, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_tcp_sock_convert_ctx_access, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_tcp_sock_is_valid_access, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_xdp_sock_convert_ctx_access, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_xdp_sock_is_valid_access, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_sock_ids, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(cg_skb_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(cg_sock_addr_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(cg_sock_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(flow_dissector_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(lwt_in_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(lwt_out_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(lwt_seg6local_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(lwt_xmit_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(sk_filter_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(sk_lookup_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(sk_msg_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(sk_reuseport_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(sk_skb_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(sock_ops_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(tc_cls_act_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(xdp_verifier_ops, "BPF_VERIFIER_INTERNAL");

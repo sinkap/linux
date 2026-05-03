@@ -148,14 +148,48 @@ What v1 does and doesn't deliver
   the built-in.  Used to validate the dispatch and drain paths
   end-to-end.
 
-**v1 does NOT yet deliver a fully loadable replacement verifier.**
-The verifier source set calls into roughly 350 functions across the
-rest of the kernel/BPF subsystem (BTF accessors, map operations, the
-kfunc registry, trampolines, JIT capability queries, ...), most of
-which are not currently ``EXPORT_SYMBOL_GPL``.  A real verifier-as-
-module needs those exports.  The original "Modular BPF" design
-identifies this as the largest single piece of work; it is being
-done as a follow-on series.
+**v1 does NOT yet deliver a fully loadable replacement verifier**,
+but it does most of the preparatory work:
+
+* 237 verifier-callable symbols across ``kernel/bpf/``,
+  ``kernel/trace/``, ``kernel/events/``, ``arch/x86/``, ``net/core/``,
+  ``net/netfilter/``, ``fs/``, ``mm/``, ``lib/`` and ``drivers/media/``
+  are exported with ``EXPORT_SYMBOL_NS_GPL(name, "BPF_VERIFIER_INTERNAL")``.
+  A future verifier module declares ``MODULE_IMPORT_NS("BPF_VERIFIER_INTERNAL")``
+  to resolve them.
+
+* ``struct bpf_verifier_impl`` carries function pointers for the
+  seven helpers the verifier set defines but vmlinux callers (the
+  JIT path in ``core.c``, BTF code in ``btf.c``/``syscall.c``/``inode.c``)
+  invoke during a verifier-driven flow:
+  ``get_btf_vmlinux``, ``patch_insn_data``, ``dup_insn_aux_data``,
+  ``restore_insn_aux_data``, ``get_kfunc_addr``,
+  ``free_kfunc_btf_tab``, ``prog_has_kfunc_call``.  The dispatcher
+  exposes these as ordinary ``EXPORT_SYMBOL_NS_GPL`` wrappers; intra-
+  verifier callers go straight to the ``_impl`` versions via macro
+  redirection in ``kernel/bpf/verifier_internal.h`` (zero overhead in
+  the built-in path).
+
+* The Kconfig symbol ``BPF_VERIFIER_REPLACEABLE`` is a tristate; with
+  ``=y`` (the default) the verifier set is built into vmlinux as
+  today.
+
+What still blocks ``CONFIG_BPF_VERIFIER_REPLACEABLE=m``:
+
+* A handful of global *data* symbols defined in the verifier set are
+  read from vmlinux files: ``btf_vmlinux`` (read by ``btf.c`` and
+  ``bpf_struct_ops.c``), ``bpf_global_percpu_ma`` (read by
+  ``helpers.c``).  These need to be moved to vmlinux-resident files
+  (likely ``btf.c`` and ``memalloc.c``).
+
+* A few cross-boundary functions still live in the verifier set:
+  ``map_set_for_each_callback_args`` (referenced from map_ops vtables
+  in ``arraymap.c`` etc.), ``bpf_prog_ctx_arg_info_init`` (called
+  from ``bpf_iter.c``).  Same treatment: move to vmlinux or add to
+  the impl table.
+
+These are concrete, mechanical, and bounded.  Once they're done, the
+``=m`` build links cleanly and the ``.ko`` is loadable.
 
 The non-goals carry over from the design doc:
 

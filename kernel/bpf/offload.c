@@ -864,3 +864,16 @@ static int __init bpf_offload_init(void)
 }
 
 core_initcall(bpf_offload_init);
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_dev_bound_kfunc_check, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_dev_bound_resolve_kfunc, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_offload_prog_map_match, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_prog_dev_bound_match, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_prog_offload_finalize, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_prog_offload_remove_insns, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_prog_offload_replace_insn, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_prog_offload_verifier_prep, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_prog_offload_verify_insn, "BPF_VERIFIER_INTERNAL");

@@ -260,3 +260,8 @@ bool bpf_token_allow_prog_type(const struct bpf_token *token,
 	return (token->allowed_progs & BIT_ULL(prog_type)) &&
 	       (token->allowed_attachs & BIT_ULL(attach_type));
 }
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_token_capable, "BPF_VERIFIER_INTERNAL");

@@ -1053,3 +1053,8 @@ void xdp_features_clear_redirect_target(struct net_device *dev)
 	netdev_unlock(dev);
 }
 EXPORT_SYMBOL_GPL(xdp_features_clear_redirect_target);
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_dev_bound_kfunc_id, "BPF_VERIFIER_INTERNAL");

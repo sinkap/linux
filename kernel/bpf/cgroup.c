@@ -2755,3 +2755,10 @@ cgroup_common_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 		return NULL;
 	}
 }
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(cg_dev_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(cg_sockopt_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(cg_sysctl_verifier_ops, "BPF_VERIFIER_INTERNAL");

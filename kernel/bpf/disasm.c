@@ -391,3 +391,10 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
 			insn->code, bpf_class_string[class]);
 	}
 }
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_alu_string, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(func_id_name, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(print_bpf_insn, "BPF_VERIFIER_INTERNAL");

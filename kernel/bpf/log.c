@@ -900,3 +900,19 @@ void print_insn_state(struct bpf_verifier_env *env, const struct bpf_verifier_st
 	}
 	print_verifier_state(env, vstate, frameno, false);
 }
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_verifier_vlog, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_vlog_alignment, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_vlog_finalize, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_vlog_init, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_vlog_reset, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(dynptr_type_str, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(iter_state_str, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(iter_type_str, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(print_insn_state, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(print_verifier_state, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(reg_type_str, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(verbose_linfo, "BPF_VERIFIER_INTERNAL");

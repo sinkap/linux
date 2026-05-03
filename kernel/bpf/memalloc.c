@@ -1037,3 +1037,9 @@ void bpf_mem_alloc_set_dtor(struct bpf_mem_alloc *ma, void (*dtor)(void *obj, vo
 		}
 	}
 }
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_mem_alloc_percpu_init, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_mem_alloc_percpu_unit_init, "BPF_VERIFIER_INTERNAL");

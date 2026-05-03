@@ -494,3 +494,8 @@ out:
 	mutex_unlock(&module_mutex);
 	return ret;
 }
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(find_kallsyms_symbol_value, "BPF_VERIFIER_INTERNAL");

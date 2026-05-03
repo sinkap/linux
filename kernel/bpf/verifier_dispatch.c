@@ -48,6 +48,44 @@ static int stub_check_attach_target(struct bpf_verifier_log *log,
 	return -ENOENT;
 }
 
+static struct btf *stub_get_btf_vmlinux(void)
+{
+	return NULL;
+}
+
+static struct bpf_prog *stub_patch_insn_data(struct bpf_verifier_env *env,
+					     u32 off,
+					     const struct bpf_insn *patch,
+					     u32 len)
+{
+	return NULL;
+}
+
+static struct bpf_insn_aux_data *stub_dup_insn_aux_data(struct bpf_verifier_env *env)
+{
+	return NULL;
+}
+
+static void stub_restore_insn_aux_data(struct bpf_verifier_env *env,
+				       struct bpf_insn_aux_data *orig)
+{
+}
+
+static int stub_get_kfunc_addr(const struct bpf_prog *prog, u32 func_id,
+			       u16 btf_fd_idx, u8 **func_addr)
+{
+	return -ENOENT;
+}
+
+static void stub_free_kfunc_btf_tab(struct bpf_kfunc_btf_tab *tab)
+{
+}
+
+static bool stub_prog_has_kfunc_call(const struct bpf_prog *prog)
+{
+	return false;
+}
+
 /* Pre-registration fallback.  Active until the built-in verifier
  * registers itself via subsys_initcall.  Owner is NULL so dispatch
  * takes no try_module_get() reference.
@@ -55,6 +93,13 @@ static int stub_check_attach_target(struct bpf_verifier_log *log,
 static struct bpf_verifier_impl stub_verifier_impl = {
 	.check			= stub_check,
 	.check_attach_target	= stub_check_attach_target,
+	.get_btf_vmlinux	= stub_get_btf_vmlinux,
+	.patch_insn_data	= stub_patch_insn_data,
+	.dup_insn_aux_data	= stub_dup_insn_aux_data,
+	.restore_insn_aux_data	= stub_restore_insn_aux_data,
+	.get_kfunc_addr		= stub_get_kfunc_addr,
+	.free_kfunc_btf_tab	= stub_free_kfunc_btf_tab,
+	.prog_has_kfunc_call	= stub_prog_has_kfunc_call,
 	.owner			= NULL,
 	.name			= "stub",
 	.abi_version		= BPF_VERIFIER_ABI_VERSION,
@@ -232,3 +277,79 @@ void unregister_bpf_verifier(struct bpf_verifier_impl *impl)
 		next->name ?: "(unnamed)");
 }
 EXPORT_SYMBOL_GPL(unregister_bpf_verifier);
+
+/* Helper wrappers.  Vmlinux callers use these; they route through the
+ * active impl.  Module callers can use them too -- but the verifier
+ * module typically calls its own internal versions directly, so these
+ * wrappers carry no per-call refcount overhead beyond an RCU read.
+ *
+ * These deliberately do NOT take try_module_get()/in_flight refs:
+ * every legitimate caller is reached only via env != NULL, which can
+ * only be true if the caller is itself running inside a bpf_check()
+ * dispatched call -- which already holds the module ref.
+ */
+
+struct btf *bpf_get_btf_vmlinux(void)
+{
+	struct btf *ret;
+
+	rcu_read_lock();
+	ret = rcu_dereference(active_verifier)->get_btf_vmlinux();
+	rcu_read_unlock();
+	return ret;
+}
+EXPORT_SYMBOL_NS_GPL(bpf_get_btf_vmlinux, "BPF_VERIFIER_INTERNAL");
+
+struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 off,
+				     const struct bpf_insn *patch, u32 len)
+{
+	return rcu_dereference_check(active_verifier, 1)
+		->patch_insn_data(env, off, patch, len);
+}
+EXPORT_SYMBOL_NS_GPL(bpf_patch_insn_data, "BPF_VERIFIER_INTERNAL");
+
+struct bpf_insn_aux_data *bpf_dup_insn_aux_data(struct bpf_verifier_env *env)
+{
+	return rcu_dereference_check(active_verifier, 1)->dup_insn_aux_data(env);
+}
+EXPORT_SYMBOL_NS_GPL(bpf_dup_insn_aux_data, "BPF_VERIFIER_INTERNAL");
+
+void bpf_restore_insn_aux_data(struct bpf_verifier_env *env,
+			       struct bpf_insn_aux_data *orig)
+{
+	rcu_dereference_check(active_verifier, 1)
+		->restore_insn_aux_data(env, orig);
+}
+EXPORT_SYMBOL_NS_GPL(bpf_restore_insn_aux_data, "BPF_VERIFIER_INTERNAL");
+
+int bpf_get_kfunc_addr(const struct bpf_prog *prog, u32 func_id,
+		       u16 btf_fd_idx, u8 **func_addr)
+{
+	int ret;
+
+	rcu_read_lock();
+	ret = rcu_dereference(active_verifier)
+		->get_kfunc_addr(prog, func_id, btf_fd_idx, func_addr);
+	rcu_read_unlock();
+	return ret;
+}
+EXPORT_SYMBOL_NS_GPL(bpf_get_kfunc_addr, "BPF_VERIFIER_INTERNAL");
+
+void bpf_free_kfunc_btf_tab(struct bpf_kfunc_btf_tab *tab)
+{
+	rcu_read_lock();
+	rcu_dereference(active_verifier)->free_kfunc_btf_tab(tab);
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL_NS_GPL(bpf_free_kfunc_btf_tab, "BPF_VERIFIER_INTERNAL");
+
+bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
+{
+	bool ret;
+
+	rcu_read_lock();
+	ret = rcu_dereference(active_verifier)->prog_has_kfunc_call(prog);
+	rcu_read_unlock();
+	return ret;
+}
+EXPORT_SYMBOL_NS_GPL(bpf_prog_has_kfunc_call, "BPF_VERIFIER_INTERNAL");

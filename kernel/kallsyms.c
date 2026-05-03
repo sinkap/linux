@@ -935,3 +935,9 @@ static int __init kallsyms_init(void)
 	return 0;
 }
 device_initcall(kallsyms_init);
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(kallsyms_lookup, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(kallsyms_lookup_name, "BPF_VERIFIER_INTERNAL");

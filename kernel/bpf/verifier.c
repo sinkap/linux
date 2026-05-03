@@ -2470,7 +2470,7 @@ find_kfunc_desc(const struct bpf_prog *prog, u32 func_id, u16 offset)
 		       sizeof(tab->descs[0]), kfunc_desc_cmp_by_id_off);
 }
 
-int bpf_get_kfunc_addr(const struct bpf_prog *prog, u32 func_id,
+int bpf_get_kfunc_addr_impl(const struct bpf_prog *prog, u32 func_id,
 		       u16 btf_fd_idx, u8 **func_addr)
 {
 	const struct bpf_kfunc_desc *desc;
@@ -2547,7 +2547,7 @@ static struct btf *__find_kfunc_desc_btf(struct bpf_verifier_env *env,
 	return btf;
 }
 
-void bpf_free_kfunc_btf_tab(struct bpf_kfunc_btf_tab *tab)
+void bpf_free_kfunc_btf_tab_impl(struct bpf_kfunc_btf_tab *tab)
 {
 	if (!tab)
 		return;
@@ -2761,7 +2761,7 @@ int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset)
 	return 0;
 }
 
-bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
+bool bpf_prog_has_kfunc_call_impl(const struct bpf_prog *prog)
 {
 	return !!prog->aux->kfunc_tab;
 }
@@ -19034,7 +19034,7 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 	return 0;
 }
 
-struct btf *bpf_get_btf_vmlinux(void)
+struct btf *bpf_get_btf_vmlinux_impl(void)
 {
 	if (!btf_vmlinux && IS_ENABLED(CONFIG_DEBUG_INFO_BTF)) {
 		mutex_lock(&bpf_verifier_lock);
@@ -19645,13 +19645,60 @@ err_free_env:
 static struct bpf_verifier_impl bpf_builtin_verifier_impl = {
 	.check			= bpf_check_impl,
 	.check_attach_target	= bpf_check_attach_target_impl,
+	.get_btf_vmlinux	= bpf_get_btf_vmlinux_impl,
+	.patch_insn_data	= bpf_patch_insn_data_impl,
+	.dup_insn_aux_data	= bpf_dup_insn_aux_data_impl,
+	.restore_insn_aux_data	= bpf_restore_insn_aux_data_impl,
+	.get_kfunc_addr		= bpf_get_kfunc_addr_impl,
+	.free_kfunc_btf_tab	= bpf_free_kfunc_btf_tab_impl,
+	.prog_has_kfunc_call	= bpf_prog_has_kfunc_call_impl,
+#ifdef MODULE
+	.owner			= THIS_MODULE,
+	.name			= "builtin-mod",
+#else
 	.owner			= NULL,
 	.name			= "builtin",
+#endif
 	.abi_version		= BPF_VERIFIER_ABI_VERSION,
 };
 
+#ifdef MODULE
+/* When CONFIG_BPF_VERIFIER_REPLACEABLE=m, the verifier set is packaged
+ * as bpf_verifier.ko.  Register on module load, unregister on unload.
+ * The dispatcher's stub takes over in between (bpf_check returns
+ * -ENOENT).
+ */
+static int __init bpf_verifier_module_init(void)
+{
+	int ret;
+
+	ret = unbound_reg_init();
+	if (ret)
+		return ret;
+	return register_bpf_verifier(&bpf_builtin_verifier_impl);
+}
+
+static void __exit bpf_verifier_module_exit(void)
+{
+	unregister_bpf_verifier(&bpf_builtin_verifier_impl);
+}
+
+module_init(bpf_verifier_module_init);
+module_exit(bpf_verifier_module_exit);
+
+MODULE_AUTHOR("KP Singh <kpsingh@kernel.org>");
+MODULE_DESCRIPTION("Loadable BPF verifier");
+MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS("BPF_VERIFIER_INTERNAL");
+#else
+/* Built-in case: register at subsys_initcall, never unregister. */
 static int __init bpf_builtin_verifier_init(void)
 {
+	int ret = unbound_reg_init();
+
+	if (ret)
+		return ret;
 	return register_bpf_verifier(&bpf_builtin_verifier_impl);
 }
 subsys_initcall(bpf_builtin_verifier_init);
+#endif

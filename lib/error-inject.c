@@ -237,3 +237,8 @@ static int __init init_error_injection(void)
 	return 0;
 }
 late_initcall(init_error_injection);
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(within_error_injection_list, "BPF_VERIFIER_INTERNAL");

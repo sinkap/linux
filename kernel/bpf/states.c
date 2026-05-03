@@ -654,12 +654,11 @@ static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
 
 static struct bpf_reg_state unbound_reg;
 
-static __init int unbound_reg_init(void)
+int unbound_reg_init(void)
 {
 	bpf_mark_reg_unknown_imprecise(&unbound_reg);
 	return 0;
 }
-late_initcall(unbound_reg_init);
 
 static bool is_spilled_scalar_after(const struct bpf_stack_state *stack, int im)
 {

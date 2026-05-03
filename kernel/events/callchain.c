@@ -328,3 +328,9 @@ static int __init init_callchain_sysctls(void)
 }
 core_initcall(init_callchain_sysctls);
 
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(get_callchain_buffers, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(sysctl_perf_event_max_stack, "BPF_VERIFIER_INTERNAL");

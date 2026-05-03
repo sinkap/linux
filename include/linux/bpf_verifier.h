@@ -981,6 +981,30 @@ struct bpf_verifier_impl {
 				   const struct bpf_prog *tgt_prog,
 				   u32 btf_id,
 				   struct bpf_attach_target_info *tgt_info);
+	/* Helpers called from vmlinux (typically the JIT path in core.c
+	 * and BTF-aware helpers in btf.c / syscall.c / inode.c) during a
+	 * verifier-driven flow.  They live here -- rather than as plain
+	 * exported symbols -- because their definitions are in the
+	 * verifier set and would otherwise be unresolved when the
+	 * verifier is built as a module (CONFIG_BPF_VERIFIER_REPLACEABLE=m).
+	 *
+	 * When no implementation is registered (the dispatcher's stub is
+	 * active), these return NULL / -ENOENT / false as appropriate;
+	 * the only callers reach them via env != NULL, which can't be the
+	 * case before a verifier is loaded.
+	 */
+	struct btf *(*get_btf_vmlinux)(void);
+	struct bpf_prog *(*patch_insn_data)(struct bpf_verifier_env *env,
+					    u32 off, const struct bpf_insn *patch,
+					    u32 len);
+	struct bpf_insn_aux_data *(*dup_insn_aux_data)(struct bpf_verifier_env *env);
+	void (*restore_insn_aux_data)(struct bpf_verifier_env *env,
+				      struct bpf_insn_aux_data *orig);
+	int (*get_kfunc_addr)(const struct bpf_prog *prog, u32 func_id,
+			      u16 btf_fd_idx, u8 **func_addr);
+	void (*free_kfunc_btf_tab)(struct bpf_kfunc_btf_tab *tab);
+	bool (*prog_has_kfunc_call)(const struct bpf_prog *prog);
+
 	struct module *owner;
 	const char *name;
 	u32 abi_version;

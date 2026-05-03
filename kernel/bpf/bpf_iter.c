@@ -825,3 +825,8 @@ __bpf_kfunc void bpf_iter_num_destroy(struct bpf_iter_num *it)
 }
 
 __bpf_kfunc_end_defs();
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_iter_prog_supported, "BPF_VERIFIER_INTERNAL");

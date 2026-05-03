@@ -4926,3 +4926,9 @@ void bpf_map_free_internal_structs(struct bpf_map *map, void *val)
 	if (btf_record_has_field(map->record, BPF_TASK_WORK))
 		bpf_obj_free_task_work(map->record, val);
 }
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_bprintf_prepare, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_dynptr_from_file_sleepable, "BPF_VERIFIER_INTERNAL");

@@ -1382,3 +1382,10 @@ static int __init init_trampolines(void)
 	return 0;
 }
 late_initcall(init_trampolines);
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_extension_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_prog_has_trampoline, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_trampoline_get, "BPF_VERIFIER_INTERNAL");

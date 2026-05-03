@@ -9801,3 +9801,48 @@ bool btf_param_match_suffix(const struct btf *btf,
 	param_name += len - suffix_len;
 	return !strncmp(param_name, suffix, suffix_len);
 }
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_core_apply, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_struct_ops_find, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_check_iter_arg, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_check_type_match, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_distill_func_proto, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_find_by_name_kind, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_find_decl_tag_value, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_find_struct_meta, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_fops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_get, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_get_by_fd, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_get_name, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_is_kernel, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_is_module, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_is_prog_ctx_type, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_is_projection_of, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_kfunc_flags, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_kfunc_is_allowed, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_kfunc_is_modify_return, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_name_by_offset, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_named_start_id, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_nested_type_is_trusted, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_nr_types, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_obj_id, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_param_match_suffix, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_parse_vmlinux, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_prepare_func_args, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_put, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_resolve_size, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_struct_access, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_struct_ids_match, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_tracing_ids, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_try_get_module, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_type_ids_nocast_alias, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_type_is_void, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_type_resolve_func_ptr, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_type_resolve_ptr, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_types_are_same, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_type_skip_modifiers, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_type_str, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(get_kern_ctx_btf_id, "BPF_VERIFIER_INTERNAL");

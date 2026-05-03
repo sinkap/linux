@@ -2775,3 +2775,5 @@ int __init kernel_unmap_pages_in_pgd(pgd_t *pgd, unsigned long address,
 #ifdef CONFIG_CPA_DEBUG
 #include "cpa-test.c"
 #endif
+
+EXPORT_SYMBOL_NS_GPL(set_memory_ro, "BPF_VERIFIER_INTERNAL");

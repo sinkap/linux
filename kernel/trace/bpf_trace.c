@@ -3640,3 +3640,15 @@ __bpf_kfunc int bpf_copy_from_user_task_str_dynptr(const struct bpf_dynptr *dptr
 }
 
 __bpf_kfunc_end_defs();
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_get_raw_tracepoint, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_put_raw_tracepoint, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(kprobe_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(perf_event_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(raw_tracepoint_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(raw_tracepoint_writable_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(tracepoint_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(tracing_verifier_ops, "BPF_VERIFIER_INTERNAL");

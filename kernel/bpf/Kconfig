@@ -121,4 +121,20 @@ config BPF_VERIFIER_REPLACE_TEST
 
 	  If unsure, say N.
 
+
+config BPF_VERIFIER_REPLACEABLE
+	tristate "Loadable replacement for the BPF verifier"
+	depends on BPF_SYSCALL
+	default y
+	help
+	  Build the BPF verifier (verifier.c and its private helpers) as a
+	  unit that can be either compiled into vmlinux (=y, default) or
+	  packaged as a loadable kernel module bpf_verifier.ko (=m).  When
+	  =m, the kernel boots with the dispatcher in place but with no
+	  active verifier; bpf(BPF_PROG_LOAD) returns -ENOENT until the
+	  module is loaded.  This is useful for shipping a verifier bug
+	  fix as a module without rebooting.
+
+	  When unsure, say Y.
+
 endmenu # "BPF subsystem"

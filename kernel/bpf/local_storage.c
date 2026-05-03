@@ -616,3 +616,8 @@ void bpf_cgroup_storage_unlink(struct bpf_cgroup_storage *storage)
 }
 
 #endif
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_cgroup_storage_assign, "BPF_VERIFIER_INTERNAL");

@@ -227,3 +227,8 @@ static int init_subsystem(void)
 	return register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC, &bpf_map_iter_kfunc_set);
 }
 late_initcall(init_subsystem);
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(btf_bpf_map_id, "BPF_VERIFIER_INTERNAL");

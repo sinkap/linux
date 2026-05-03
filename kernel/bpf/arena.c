@@ -974,3 +974,10 @@ void bpf_prog_report_arena_violation(bool write, unsigned long addr, unsigned lo
 		bpf_stream_dump_stack(ss);
 	}));
 }
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_arena_alloc_pages_non_sleepable, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_arena_free_pages_non_sleepable, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_arena_get_user_vm_start, "BPF_VERIFIER_INTERNAL");

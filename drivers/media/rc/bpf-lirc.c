@@ -340,3 +340,5 @@ put:
 
 	return ret;
 }
+
+EXPORT_SYMBOL_NS_GPL(lirc_mode2_verifier_ops, "BPF_VERIFIER_INTERNAL");

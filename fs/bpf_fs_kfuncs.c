@@ -415,3 +415,7 @@ static int __init bpf_fs_kfuncs_init(void)
 }
 
 late_initcall(bpf_fs_kfuncs_init);
+
+EXPORT_SYMBOL_NS_GPL(bpf_set_dentry_xattr_locked, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_remove_dentry_xattr_locked, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_lsm_has_d_inode_locked, "BPF_VERIFIER_INTERNAL");

@@ -448,3 +448,11 @@ int bpf_lsm_get_retval_range(const struct bpf_prog *prog,
 	}
 	return 0;
 }
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_lsm_get_retval_range, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_lsm_is_sleepable_hook, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_lsm_verify_prog, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(lsm_verifier_ops, "BPF_VERIFIER_INTERNAL");

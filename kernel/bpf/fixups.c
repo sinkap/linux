@@ -245,7 +245,7 @@ static void adjust_poke_descs(struct bpf_prog *prog, u32 off, u32 len)
 	}
 }
 
-struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 off,
+struct bpf_prog *bpf_patch_insn_data_impl(struct bpf_verifier_env *env, u32 off,
 				     const struct bpf_insn *patch, u32 len)
 {
 	struct bpf_prog *new_prog;
@@ -1006,7 +1006,7 @@ static void bpf_restore_subprog_starts(struct bpf_verifier_env *env, u32 *orig_s
 	env->subprog_info[env->subprog_cnt].start = env->prog->len;
 }
 
-struct bpf_insn_aux_data *bpf_dup_insn_aux_data(struct bpf_verifier_env *env)
+struct bpf_insn_aux_data *bpf_dup_insn_aux_data_impl(struct bpf_verifier_env *env)
 {
 	size_t size;
 	void *new_aux;
@@ -1018,7 +1018,7 @@ struct bpf_insn_aux_data *bpf_dup_insn_aux_data(struct bpf_verifier_env *env)
 	return new_aux;
 }
 
-void bpf_restore_insn_aux_data(struct bpf_verifier_env *env,
+void bpf_restore_insn_aux_data_impl(struct bpf_verifier_env *env,
 			       struct bpf_insn_aux_data *orig_insn_aux)
 {
 	/* the expanded elements are zero-filled, so no special handling is required */

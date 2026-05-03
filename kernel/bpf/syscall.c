@@ -6617,3 +6617,13 @@ static int __init bpf_syscall_sysctl_init(void)
 }
 late_initcall(bpf_syscall_sysctl_init);
 #endif /* CONFIG_SYSCTL */
+
+/* Module-replaceable verifier exports.
+ * Callable from CONFIG_BPF_VERIFIER_REPLACEABLE module.
+ */
+EXPORT_SYMBOL_NS_GPL(bpf_check_uarg_tail_zero, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_map_fops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_map_offload_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_map_write_active, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(bpf_syscall_verifier_ops, "BPF_VERIFIER_INTERNAL");
+EXPORT_SYMBOL_NS_GPL(btf_record_find, "BPF_VERIFIER_INTERNAL");
