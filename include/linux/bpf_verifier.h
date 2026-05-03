@@ -928,6 +928,60 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 			    struct bpf_attach_target_info *tgt_info);
 void bpf_free_kfunc_btf_tab(struct bpf_kfunc_btf_tab *tab);
 
+/**
+ * struct bpf_verifier_impl - Pluggable BPF verifier implementation
+ * @check: bpf_check() implementation; takes the same arguments as the
+ *         public bpf_check() entry point.
+ * @check_attach_target: bpf_check_attach_target() implementation.
+ * @owner: module that owns this implementation, or %NULL for the
+ *         built-in verifier.  The dispatcher takes a try_module_get()
+ *         reference for the duration of every call so module unload
+ *         cannot race with in-flight verification.
+ * @name: short identifier used in dmesg ("builtin", "v6.18-fix", ...).
+ *
+ * Registered via register_bpf_verifier() / unregister_bpf_verifier().
+ * At any time exactly one implementation is active; the most recently
+ * registered one wins, and unregistering it falls back to the previous
+ * one.  v1 supports a single replacement on top of the built-in -- a
+ * second register_bpf_verifier() while a non-built-in is already
+ * active returns -EBUSY.
+ */
+struct bpf_verifier_impl {
+	int (*check)(struct bpf_prog **prog, union bpf_attr *attr,
+		     bpfptr_t uattr, __u32 uattr_size);
+	int (*check_attach_target)(struct bpf_verifier_log *log,
+				   const struct bpf_prog *prog,
+				   const struct bpf_prog *tgt_prog,
+				   u32 btf_id,
+				   struct bpf_attach_target_info *tgt_info);
+	struct module *owner;
+	const char *name;
+};
+
+/**
+ * register_bpf_verifier() - Install a verifier implementation
+ * @impl: implementation to install; must outlive the registration
+ *
+ * Replaces the currently active verifier with @impl.  The previously
+ * active implementation (typically the built-in) becomes the fallback
+ * that takes over when @impl is later unregistered.
+ *
+ * Return: 0 on success, -EINVAL if @impl is malformed, -EBUSY if a
+ * non-built-in verifier is already active.
+ */
+int register_bpf_verifier(struct bpf_verifier_impl *impl);
+
+/**
+ * unregister_bpf_verifier() - Remove a previously registered verifier
+ * @impl: implementation to remove; must equal the currently active one
+ *
+ * Restores the previously active verifier (the built-in, in v1).
+ * Drains any verification calls already dispatched to @impl before
+ * returning, so it is safe for the caller to free @impl or unload the
+ * owning module immediately afterwards.
+ */
+void unregister_bpf_verifier(struct bpf_verifier_impl *impl);
+
 bool bpf_map_is_rdonly(const struct bpf_map *map);
 int bpf_map_direct_read(struct bpf_map *map, int off, int size, u64 *val,
 			bool is_ldsx);

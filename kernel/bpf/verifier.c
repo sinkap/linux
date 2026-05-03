@@ -18517,7 +18517,8 @@ static int check_attach_modify_return(unsigned long addr, const char *func_name)
 #endif /* CONFIG_FUNCTION_ERROR_INJECTION */
 
 /**
- * bpf_check_attach_target() - Validate a tracing/extension attach target
+ * bpf_check_attach_target_impl() - Built-in implementation of
+ *                                  bpf_check_attach_target()
  * @log: verifier log to record errors into (may be NULL)
  * @prog: BPF program attempting to attach (TRACING or EXT)
  * @tgt_prog: target BPF program for fentry/fexit/fmod_ret/EXT, or NULL
@@ -18526,22 +18527,20 @@ static int check_attach_modify_return(unsigned long addr, const char *func_name)
  * @tgt_info: out-param populated with attach metadata on success (target
  *            address, function prototype, owning module, target btf, etc.)
  *
- * Public verifier API. Resolves the attach point named by (@tgt_prog,
- * @btf_id), checks that @prog is allowed to attach there (matching
- * sleepable/dev-bound semantics, error-injection allow-list, recursion
- * rules, etc.) and fills @tgt_info for the trampoline / attach machinery.
+ * Reachable via the bpf_verifier_impl vtable that the dispatcher
+ * (kernel/bpf/verifier_dispatch.c) routes bpf_check_attach_target() to.
+ * Resolves the attach point named by (@tgt_prog, @btf_id), checks that
+ * @prog is allowed to attach there (matching sleepable/dev-bound
+ * semantics, error-injection allow-list, recursion rules, etc.) and
+ * fills @tgt_info for the trampoline / attach machinery.
  *
- * Called from kernel/bpf/syscall.c (BPF_LINK_CREATE / BPF_RAW_TRACEPOINT_OPEN
- * paths) and kernel/bpf/trampoline.c.
- *
- * Return: 0 on success, negative errno on failure (caller-friendly errors
- * like -EINVAL, -EBUSY, -EACCES, -ENOENT).
+ * Return: 0 on success, negative errno on failure.
  */
-int bpf_check_attach_target(struct bpf_verifier_log *log,
-			    const struct bpf_prog *prog,
-			    const struct bpf_prog *tgt_prog,
-			    u32 btf_id,
-			    struct bpf_attach_target_info *tgt_info)
+static int bpf_check_attach_target_impl(struct bpf_verifier_log *log,
+					const struct bpf_prog *prog,
+					const struct bpf_prog *tgt_prog,
+					u32 btf_id,
+					struct bpf_attach_target_info *tgt_info)
 {
 	bool prog_extension = prog->type == BPF_PROG_TYPE_EXT;
 	bool prog_tracing = prog->type == BPF_PROG_TYPE_TRACING;
@@ -18975,7 +18974,7 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 	    prog->type != BPF_PROG_TYPE_EXT)
 		return 0;
 
-	ret = bpf_check_attach_target(&env->log, prog, tgt_prog, btf_id, &tgt_info);
+	ret = bpf_check_attach_target_impl(&env->log, prog, tgt_prog, btf_id, &tgt_info);
 	if (ret)
 		return ret;
 
@@ -19317,7 +19316,7 @@ int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 }
 
 /**
- * bpf_check() - Verify a BPF program for safety and prepare it for execution
+ * bpf_check_impl() - Built-in implementation of bpf_check()
  * @prog: in/out program pointer; the verifier may replace *@prog (e.g. when
  *        JITing subprograms or applying program-wide fixups)
  * @attr: bpf(BPF_PROG_LOAD) attributes from userspace
@@ -19325,22 +19324,19 @@ int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
  *         output such as func_info, line_info and log_size_actual back out)
  * @uattr_size: size of the user attributes structure
  *
- * Public verifier API. Sole entry point for verifying a freshly-loaded
- * BPF program. Allocates a &struct bpf_verifier_env, runs control-flow
- * analysis, type/range tracking, helper/kfunc resolution, and post-pass
- * fixups (dead-code removal, ctx access conversion, JIT preparation), then
- * frees the env before returning.
- *
- * Called from kernel/bpf/syscall.c:bpf_prog_load(). This is the function
- * the loadable verifier module replaces; everything else in the verifier
- * subsystem reaches the rest of BPF through types and helpers declared in
- * &lt;linux/bpf_verifier.h&gt;.
+ * Reachable via the bpf_verifier_impl vtable that the dispatcher
+ * (kernel/bpf/verifier_dispatch.c) routes bpf_check() to.  Allocates a
+ * &struct bpf_verifier_env, runs control-flow analysis, type/range
+ * tracking, helper/kfunc resolution, and post-pass fixups (dead-code
+ * removal, ctx access conversion, JIT preparation), then frees the env
+ * before returning.
  *
  * Return: 0 on success (program is safe to load and *@prog has been
  * finalized), negative errno on failure (the verifier log in @attr
  * carries the human-readable diagnostic).
  */
-int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u32 uattr_size)
+static int bpf_check_impl(struct bpf_prog **prog, union bpf_attr *attr,
+			  bpfptr_t uattr, __u32 uattr_size)
 {
 	u64 start_time = ktime_get_ns();
 	struct bpf_verifier_env *env;
@@ -19644,3 +19640,17 @@ err_free_env:
 	kvfree(env);
 	return ret;
 }
+
+
+static struct bpf_verifier_impl bpf_builtin_verifier_impl = {
+	.check			= bpf_check_impl,
+	.check_attach_target	= bpf_check_attach_target_impl,
+	.owner			= NULL,
+	.name			= "builtin",
+};
+
+static int __init bpf_builtin_verifier_init(void)
+{
+	return register_bpf_verifier(&bpf_builtin_verifier_impl);
+}
+subsys_initcall(bpf_builtin_verifier_init);
