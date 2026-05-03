@@ -101,4 +101,24 @@ config BPF_LSM
 
 	  If you are unsure how to answer this question, answer N.
 
+
+config BPF_VERIFIER_REPLACE_TEST
+	tristate "Test module for the BPF verifier dispatcher"
+	depends on BPF_SYSCALL
+	depends on m
+	help
+	  Build a small kernel module that exercises the BPF verifier
+	  dispatcher API (register_bpf_verifier / unregister_bpf_verifier).
+	  When loaded, the module replaces the built-in verifier with one
+	  whose check() always returns -ENOSYS, making subsequent BPF
+	  program loads fail until the module is unloaded.
+
+	  Useful only for testing and demonstrating the dispatch and drain
+	  semantics; not for production.  This is *not* a replacement
+	  verifier -- a real loadable verifier is future work that
+	  requires exporting many BPF-internal symbols.  See
+	  Documentation/bpf/verifier_module.rst.
+
+	  If unsure, say N.
+
 endmenu # "BPF subsystem"
