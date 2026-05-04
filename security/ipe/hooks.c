@@ -312,6 +312,36 @@ err:
 }
 #endif /* CONFIG_IPE_PROP_DM_VERITY */
 
+#ifdef CONFIG_IPE_PROP_BPF_SIGNATURE
+/**
+ * ipe_bpf_prog_load() - ipe security hook for BPF program load.
+ * @prog: The BPF program being loaded.
+ * @attr: Unused.
+ * @token: Unused.
+ * @kernel: True if the load originated in kernel mode (e.g. lskel-internal).
+ *
+ * Reads the verifier's signature verdict from prog->aux (set by the syscall
+ * path before this hook fires) and exposes it to IPE policy via the
+ * bpf_signature, bpf_keyring and bpf_kernel properties.
+ *
+ * Return:
+ * * %0		- Success
+ * * %-EACCES	- Did not pass IPE policy
+ */
+int ipe_bpf_prog_load(struct bpf_prog *prog, union bpf_attr *attr,
+		      struct bpf_token *token, bool kernel)
+{
+	struct ipe_eval_ctx ctx = IPE_EVAL_CTX_INIT;
+
+	ipe_build_eval_ctx(&ctx, NULL, IPE_OP_BPF_PROG_LOAD,
+			   IPE_HOOK_BPF_PROG_LOAD);
+	ctx.bpf_verdict = prog->aux->sig_verdict;
+	ctx.bpf_keyring = prog->aux->keyring_used;
+	ctx.bpf_kernel = kernel;
+	return ipe_evaluate_event(&ctx);
+}
+#endif /* CONFIG_IPE_PROP_BPF_SIGNATURE */
+
 #ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
 /**
  * ipe_inode_setintegrity() - save integrity data from a inode to IPE's LSM blob.
