@@ -2798,6 +2798,20 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
 	}
 }
 
+static enum bpf_sig_keyring bpf_classify_keyring(s32 keyring_id)
+{
+	switch (keyring_id) {
+	case 0:
+		return BPF_SIG_KEYRING_BUILTIN;
+	case (s32)(unsigned long)VERIFY_USE_SECONDARY_KEYRING:
+		return BPF_SIG_KEYRING_SECONDARY;
+	case (s32)(unsigned long)VERIFY_USE_PLATFORM_KEYRING:
+		return BPF_SIG_KEYRING_PLATFORM;
+	default:
+		return BPF_SIG_KEYRING_USER;
+	}
+}
+
 static int bpf_prog_verify_signature(struct bpf_prog *prog, union bpf_attr *attr,
 				     bool is_kernel)
 {
@@ -3027,6 +3041,11 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 		err = bpf_prog_verify_signature(prog, attr, uattr.is_kernel);
 		if (err)
 			goto free_prog;
+		prog->aux->sig_verdict  = BPF_SIG_OK;
+		prog->aux->keyring_used = bpf_classify_keyring(attr->keyring_id);
+	} else {
+		prog->aux->sig_verdict  = BPF_SIG_UNSIGNED;
+		prog->aux->keyring_used = BPF_SIG_KEYRING_NONE;
 	}
 
 	prog->orig_prog = NULL;
