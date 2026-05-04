@@ -1896,8 +1896,10 @@ struct gen_loader_opts {
 	size_t sz; /* size of this struct, for forward/backward compatibility */
 	const char *data;
 	const char *insns;
+	const void *btf;
 	__u32 data_sz;
 	__u32 insns_sz;
+	__u32 btf_sz;
 	bool gen_hash;
 };
 
