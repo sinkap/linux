@@ -184,22 +184,9 @@ The mechanism rests on:
   ``=y`` (the default) the verifier set is built into vmlinux as
   today.
 
-Known caveat: module BTF validation
------------------------------------
-
-When CONFIG_DEBUG_INFO_BTF_MODULES=y the kernel rejects
-``bpf_verifier.ko`` with ``failed to validate module [bpf_verifier]
-BTF: -22`` because the verifier set defines BPF-subsystem types that
-also appear in the vmlinux BTF, and the per-module BTF parser doesn't
-yet know how to reconcile the duplicates.  Workaround until that's
-addressed::
-
-    objcopy --remove-section=.BTF kernel/bpf/bpf_verifier.ko \\
-            kernel/bpf/bpf_verifier.ko
-
-The module loads and runs correctly with BTF stripped; only kfunc/BTF-
-typed-pointer facilities that depend on the *module's* BTF are
-affected, and the verifier set doesn't define any kfuncs of its own.
+``bpf_verifier.ko`` carries its own BTF (``bpftool btf show`` lists it
+as a separate module BTF entry alongside vmlinux's), and module load
+goes through the normal pahole-deduplicated module BTF path.
 
 The non-goals carry over from the design doc:
 

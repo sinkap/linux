@@ -48,11 +48,6 @@ static int stub_check_attach_target(struct bpf_verifier_log *log,
 	return -ENOENT;
 }
 
-static struct btf *stub_get_btf_vmlinux(void)
-{
-	return NULL;
-}
-
 static struct bpf_prog *stub_patch_insn_data(struct bpf_verifier_env *env,
 					     u32 off,
 					     const struct bpf_insn *patch,
@@ -100,7 +95,6 @@ static int stub_map_set_for_each_callback_args(struct bpf_verifier_env *env,
 static struct bpf_verifier_impl stub_verifier_impl = {
 	.check			= stub_check,
 	.check_attach_target	= stub_check_attach_target,
-	.get_btf_vmlinux	= stub_get_btf_vmlinux,
 	.patch_insn_data	= stub_patch_insn_data,
 	.dup_insn_aux_data	= stub_dup_insn_aux_data,
 	.restore_insn_aux_data	= stub_restore_insn_aux_data,
@@ -296,17 +290,6 @@ EXPORT_SYMBOL_GPL(unregister_bpf_verifier);
  * only be true if the caller is itself running inside a bpf_check()
  * dispatched call -- which already holds the module ref.
  */
-
-struct btf *bpf_get_btf_vmlinux(void)
-{
-	struct btf *ret;
-
-	rcu_read_lock();
-	ret = rcu_dereference(active_verifier)->get_btf_vmlinux();
-	rcu_read_unlock();
-	return ret;
-}
-EXPORT_SYMBOL_NS_GPL(bpf_get_btf_vmlinux, "BPF_VERIFIER_INTERNAL");
 
 struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 off,
 				     const struct bpf_insn *patch, u32 len)

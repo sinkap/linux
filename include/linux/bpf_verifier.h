@@ -993,7 +993,6 @@ struct bpf_verifier_impl {
 	 * the only callers reach them via env != NULL, which can't be the
 	 * case before a verifier is loaded.
 	 */
-	struct btf *(*get_btf_vmlinux)(void);
 	struct bpf_prog *(*patch_insn_data)(struct bpf_verifier_env *env,
 					    u32 off, const struct bpf_insn *patch,
 					    u32 len);

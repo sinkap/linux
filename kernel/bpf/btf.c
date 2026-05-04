@@ -30,6 +30,20 @@
 #include <linux/overflow.h>
 
 struct btf *btf_vmlinux;
+static DEFINE_MUTEX(bpf_btf_vmlinux_lock);
+
+struct btf *bpf_get_btf_vmlinux(void)
+{
+	if (!btf_vmlinux && IS_ENABLED(CONFIG_DEBUG_INFO_BTF)) {
+		mutex_lock(&bpf_btf_vmlinux_lock);
+		if (!btf_vmlinux)
+			btf_vmlinux = btf_parse_vmlinux();
+		mutex_unlock(&bpf_btf_vmlinux_lock);
+	}
+	return btf_vmlinux;
+}
+EXPORT_SYMBOL_NS_GPL(bpf_get_btf_vmlinux, "BPF_VERIFIER_INTERNAL");
+
 
 #include <net/netfilter/nf_bpf_link.h>
 

@@ -603,7 +603,6 @@ struct bpf_prog *bpf_patch_insn_data_impl(struct bpf_verifier_env *env, u32 off,
 struct bpf_insn_aux_data *bpf_dup_insn_aux_data_impl(struct bpf_verifier_env *env);
 void bpf_restore_insn_aux_data_impl(struct bpf_verifier_env *env,
 				    struct bpf_insn_aux_data *orig);
-struct btf *bpf_get_btf_vmlinux_impl(void);
 int bpf_get_kfunc_addr_impl(const struct bpf_prog *prog, u32 func_id,
 			    u16 btf_fd_idx, u8 **func_addr);
 void bpf_free_kfunc_btf_tab_impl(struct bpf_kfunc_btf_tab *tab);
@@ -612,7 +611,6 @@ bool bpf_prog_has_kfunc_call_impl(const struct bpf_prog *prog);
 #define bpf_patch_insn_data		bpf_patch_insn_data_impl
 #define bpf_dup_insn_aux_data		bpf_dup_insn_aux_data_impl
 #define bpf_restore_insn_aux_data	bpf_restore_insn_aux_data_impl
-#define bpf_get_btf_vmlinux		bpf_get_btf_vmlinux_impl
 #define bpf_get_kfunc_addr		bpf_get_kfunc_addr_impl
 #define bpf_free_kfunc_btf_tab		bpf_free_kfunc_btf_tab_impl
 #define bpf_prog_has_kfunc_call		bpf_prog_has_kfunc_call_impl

@@ -52,7 +52,6 @@ enum bpf_features {
 	__MAX_BPF_FEAT,
 };
 
-struct bpf_mem_alloc bpf_global_percpu_ma;
 static bool bpf_global_percpu_ma_set;
 
 /* bpf_check() is a static code analyzer that walks eBPF program
@@ -261,7 +260,6 @@ struct bpf_kfunc_meta {
 	s32 id;
 };
 
-struct btf *btf_vmlinux;
 
 typedef struct argno {
 	int argno;
@@ -18304,14 +18302,6 @@ static void print_verification_stats(struct bpf_verifier_env *env)
 		env->peak_states, env->longest_mark_read_walk);
 }
 
-int bpf_prog_ctx_arg_info_init(struct bpf_prog *prog,
-			       const struct bpf_ctx_arg_aux *info, u32 cnt)
-{
-	prog->aux->ctx_arg_info = kmemdup_array(info, cnt, sizeof(*info), GFP_KERNEL_ACCOUNT);
-	prog->aux->ctx_arg_info_size = cnt;
-
-	return prog->aux->ctx_arg_info ? 0 : -ENOMEM;
-}
 
 static int check_struct_ops_btf_id(struct bpf_verifier_env *env)
 {
@@ -19034,16 +19024,6 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 	return 0;
 }
 
-struct btf *bpf_get_btf_vmlinux_impl(void)
-{
-	if (!btf_vmlinux && IS_ENABLED(CONFIG_DEBUG_INFO_BTF)) {
-		mutex_lock(&bpf_verifier_lock);
-		if (!btf_vmlinux)
-			btf_vmlinux = btf_parse_vmlinux();
-		mutex_unlock(&bpf_verifier_lock);
-	}
-	return btf_vmlinux;
-}
 
 /*
  * The add_fd_from_fd_array() is executed only if fd_array_cnt is non-zero. In
@@ -19645,7 +19625,6 @@ err_free_env:
 static struct bpf_verifier_impl bpf_builtin_verifier_impl = {
 	.check			= bpf_check_impl,
 	.check_attach_target	= bpf_check_attach_target_impl,
-	.get_btf_vmlinux	= bpf_get_btf_vmlinux_impl,
 	.patch_insn_data	= bpf_patch_insn_data_impl,
 	.dup_insn_aux_data	= bpf_dup_insn_aux_data_impl,
 	.restore_insn_aux_data	= bpf_restore_insn_aux_data_impl,
