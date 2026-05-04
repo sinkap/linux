@@ -52,6 +52,8 @@ struct bpf_gen {
 	int fd_array;
 	int nr_fd_array;
 	int hash_insn_offset[SHA256_DWORD_SIZE];
+	struct btf *loader_btf;
+	int loader_btf_func_id;
 };
 
 void bpf_gen__init(struct bpf_gen *gen, int log_level, int nr_progs, int nr_maps);
