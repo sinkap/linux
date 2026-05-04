@@ -793,6 +793,8 @@ static int gen_trace(struct bpf_object *obj, const char *obj_name, const char *h
 	if (sign_progs) {
 		sopts.insns = opts.insns;
 		sopts.insns_sz = opts.insns_sz;
+		sopts.btf = opts.btf;
+		sopts.btf_sz = opts.btf_sz;
 		sopts.excl_prog_hash = prog_sha;
 		sopts.excl_prog_hash_sz = sizeof(prog_sha);
 		sopts.signature = sig_buf;
@@ -822,6 +824,17 @@ static int gen_trace(struct bpf_object *obj, const char *obj_name, const char *h
 		\n\
 		\";\n");
 
+		if (opts.btf_sz) {
+			codegen("\
+		\n\
+			static const char opts_btf[] __attribute__((__aligned__(8))) = \"\\\n\
+		");
+			print_hex(opts.btf, opts.btf_sz);
+			codegen("\
+		\n\
+		\";\n");
+		}
+
 		codegen("\
 		\n\
 			opts.signature = (void *)opts_sig;			\n\
@@ -829,6 +842,14 @@ static int gen_trace(struct bpf_object *obj, const char *obj_name, const char *h
 			opts.excl_prog_hash = (void *)opts_excl_hash;		\n\
 			opts.excl_prog_hash_sz = sizeof(opts_excl_hash) - 1;	\n\
 			opts.keyring_id = skel->keyring_id;			\n\
+		");
+	}
+
+	if (sign_progs && opts.btf_sz) {
+		codegen("\
+		\n\
+			opts.btf = (void *)opts_btf;			    \n\
+			opts.btf_sz = sizeof(opts_btf) - 1;		    \n\
 		");
 	}
 
