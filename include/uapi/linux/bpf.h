@@ -1382,6 +1382,15 @@ enum {
  * bpf_call->imm == btf_id of a BTF_KIND_FUNC in the running kernel
  */
 #define BPF_PSEUDO_KFUNC_CALL	2
+/* when bpf_call->src_reg == BPF_PSEUDO_KFUNC_CALL_PROG_BTF,
+ * bpf_call->imm == btf_id of a BTF_KIND_FUNC in the program's own
+ * prog BTF (not vmlinux). The verifier resolves the FUNC's name in
+ * vmlinux BTF, patches imm to the vmlinux btf_id, and rewrites
+ * src_reg back to BPF_PSEUDO_KFUNC_CALL. Used by libbpf gen_loader
+ * for synthesized loader programs that cannot bake vmlinux ids at
+ * sign time.
+ */
+#define BPF_PSEUDO_KFUNC_CALL_PROG_BTF	3
 
 enum bpf_addr_space_cast {
 	BPF_ADDR_SPACE_CAST = 1,

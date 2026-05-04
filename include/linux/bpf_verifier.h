@@ -1012,7 +1012,8 @@ static inline bool bpf_pseudo_call(const struct bpf_insn *insn)
 static inline bool bpf_pseudo_kfunc_call(const struct bpf_insn *insn)
 {
 	return insn->code == (BPF_JMP | BPF_CALL) &&
-	       insn->src_reg == BPF_PSEUDO_KFUNC_CALL;
+	       (insn->src_reg == BPF_PSEUDO_KFUNC_CALL ||
+		insn->src_reg == BPF_PSEUDO_KFUNC_CALL_PROG_BTF);
 }
 
 __printf(2, 0) void bpf_verifier_vlog(struct bpf_verifier_log *log,
