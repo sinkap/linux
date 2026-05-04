@@ -1661,6 +1661,20 @@ struct bpf_stream_stage {
 	int len;
 };
 
+enum bpf_sig_verdict {
+	BPF_SIG_UNSIGNED = 0,
+	BPF_SIG_OK,                  /* loader signature verified */
+	BPF_SIG_METADATA_VERIFIED,   /* loader signature + map content verified */
+};
+
+enum bpf_sig_keyring {
+	BPF_SIG_KEYRING_NONE = 0,
+	BPF_SIG_KEYRING_BUILTIN,
+	BPF_SIG_KEYRING_SECONDARY,
+	BPF_SIG_KEYRING_PLATFORM,
+	BPF_SIG_KEYRING_USER,
+};
+
 struct bpf_prog_aux {
 	atomic64_t refcnt;
 	u32 used_map_cnt;
@@ -1703,6 +1717,8 @@ struct bpf_prog_aux {
 	bool changes_pkt_data;
 	bool might_sleep;
 	bool kprobe_write_ctx;
+	u8 sig_verdict;     /* enum bpf_sig_verdict, set before LSM hook */
+	u8 keyring_used;    /* enum bpf_sig_keyring */
 	u64 prog_array_member_cnt; /* counts how many times as member of prog_array */
 	struct mutex ext_mutex; /* mutex for is_extended and prog_array_member_cnt */
 	struct bpf_arena *arena;

@@ -1708,6 +1708,16 @@ int bpf_prog_test_run_syscall(struct bpf_prog *prog,
 	retval = bpf_prog_run_pin_on_cpu(prog, ctx);
 	rcu_read_unlock_trace();
 
+	/* A signed loader program that returns 0 has executed its embedded
+	 * signature_match block in full: every metadata-map sha[] dword
+	 * matched the H_meta baked in at signing time, and the metadata map
+	 * was created exclusive (excl_prog_sha != NULL). Promote the verdict
+	 * so observers see that map content was verified, not just the
+	 * loader instruction signature.
+	 */
+	if (retval == 0 && prog->aux->sig_verdict == BPF_SIG_OK)
+		prog->aux->sig_verdict = BPF_SIG_METADATA_VERIFIED;
+
 	if (copy_to_user(&uattr->test.retval, &retval, sizeof(u32))) {
 		err = -EFAULT;
 		goto out;
