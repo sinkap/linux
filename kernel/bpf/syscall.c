@@ -2816,9 +2816,12 @@ static int bpf_prog_verify_signature(struct bpf_prog *prog, union bpf_attr *attr
 				     bool is_kernel)
 {
 	bpfptr_t usig = make_bpfptr(attr->signature, is_kernel);
-	struct bpf_dynptr_kern sig_ptr, insns_ptr;
+	struct bpf_dynptr_kern sig_ptr, data_ptr;
 	struct bpf_key *key = NULL;
-	void *sig;
+	u32 insns_sz, btf_sz = 0;
+	const void *btf_data = NULL;
+	struct btf *btf = NULL;
+	void *sig, *data = NULL;
 	int err = 0;
 
 	/*
@@ -2842,14 +2845,47 @@ static int bpf_prog_verify_signature(struct bpf_prog *prog, union bpf_attr *attr
 		return PTR_ERR(sig);
 	}
 
+	insns_sz = prog->len * sizeof(struct bpf_insn);
+
+	if (attr->prog_btf_fd) {
+		btf = btf_get_by_fd(attr->prog_btf_fd);
+		if (IS_ERR(btf)) {
+			err = PTR_ERR(btf);
+			btf = NULL;
+			goto out;
+		}
+		if (btf_is_kernel(btf)) {
+			err = -EACCES;
+			goto out;
+		}
+		btf_data = btf_get_raw_data(btf, &btf_sz);
+	}
+
+	if (btf_sz) {
+		data = kvmalloc(insns_sz + btf_sz, GFP_KERNEL);
+		if (!data) {
+			err = -ENOMEM;
+			goto out;
+		}
+		memcpy(data, prog->insnsi, insns_sz);
+		memcpy(data + insns_sz, btf_data, btf_sz);
+		bpf_dynptr_init(&data_ptr, data, BPF_DYNPTR_TYPE_LOCAL, 0,
+				insns_sz + btf_sz);
+	} else {
+		bpf_dynptr_init(&data_ptr, prog->insnsi, BPF_DYNPTR_TYPE_LOCAL, 0,
+				insns_sz);
+	}
+
 	bpf_dynptr_init(&sig_ptr, sig, BPF_DYNPTR_TYPE_LOCAL, 0,
 			attr->signature_size);
-	bpf_dynptr_init(&insns_ptr, prog->insnsi, BPF_DYNPTR_TYPE_LOCAL, 0,
-			prog->len * sizeof(struct bpf_insn));
 
-	err = bpf_verify_pkcs7_signature((struct bpf_dynptr *)&insns_ptr,
+	err = bpf_verify_pkcs7_signature((struct bpf_dynptr *)&data_ptr,
 					 (struct bpf_dynptr *)&sig_ptr, key);
 
+out:
+	if (btf)
+		btf_put(btf);
+	kvfree(data);
 	bpf_key_put(key);
 	kvfree(sig);
 	return err;

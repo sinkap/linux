@@ -8320,6 +8320,13 @@ bool btf_is_kernel(const struct btf *btf)
 	return btf->kernel_btf;
 }
 
+const void *btf_get_raw_data(const struct btf *btf, u32 *data_size)
+{
+	if (data_size)
+		*data_size = btf->data_size;
+	return btf->data;
+}
+
 bool btf_is_module(const struct btf *btf)
 {
 	return btf->kernel_btf && strcmp(btf->name, "vmlinux") != 0;
