@@ -141,14 +141,38 @@ modprobe bpf_verifier_replace_test abi_major=99
 #   "bpf: rejecting verifier 'test-replace' with ABI 99.0 (kernel expects 1.x)"
 ```
 
-## Known limitations
+## Stacking + unlimited reloads
 
-- v1 supports a single replacement at a time.  A second
-  `register_bpf_verifier()` while a non-built-in is already active
-  returns `-EBUSY`.
+The dispatcher is a real stack of registered impls, not a single
+replacement slot.  Implications:
+
+- **Unlimited reloads.**  `rmmod bpf_verifier` + `modprobe bpf_verifier`
+  works any number of times.  Each cycle runs a real verification
+  through a fresh instance of the module.
+- **Stacking.**  Loading a second verifier on top of an already-loaded
+  one (e.g. a hotfix module on top of the main one) succeeds; the
+  newer one becomes active, the older one stays in the stack as the
+  fallback.  `bpftool` confirms with two module BTF entries.
+- **Out-of-order rmmod is refused by the kernel.**  Each registration
+  takes `try_module_get()` on the impl below it, so attempting to
+  `rmmod` the bottom of the stack while the top is still loaded fails
+  with *"Module bpf_verifier is in use"* — no use-after-free, no
+  kernel trace.  The user must `rmmod` from the top down.
+
+```
+$ insmod bpf_verifier.ko          # stack: [stub, bpf_verifier]
+$ insmod bpf_verifier_v2.ko       # stack: [stub, bpf_verifier, bpf_verifier_v2]
+$ rmmod bpf_verifier              # refused: "Module bpf_verifier is in use"
+$ rmmod bpf_verifier_v2           # ok    -> stack: [stub, bpf_verifier]
+$ rmmod bpf_verifier              # ok    -> stack: [stub]
+```
+
+## Other limitations
+
 - No per-cgroup or per-task verifier selection.  No multi-version
-  coexistence.  No JIT/maps/helpers/syscall.c modularization.  These
-  are deliberate non-goals for v1 — see the design doc.
+  coexistence with different verifiers serving different programs.
+  No JIT/maps/helpers/syscall.c modularization.  These are deliberate
+  non-goals for v1 — see the design doc.
 - `bpf_log` and `bpf_verifier_log_write` are still plain
   `EXPORT_SYMBOL_GPL` (pre-existing exports we deliberately didn't
   touch).  The rest of the log API is namespace-gated to
