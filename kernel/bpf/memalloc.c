@@ -1045,3 +1045,4 @@ EXPORT_SYMBOL_NS_GPL(bpf_mem_alloc_percpu_init, "BPF_VERIFIER_INTERNAL");
 EXPORT_SYMBOL_NS_GPL(bpf_mem_alloc_percpu_unit_init, "BPF_VERIFIER_INTERNAL");
 
 struct bpf_mem_alloc bpf_global_percpu_ma;
+EXPORT_SYMBOL_NS_GPL(bpf_global_percpu_ma, "BPF_VERIFIER_INTERNAL");

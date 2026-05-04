@@ -110,12 +110,18 @@ static struct bpf_verifier_impl stub_verifier_impl = {
 static struct bpf_verifier_impl __rcu *active_verifier =
 	RCU_INITIALIZER(&stub_verifier_impl);
 
-/* Saved fallback: when a module registers, we record the previously
- * active impl here so unregister_bpf_verifier() can restore it.  v1
- * allows a single replacement, so this is a single slot rather than a
- * stack.
+/* Stack of registered verifier impls, oldest at the head, top-of-stack
+ * (the currently active impl) at the tail.  active_verifier always
+ * points at the tail.  The stub is the implicit bottom -- never on the
+ * list.  Each non-stub registration pins the impl beneath it via
+ * try_module_get(), so out-of-order rmmod is refused by the module
+ * subsystem.
  */
-static struct bpf_verifier_impl *fallback_verifier;
+struct bpf_verifier_stack_node {
+	struct list_head list;
+	struct bpf_verifier_impl *impl;
+};
+static LIST_HEAD(verifier_stack);
 
 static DEFINE_MUTEX(verifier_register_mutex);
 
@@ -190,6 +196,7 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 
 int register_bpf_verifier(struct bpf_verifier_impl *impl)
 {
+	struct bpf_verifier_stack_node *node;
 	struct bpf_verifier_impl *cur;
 	u32 impl_major, kernel_major;
 
@@ -207,24 +214,24 @@ int register_bpf_verifier(struct bpf_verifier_impl *impl)
 		return -ENOEXEC;
 	}
 
+	node = kzalloc_obj(*node, GFP_KERNEL);
+	if (!node)
+		return -ENOMEM;
+	node->impl = impl;
+
 	mutex_lock(&verifier_register_mutex);
 	cur = rcu_dereference_protected(active_verifier,
 					lockdep_is_held(&verifier_register_mutex));
-	if (cur == &stub_verifier_impl) {
-		/* First registration -- the built-in coming up via
-		 * subsys_initcall.  No fallback to remember; the stub
-		 * is just a NULL-deref guard, not something we want to
-		 * fall back to when a module unregisters.
-		 */
-	} else if (fallback_verifier) {
-		/* A non-built-in is already active; v1 only supports a
-		 * single replacement layer.
-		 */
+	/* Pin the impl we're stacking on top of so its module can't be
+	 * removed while we sit above it.  When @cur is the static stub
+	 * (owner == NULL), try_module_get() is a no-op.
+	 */
+	if (cur->owner && !try_module_get(cur->owner)) {
 		mutex_unlock(&verifier_register_mutex);
-		return -EBUSY;
-	} else {
-		fallback_verifier = cur;
+		kfree(node);
+		return -ENOENT;
 	}
+	list_add_tail(&node->list, &verifier_stack);
 	rcu_assign_pointer(active_verifier, impl);
 	mutex_unlock(&verifier_register_mutex);
 
@@ -235,18 +242,17 @@ int register_bpf_verifier(struct bpf_verifier_impl *impl)
 	 */
 	synchronize_rcu();
 
-	pr_info("bpf: verifier '%s' active%s%s%s\n",
+	pr_info("bpf: verifier '%s' active (replacing '%s')\n",
 		impl->name ?: "(unnamed)",
-		fallback_verifier ? " (replacing '" : "",
-		fallback_verifier ? (fallback_verifier->name ?: "(unnamed)") : "",
-		fallback_verifier ? "')" : "");
+		cur->name ?: "(unnamed)");
 	return 0;
 }
 EXPORT_SYMBOL_GPL(register_bpf_verifier);
 
 void unregister_bpf_verifier(struct bpf_verifier_impl *impl)
 {
-	struct bpf_verifier_impl *cur, *next;
+	struct bpf_verifier_stack_node *top;
+	struct bpf_verifier_impl *cur, *next, *below;
 
 	if (WARN_ON_ONCE(!impl))
 		return;
@@ -255,24 +261,40 @@ void unregister_bpf_verifier(struct bpf_verifier_impl *impl)
 	cur = rcu_dereference_protected(active_verifier,
 					lockdep_is_held(&verifier_register_mutex));
 	if (WARN(cur != impl,
-		 "bpf: unregister of inactive verifier '%s' (active is '%s')\n",
+		 "bpf: unregister of non-top verifier '%s' (top is '%s'); module refs should have prevented this\n",
 		 impl->name ?: "(unnamed)", cur->name ?: "(unnamed)")) {
 		mutex_unlock(&verifier_register_mutex);
 		return;
 	}
-	next = fallback_verifier ?: &stub_verifier_impl;
-	fallback_verifier = NULL;
+	top = list_last_entry(&verifier_stack, struct bpf_verifier_stack_node, list);
+	list_del(&top->list);
+	if (list_empty(&verifier_stack)) {
+		next = &stub_verifier_impl;
+		below = &stub_verifier_impl;
+	} else {
+		next = list_last_entry(&verifier_stack,
+				       struct bpf_verifier_stack_node,
+				       list)->impl;
+		below = next;
+	}
 	rcu_assign_pointer(active_verifier, next);
 	mutex_unlock(&verifier_register_mutex);
 
 	/* After synchronize_rcu(), no new caller can observe @impl via
-	 * the dispatcher.  Any caller that observed it before the swap
-	 * already incremented verifier_in_flight inside an RCU read-side
-	 * critical section; wait for them to drain so the caller (or
-	 * their module) can be freed safely.
+	 * the dispatcher.  Drain any caller that observed it before the
+	 * swap.
 	 */
 	synchronize_rcu();
 	wait_event(verifier_drain_wq, atomic_read(&verifier_in_flight) == 0);
+
+	/* Drop the module ref we took in register_bpf_verifier on the
+	 * impl we were stacked on top of.  After this, the now-revealed
+	 * impl below us can be unloaded if no further user pins it.
+	 */
+	if (below->owner)
+		module_put(below->owner);
+
+	kfree(top);
 
 	pr_info("bpf: verifier '%s' inactive (now: '%s')\n",
 		impl->name ?: "(unnamed)",
