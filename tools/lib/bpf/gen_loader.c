@@ -34,6 +34,7 @@
 struct loader_stack {
 	__u32 btf_fd;
 	__u32 inner_map_fd;
+	__u64 metadata_hash[SHA256_DWORD_SIZE];
 	__u32 prog_fd[MAX_USED_PROGS];
 };
 
@@ -152,8 +153,38 @@ void bpf_gen__init(struct bpf_gen *gen, int log_level, int nr_progs, int nr_maps
 	/* R7 contains the error code from sys_bpf. Copy it into R0 and exit. */
 	emit(gen, BPF_MOV64_REG(BPF_REG_0, BPF_REG_7));
 	emit(gen, BPF_EXIT_INSN());
-	if (OPTS_GET(gen->opts, gen_hash, false))
+	if (OPTS_GET(gen->opts, gen_hash, false)) {
+		/* Synthesize a minimal prog BTF from primitives so the FUNC name
+		 * the kernel resolves against vmlinux BTF lives in a blob whose
+		 * bytes are reproducible across build hosts.
+		 */
+		int int_id, ptr_id, proto_id;
+
+		gen->loader_btf = btf__new_empty();
+		if (libbpf_get_error(gen->loader_btf)) {
+			gen->error = -ENOMEM;
+			gen->loader_btf = NULL;
+			return;
+		}
+		int_id = btf__add_int(gen->loader_btf, "int", 4, BTF_INT_SIGNED);
+		ptr_id = btf__add_ptr(gen->loader_btf, 0);
+		proto_id = btf__add_func_proto(gen->loader_btf, int_id);
+		if (proto_id < 0) {
+			gen->error = proto_id;
+			return;
+		}
+		btf__add_func_param(gen->loader_btf, "map", ptr_id);
+		btf__add_func_param(gen->loader_btf, "hash", ptr_id);
+		gen->loader_btf_func_id = btf__add_func(gen->loader_btf,
+							"bpf_loader_verify_metadata",
+							BTF_FUNC_GLOBAL, proto_id);
+		if (gen->loader_btf_func_id < 0) {
+			gen->error = gen->loader_btf_func_id;
+			gen->loader_btf_func_id = 0;
+			return;
+		}
 		emit_signature_match(gen);
+	}
 }
 
 static int add_data(struct bpf_gen *gen, const void *data, __u32 size)
@@ -410,6 +441,19 @@ int bpf_gen__finish(struct bpf_gen *gen, int nr_progs, int nr_maps)
 		opts->data = gen->data_start;
 		opts->data_sz = gen->data_cur - gen->data_start;
 
+		if (gen->loader_btf) {
+			__u32 btf_sz = 0;
+			const void *btf_data;
+
+			btf_data = btf__raw_data(gen->loader_btf, &btf_sz);
+			if (!btf_data) {
+				gen->error = -ENOMEM;
+				return gen->error;
+			}
+			opts->btf = btf_data;
+			opts->btf_sz = btf_sz;
+		}
+
 		/* use target endianness for embedded loader */
 		if (gen->swapped_endian) {
 			struct bpf_insn *insn = (struct bpf_insn *)opts->insns;
@@ -426,6 +470,7 @@ void bpf_gen__free(struct bpf_gen *gen)
 {
 	if (!gen)
 		return;
+	btf__free(gen->loader_btf);
 	free(gen->data_start);
 	free(gen->insn_start);
 	free(gen);
@@ -585,35 +630,41 @@ static void emit_signature_match(struct bpf_gen *gen)
 	__s64 off;
 	int i;
 
-	for (i = 0; i < SHA256_DWORD_SIZE; i++) {
-		emit2(gen, BPF_LD_IMM64_RAW_FULL(BPF_REG_1, BPF_PSEUDO_MAP_IDX,
-						 0, 0, 0, 0));
-		emit(gen, BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_1, i * sizeof(__u64)));
-		gen->hash_insn_offset[i] = gen->insn_cur - gen->insn_start;
-		emit2(gen, BPF_LD_IMM64_RAW_FULL(BPF_REG_3, 0, 0, 0, 0, 0));
-
-		off =  -(gen->insn_cur - gen->insn_start - gen->cleanup_label) / 8 - 1;
-		if (is_simm16(off)) {
-			emit(gen, BPF_MOV64_IMM(BPF_REG_7, -EINVAL));
-			emit(gen, BPF_JMP_REG(BPF_JNE, BPF_REG_2, BPF_REG_3, off));
-		} else {
-			gen->error = -ERANGE;
-			emit(gen, BPF_JMP_IMM(BPF_JA, 0, 0, -1));
-		}
-	}
-
-	/* Reject if the metadata map is not exclusive. Without exclusivity
-	 * the cached map->sha[] verified above can be stale: another BPF
-	 * program with map access could have mutated the contents between
-	 * BPF_OBJ_GET_INFO_BY_FD and loader execution.
-	 */
+	/* arg1: pointer to the metadata struct bpf_map (resolved via fd_array) */
 	emit2(gen, BPF_LD_IMM64_RAW_FULL(BPF_REG_1, BPF_PSEUDO_MAP_IDX,
 					 0, 0, 0, 0));
-	emit(gen, BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_1, SHA256_DWORD_SIZE * sizeof(__u64)));
+
+	/* arg2: pointer to a 32-byte SHA256 buffer on our own BPF stack. The
+	 * dwords come from ld_imm64 immediates that compute_sha_update_offsets()
+	 * patches with the metadata SHA before signing, so the expected hash is
+	 * part of the PKCS#7-signed payload.
+	 */
+	emit(gen, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+	emit(gen, BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, stack_off(metadata_hash)));
+	for (i = 0; i < SHA256_DWORD_SIZE; i++) {
+		gen->hash_insn_offset[i] = gen->insn_cur - gen->insn_start;
+		emit2(gen, BPF_LD_IMM64_RAW_FULL(BPF_REG_3, 0, 0, 0, 0, 0));
+		emit(gen, BPF_STX_MEM(BPF_DW, BPF_REG_2, BPF_REG_3,
+				      i * sizeof(__u64)));
+	}
+
+	/* arg3: byte length of the hash buffer (verifier-checked via __sz). */
+	emit(gen, BPF_MOV64_IMM(BPF_REG_3, SHA256_DWORD_SIZE * sizeof(__u64)));
+
+	/* The kernel resolves the FUNC name in our prog BTF against vmlinux
+	 * BTF and patches imm to the kfunc's vmlinux btf id before
+	 * verification. The kfunc compares hash against map->sha and
+	 * promotes sig_verdict to BPF_SIG_METADATA_VERIFIED on success.
+	 */
+	emit(gen, BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0,
+			       BPF_PSEUDO_KFUNC_CALL_PROG_BTF, 0,
+			       gen->loader_btf_func_id));
+
+	/* On non-zero return: stash the error code in r7 and jump to cleanup. */
+	emit(gen, BPF_MOV64_REG(BPF_REG_7, BPF_REG_0));
 	off = -(gen->insn_cur - gen->insn_start - gen->cleanup_label) / 8 - 1;
 	if (is_simm16(off)) {
-		emit(gen, BPF_MOV64_IMM(BPF_REG_7, -EINVAL));
-		emit(gen, BPF_JMP_IMM(BPF_JEQ, BPF_REG_2, 0, off));
+		emit(gen, BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, off));
 	} else {
 		gen->error = -ERANGE;
 		emit(gen, BPF_JMP_IMM(BPF_JA, 0, 0, -1));
