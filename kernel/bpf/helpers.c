@@ -4257,6 +4257,40 @@ __bpf_kfunc int bpf_verify_pkcs7_signature(const struct bpf_dynptr *data_p,
 	return -EOPNOTSUPP;
 #endif /* CONFIG_SYSTEM_DATA_VERIFICATION */
 }
+
+/**
+ * bpf_loader_verify_metadata - perform the signed loader's metadata-map check
+ * in a single kernel-side step.
+ *
+ * Asserts the metadata map is exclusive, compares its frozen content hash
+ * against the expected SHA256 carried in the loader's signed instruction
+ * stream, and promotes sig_verdict from BPF_SIG_OK to
+ * BPF_SIG_METADATA_VERIFIED.
+ *
+ * @map:       metadata map bound to this loader via excl_prog_hash at sign time
+ * @hash:      pointer to the expected SHA256, spilled to the loader's BPF stack
+ *             from signed ld_imm64 immediates
+ * @hash__sz:  byte length of @hash (must equal SHA256_DIGEST_SIZE)
+ *
+ * Return: 0 on success, -EPERM if not called from a signed loader,
+ * -EINVAL if the map is not exclusive or the hash buffer is the wrong size,
+ * -EBADMSG if the hash does not match.
+ */
+__bpf_kfunc int bpf_loader_verify_metadata(struct bpf_map *map,
+					   const u64 *hash, u32 hash__sz)
+{
+	struct bpf_prog *prog = current->bpf_running_loader_prog;
+
+	if (!prog || prog->aux->sig_verdict != BPF_SIG_OK)
+		return -EPERM;
+	if (!map->excl_prog_sha || hash__sz != SHA256_DIGEST_SIZE)
+		return -EINVAL;
+	if (memcmp(map->sha, hash, SHA256_DIGEST_SIZE))
+		return -EBADMSG;
+
+	prog->aux->sig_verdict = BPF_SIG_METADATA_VERIFIED;
+	return 0;
+}
 #endif /* CONFIG_KEYS */
 
 typedef int (*bpf_task_work_callback_t)(struct bpf_map *map, void *key, void *value);
@@ -4752,6 +4786,7 @@ BTF_ID_FLAGS(func, bpf_lookup_system_key, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_key_put, KF_RELEASE)
 #ifdef CONFIG_SYSTEM_DATA_VERIFICATION
 BTF_ID_FLAGS(func, bpf_verify_pkcs7_signature, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_loader_verify_metadata)
 #endif
 #endif
 #ifdef CONFIG_S390

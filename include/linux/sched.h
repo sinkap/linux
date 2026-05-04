@@ -1583,6 +1583,10 @@ struct task_struct {
 	struct bpf_local_storage __rcu	*bpf_storage;
 	/* Used for BPF run context */
 	struct bpf_run_ctx		*bpf_ctx;
+	/* Loader BPF program currently running in this task. Set/cleared by
+	 * bpf_prog_test_run_syscall() so bpf_loader_mark_verified() can
+	 * promote the loader's sig_verdict. */
+	struct bpf_prog			*bpf_running_loader_prog;
 #endif
 	/* Used by BPF for per-TASK xdp storage */
 	struct bpf_net_context		*bpf_net_context;

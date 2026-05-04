@@ -1664,7 +1664,7 @@ struct bpf_stream_stage {
 enum bpf_sig_verdict {
 	BPF_SIG_UNSIGNED = 0,
 	BPF_SIG_OK,                  /* loader signature verified */
-	BPF_SIG_METADATA_VERIFIED,   /* loader signature + map content verified */
+	BPF_SIG_METADATA_VERIFIED,   /* loader called bpf_loader_verify_metadata() */
 };
 
 enum bpf_sig_keyring {
