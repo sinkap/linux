@@ -1383,6 +1383,11 @@ enum {
  * bpf_call->imm == btf_id of a BTF_KIND_FUNC in the running kernel
  */
 #define BPF_PSEUDO_KFUNC_CALL	2
+/* when bpf_call->src_reg == BPF_PSEUDO_KFUNC_CALL_PROG_BTF,
+ * bpf_call->imm == btf_id of a BTF_KIND_FUNC in the program's
+ * prog BTF. The verifier resolves it to a vmlinux btf_id by name.
+ */
+#define BPF_PSEUDO_KFUNC_CALL_PROG_BTF	3
 
 enum bpf_addr_space_cast {
 	BPF_ADDR_SPACE_CAST = 1,

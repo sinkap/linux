@@ -417,7 +417,12 @@ int bpf_check_btf_info_early(struct bpf_verifier_env *env,
 	if (!attr->func_info_cnt && !attr->line_info_cnt) {
 		if (check_abnormal_return(env))
 			return -EINVAL;
-		return 0;
+		/* Signed loaders carry prog BTF for kfunc name resolution
+		 * but no func/line info; load it anyway.
+		 */
+		if (!attr->prog_btf_fd ||
+		    env->prog->type != BPF_PROG_TYPE_SYSCALL)
+			return 0;
 	}
 
 	if (env->prog->aux->btf)

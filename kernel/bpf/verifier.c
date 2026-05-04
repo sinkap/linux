@@ -2800,6 +2800,47 @@ bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
 	return !!prog->aux->kfunc_tab;
 }
 
+/*
+ * Resolve a gen_loader-emitted kfunc CALL by FUNC name in vmlinux BTF,
+ * then rewrite src_reg back to BPF_PSEUDO_KFUNC_CALL. Caller must have
+ * already filtered for BPF_PSEUDO_KFUNC_CALL_PROG_BTF.
+ */
+static int resolve_loader_kfunc(struct bpf_verifier_env *env,
+				struct bpf_insn *insn, int insn_idx)
+{
+	struct btf *prog_btf = env->prog->aux->btf;
+	const struct btf_type *t;
+	const char *name;
+	s32 vmlinux_id;
+
+	if (!prog_btf || !btf_vmlinux || insn->off) {
+		verbose(env, "kfunc call insn %d: PROG_BTF resolution requires prog BTF and insn->off == 0\n",
+			insn_idx);
+		return -EINVAL;
+	}
+	t = btf_type_by_id(prog_btf, insn->imm);
+	if (!t || !btf_type_is_func(t)) {
+		verbose(env, "kfunc call insn %d: imm %d is not a FUNC in prog BTF\n",
+			insn_idx, insn->imm);
+		return -EINVAL;
+	}
+	name = btf_name_by_offset(prog_btf, t->name_off);
+	if (!name || !name[0]) {
+		verbose(env, "kfunc call insn %d: prog-BTF FUNC has no name\n",
+			insn_idx);
+		return -EINVAL;
+	}
+	vmlinux_id = btf_find_by_name_kind(btf_vmlinux, name, BTF_KIND_FUNC);
+	if (vmlinux_id < 0) {
+		verbose(env, "kfunc call insn %d: %s not found in vmlinux BTF\n",
+			insn_idx, name);
+		return vmlinux_id;
+	}
+	insn->imm = vmlinux_id;
+	insn->src_reg = BPF_PSEUDO_KFUNC_CALL;
+	return 0;
+}
+
 static int add_subprog_and_kfunc(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *subprog = env->subprog_info;
@@ -2813,7 +2854,8 @@ static int add_subprog_and_kfunc(struct bpf_verifier_env *env)
 
 	for (i = 0; i < insn_cnt; i++, insn++) {
 		if (!bpf_pseudo_func(insn) && !bpf_pseudo_call(insn) &&
-		    !bpf_pseudo_kfunc_call(insn))
+		    !bpf_pseudo_kfunc_call(insn) &&
+		    !bpf_pseudo_kfunc_call_prog_btf(insn))
 			continue;
 
 		if (!env->bpf_capable) {
@@ -2821,10 +2863,16 @@ static int add_subprog_and_kfunc(struct bpf_verifier_env *env)
 			return -EPERM;
 		}
 
-		if (bpf_pseudo_func(insn) || bpf_pseudo_call(insn))
+		if (bpf_pseudo_func(insn) || bpf_pseudo_call(insn)) {
 			ret = add_subprog(env, i + insn->imm + 1);
-		else
+		} else {
+			if (bpf_pseudo_kfunc_call_prog_btf(insn)) {
+				ret = resolve_loader_kfunc(env, insn, i);
+				if (ret < 0)
+					return ret;
+			}
 			ret = bpf_add_kfunc_call(env, insn->imm, insn->off);
+		}
 
 		if (ret < 0)
 			return ret;
