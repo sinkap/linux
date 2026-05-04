@@ -3127,6 +3127,13 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, struct bpf_log_at
 		prog->aux->keyring_used = BPF_SIG_KEYRING_NONE;
 	}
 
+	/* Hash insns now, before any verifier-side rewrite, so prog->digest
+	 * matches the excl_prog_hash userspace computed.
+	 */
+	err = bpf_prog_calc_tag(prog);
+	if (err)
+		goto free_prog;
+
 	prog->orig_prog = NULL;
 	prog->jited = 0;
 

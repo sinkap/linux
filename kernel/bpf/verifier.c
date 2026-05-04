@@ -18066,10 +18066,6 @@ static int check_and_resolve_insns(struct bpf_verifier_env *env)
 	int insn_cnt = env->prog->len;
 	int i, err;
 
-	err = bpf_prog_calc_tag(env->prog);
-	if (err)
-		return err;
-
 	for (i = 0; i < insn_cnt; i++, insn++) {
 		if (insn->dst_reg >= MAX_BPF_REG &&
 		    !is_stack_arg_st(insn) && !is_stack_arg_stx(insn)) {
