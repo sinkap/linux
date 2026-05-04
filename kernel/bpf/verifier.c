@@ -2765,6 +2765,42 @@ bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
 	return !!prog->aux->kfunc_tab;
 }
 
+/*
+ * Signed loaders emit kfunc CALL with imm = FUNC type id from the
+ * (signed) prog BTF, since gen_loader can't know vmlinux ids at
+ * sign time. Translate to the matching vmlinux btf id by name.
+ * Clang-compiled programs already carry vmlinux btf ids in imm and
+ * have no FUNC at that id in prog BTF, so they fall through.
+ */
+static int resolve_signed_kfunc_call(struct bpf_verifier_env *env,
+				     struct bpf_insn *insn, int insn_idx)
+{
+	struct btf *prog_btf = env->prog->aux->btf;
+	const struct btf_type *t;
+	const char *name;
+	s32 vmlinux_id;
+
+	if (!prog_btf || !btf_vmlinux || insn->off)
+		return 0;
+	t = btf_type_by_id(prog_btf, insn->imm);
+	if (!t || !btf_type_is_func(t))
+		return 0;
+	name = btf_name_by_offset(prog_btf, t->name_off);
+	if (!name || !name[0]) {
+		verbose(env, "kfunc call insn %d: prog-BTF FUNC has no name\n",
+			insn_idx);
+		return -EINVAL;
+	}
+	vmlinux_id = btf_find_by_name_kind(btf_vmlinux, name, BTF_KIND_FUNC);
+	if (vmlinux_id < 0) {
+		verbose(env, "kfunc call insn %d: %s not found in vmlinux BTF\n",
+			insn_idx, name);
+		return vmlinux_id;
+	}
+	insn->imm = vmlinux_id;
+	return 0;
+}
+
 static int add_subprog_and_kfunc(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *subprog = env->subprog_info;
@@ -2786,10 +2822,14 @@ static int add_subprog_and_kfunc(struct bpf_verifier_env *env)
 			return -EPERM;
 		}
 
-		if (bpf_pseudo_func(insn) || bpf_pseudo_call(insn))
+		if (bpf_pseudo_func(insn) || bpf_pseudo_call(insn)) {
 			ret = add_subprog(env, i + insn->imm + 1);
-		else
+		} else {
+			ret = resolve_signed_kfunc_call(env, insn, i);
+			if (ret < 0)
+				return ret;
 			ret = bpf_add_kfunc_call(env, insn->imm, insn->off);
+		}
 
 		if (ret < 0)
 			return ret;
