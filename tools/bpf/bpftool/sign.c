@@ -134,10 +134,24 @@ int bpftool_prog_sign(struct bpf_load_and_run_opts *opts)
 	EVP_PKEY *private_key = NULL;
 	CMS_ContentInfo *cms = NULL;
 	long actual_sig_len = 0;
+	void *signed_buf = NULL;
+	size_t signed_sz;
 	X509 *x509 = NULL;
 	int err = 0;
 
-	bd_in = BIO_new_mem_buf(opts->insns, opts->insns_sz);
+	signed_sz = opts->insns_sz + opts->btf_sz;
+	if (opts->btf_sz) {
+		signed_buf = malloc(signed_sz);
+		if (!signed_buf) {
+			err = -ENOMEM;
+			goto cleanup;
+		}
+		memcpy(signed_buf, opts->insns, opts->insns_sz);
+		memcpy(signed_buf + opts->insns_sz, opts->btf, opts->btf_sz);
+		bd_in = BIO_new_mem_buf(signed_buf, signed_sz);
+	} else {
+		bd_in = BIO_new_mem_buf(opts->insns, opts->insns_sz);
+	}
 	if (!bd_in) {
 		err = -ENOMEM;
 		goto cleanup;
@@ -212,6 +226,7 @@ cleanup:
 	X509_free(x509);
 	EVP_PKEY_free(private_key);
 	BIO_free(bd_in);
+	free(signed_buf);
 	DISPLAY_OSSL_ERR(err < 0);
 	return err;
 }

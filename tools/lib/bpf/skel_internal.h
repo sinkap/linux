@@ -66,8 +66,10 @@ struct bpf_load_and_run_opts {
 	struct bpf_loader_ctx *ctx;
 	const void *data;
 	const void *insns;
+	const void *btf;
 	__u32 data_sz;
 	__u32 insns_sz;
+	__u32 btf_sz;
 	const char *errstr;
 	void *signature;
 	__u32 signature_sz;
@@ -353,8 +355,9 @@ static inline int skel_map_freeze(int fd)
 static inline int bpf_load_and_run(struct bpf_load_and_run_opts *opts)
 {
 	const size_t prog_load_attr_sz = offsetofend(union bpf_attr, keyring_id);
+	const size_t btf_load_attr_sz = offsetofend(union bpf_attr, btf_token_fd);
 	const size_t test_run_attr_sz = offsetofend(union bpf_attr, test);
-	int map_fd = -1, prog_fd = -1, key = 0, err;
+	int map_fd = -1, prog_fd = -1, btf_fd = -1, key = 0, err;
 	union bpf_attr attr;
 
 	err = map_fd = skel_map_create(BPF_MAP_TYPE_ARRAY, "__loader.map", 4, opts->data_sz, 1,
@@ -387,11 +390,26 @@ static inline int bpf_load_and_run(struct bpf_load_and_run_opts *opts)
 	}
 #endif
 
+	if (opts->btf && opts->btf_sz) {
+		memset(&attr, 0, btf_load_attr_sz);
+		attr.btf = (long) opts->btf;
+		attr.btf_size = opts->btf_sz;
+		err = btf_fd = skel_sys_bpf(BPF_BTF_LOAD, &attr,
+					    btf_load_attr_sz);
+		if (btf_fd < 0) {
+			opts->errstr = "failed to load loader BTF";
+			set_err;
+			goto out;
+		}
+	}
+
 	memset(&attr, 0, prog_load_attr_sz);
 	attr.prog_type = BPF_PROG_TYPE_SYSCALL;
 	attr.insns = (long) opts->insns;
 	attr.insn_cnt = opts->insns_sz / sizeof(struct bpf_insn);
 	attr.license = (long) "Dual BSD/GPL";
+	if (btf_fd >= 0)
+		attr.prog_btf_fd = btf_fd;
 #ifndef __KERNEL__
 	attr.signature = (long) opts->signature;
 	attr.signature_size = opts->signature_sz;
@@ -437,6 +455,8 @@ out:
 		close(map_fd);
 	if (prog_fd >= 0)
 		close(prog_fd);
+	if (btf_fd >= 0)
+		close(btf_fd);
 	return err;
 }
 
