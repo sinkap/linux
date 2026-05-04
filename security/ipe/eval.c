@@ -11,6 +11,7 @@
 #include <linux/rcupdate.h>
 #include <linux/moduleparam.h>
 #include <linux/fsverity.h>
+#include <linux/bpf.h>
 
 #include "ipe.h"
 #include "eval.h"
@@ -265,6 +266,42 @@ static bool evaluate_fsv_sig_true(const struct ipe_eval_ctx *const ctx)
 }
 #endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
 
+#ifdef CONFIG_IPE_PROP_BPF_SIGNATURE
+static bool evaluate_bpf_verdict(const struct ipe_eval_ctx *const ctx,
+				 enum bpf_sig_verdict expected)
+{
+	return ctx->bpf_verdict == expected;
+}
+
+static bool evaluate_bpf_keyring(const struct ipe_eval_ctx *const ctx,
+				 enum bpf_sig_keyring expected)
+{
+	return ctx->bpf_keyring == expected;
+}
+
+static bool evaluate_bpf_kernel(const struct ipe_eval_ctx *const ctx)
+{
+	return ctx->bpf_kernel;
+}
+#else
+static bool evaluate_bpf_verdict(const struct ipe_eval_ctx *const ctx,
+				 enum bpf_sig_verdict expected)
+{
+	return false;
+}
+
+static bool evaluate_bpf_keyring(const struct ipe_eval_ctx *const ctx,
+				 enum bpf_sig_keyring expected)
+{
+	return false;
+}
+
+static bool evaluate_bpf_kernel(const struct ipe_eval_ctx *const ctx)
+{
+	return false;
+}
+#endif /* CONFIG_IPE_PROP_BPF_SIGNATURE */
+
 /**
  * evaluate_property() - Analyze @ctx against a rule property.
  * @ctx: Supplies a pointer to the context to be evaluated.
@@ -297,6 +334,24 @@ static bool evaluate_property(const struct ipe_eval_ctx *const ctx,
 		return evaluate_fsv_sig_false(ctx);
 	case IPE_PROP_FSV_SIG_TRUE:
 		return evaluate_fsv_sig_true(ctx);
+	case IPE_PROP_BPF_SIG_UNSIGNED:
+		return evaluate_bpf_verdict(ctx, BPF_SIG_UNSIGNED);
+	case IPE_PROP_BPF_SIG_OK:
+		return evaluate_bpf_verdict(ctx, BPF_SIG_OK);
+	case IPE_PROP_BPF_SIG_METADATA_VERIFIED:
+		return evaluate_bpf_verdict(ctx, BPF_SIG_METADATA_VERIFIED);
+	case IPE_PROP_BPF_KEYRING_BUILTIN:
+		return evaluate_bpf_keyring(ctx, BPF_SIG_KEYRING_BUILTIN);
+	case IPE_PROP_BPF_KEYRING_SECONDARY:
+		return evaluate_bpf_keyring(ctx, BPF_SIG_KEYRING_SECONDARY);
+	case IPE_PROP_BPF_KEYRING_PLATFORM:
+		return evaluate_bpf_keyring(ctx, BPF_SIG_KEYRING_PLATFORM);
+	case IPE_PROP_BPF_KEYRING_USER:
+		return evaluate_bpf_keyring(ctx, BPF_SIG_KEYRING_USER);
+	case IPE_PROP_BPF_KERNEL_FALSE:
+		return !evaluate_bpf_kernel(ctx);
+	case IPE_PROP_BPF_KERNEL_TRUE:
+		return evaluate_bpf_kernel(ctx);
 	default:
 		return false;
 	}

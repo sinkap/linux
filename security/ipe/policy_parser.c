@@ -237,6 +237,7 @@ static const match_table_t operation_tokens = {
 	{IPE_OP_KEXEC_INITRAMFS,	"op=KEXEC_INITRAMFS"},
 	{IPE_OP_POLICY,			"op=POLICY"},
 	{IPE_OP_X509,			"op=X509_CERT"},
+	{IPE_OP_BPF_PROG_LOAD,		"op=BPF_PROG_LOAD"},
 	{IPE_OP_INVALID,		NULL}
 };
 
@@ -281,6 +282,15 @@ static const match_table_t property_tokens = {
 	{IPE_PROP_FSV_DIGEST,		"fsverity_digest=%s"},
 	{IPE_PROP_FSV_SIG_FALSE,	"fsverity_signature=FALSE"},
 	{IPE_PROP_FSV_SIG_TRUE,		"fsverity_signature=TRUE"},
+	{IPE_PROP_BPF_SIG_UNSIGNED,	"bpf_signature=UNSIGNED"},
+	{IPE_PROP_BPF_SIG_OK,		"bpf_signature=OK"},
+	{IPE_PROP_BPF_SIG_METADATA_VERIFIED, "bpf_signature=METADATA_VERIFIED"},
+	{IPE_PROP_BPF_KEYRING_BUILTIN,	"bpf_keyring=BUILTIN"},
+	{IPE_PROP_BPF_KEYRING_SECONDARY, "bpf_keyring=SECONDARY"},
+	{IPE_PROP_BPF_KEYRING_PLATFORM,	"bpf_keyring=PLATFORM"},
+	{IPE_PROP_BPF_KEYRING_USER,	"bpf_keyring=USER"},
+	{IPE_PROP_BPF_KERNEL_FALSE,	"bpf_kernel=FALSE"},
+	{IPE_PROP_BPF_KERNEL_TRUE,	"bpf_kernel=TRUE"},
 	{IPE_PROP_INVALID,		NULL}
 };
 
@@ -331,6 +341,15 @@ static int parse_property(char *t, struct ipe_rule *r)
 	case IPE_PROP_DMV_SIG_TRUE:
 	case IPE_PROP_FSV_SIG_FALSE:
 	case IPE_PROP_FSV_SIG_TRUE:
+	case IPE_PROP_BPF_SIG_UNSIGNED:
+	case IPE_PROP_BPF_SIG_OK:
+	case IPE_PROP_BPF_SIG_METADATA_VERIFIED:
+	case IPE_PROP_BPF_KEYRING_BUILTIN:
+	case IPE_PROP_BPF_KEYRING_SECONDARY:
+	case IPE_PROP_BPF_KEYRING_PLATFORM:
+	case IPE_PROP_BPF_KEYRING_USER:
+	case IPE_PROP_BPF_KERNEL_FALSE:
+	case IPE_PROP_BPF_KERNEL_TRUE:
 		p->type = token;
 		break;
 	default:
