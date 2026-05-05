@@ -239,6 +239,7 @@ static const match_table_t operation_tokens = {
 	{IPE_OP_X509,			"op=X509_CERT"},
 #ifdef CONFIG_IPE_PROP_BPF_SIGNATURE
 	{IPE_OP_BPF_PROG_LOAD,		"op=BPF_PROG_LOAD"},
+	{IPE_OP_BPF_PROG_LOAD_POST_INTEGRITY, "op=BPF_PROG_LOAD_POST_INTEGRITY"},
 #endif
 	{IPE_OP_INVALID,		NULL}
 };

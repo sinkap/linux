@@ -20,6 +20,7 @@ enum ipe_hook_type {
 	IPE_HOOK_KERNEL_READ,
 	IPE_HOOK_KERNEL_LOAD,
 	IPE_HOOK_BPF_PROG_LOAD,
+	IPE_HOOK_BPF_PROG_LOAD_POST_INTEGRITY,
 	__IPE_HOOK_MAX
 };
 
@@ -57,6 +58,7 @@ int ipe_inode_setintegrity(const struct inode *inode, enum lsm_integrity_type ty
 #ifdef CONFIG_IPE_PROP_BPF_SIGNATURE
 int ipe_bpf_prog_load(struct bpf_prog *prog, union bpf_attr *attr,
 		      struct bpf_token *token, bool kernel);
+int ipe_bpf_prog_load_post_integrity(struct bpf_prog *prog);
 #endif /* CONFIG_IPE_PROP_BPF_SIGNATURE */
 
 #endif /* _IPE_HOOKS_H */

@@ -62,6 +62,7 @@ static struct security_hook_list ipe_hooks[] __ro_after_init = {
 #endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
 #ifdef CONFIG_IPE_PROP_BPF_SIGNATURE
 	LSM_HOOK_INIT(bpf_prog_load, ipe_bpf_prog_load),
+	LSM_HOOK_INIT(bpf_prog_load_post_integrity, ipe_bpf_prog_load_post_integrity),
 #endif /* CONFIG_IPE_PROP_BPF_SIGNATURE */
 };
 

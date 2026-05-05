@@ -42,6 +42,7 @@ static const char *const audit_op_names[__IPE_OP_MAX + 1] = {
 	"POLICY",
 	"X509_CERT",
 	"BPF_PROG_LOAD",
+	"BPF_PROG_LOAD_POST_INTEGRITY",
 	"UNKNOWN",
 };
 
@@ -53,6 +54,7 @@ static const char *const audit_hook_names[__IPE_HOOK_MAX] = {
 	"KERNEL_READ",
 	"KERNEL_LOAD",
 	"BPF_PROG_LOAD",
+	"BPF_PROG_LOAD_POST_INTEGRITY",
 };
 
 static const char *const audit_prop_names[__IPE_PROP_MAX] = {

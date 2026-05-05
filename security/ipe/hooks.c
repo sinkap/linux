@@ -340,6 +340,28 @@ int ipe_bpf_prog_load(struct bpf_prog *prog, union bpf_attr *attr,
 	ctx.bpf_kernel = kernel;
 	return ipe_evaluate_event(&ctx);
 }
+
+/**
+ * ipe_bpf_prog_load_post_integrity() - ipe hook for the post-integrity verdict.
+ * @prog: the loader BPF program whose metadata check just passed.
+ *
+ * Evaluates IPE_OP_BPF_PROG_LOAD_POST_INTEGRITY against the loader.
+ *
+ * Return:
+ * * %0		- Success
+ * * %-EACCES	- Did not pass IPE policy
+ */
+int ipe_bpf_prog_load_post_integrity(struct bpf_prog *prog)
+{
+	struct ipe_eval_ctx ctx = IPE_EVAL_CTX_INIT;
+
+	ipe_build_eval_ctx(&ctx, NULL, IPE_OP_BPF_PROG_LOAD_POST_INTEGRITY,
+			   IPE_HOOK_BPF_PROG_LOAD_POST_INTEGRITY);
+	ctx.bpf_verdict = prog->aux->sig_verdict;
+	ctx.bpf_keyring = prog->aux->keyring_used;
+	ctx.bpf_kernel = false;
+	return ipe_evaluate_event(&ctx);
+}
 #endif /* CONFIG_IPE_PROP_BPF_SIGNATURE */
 
 #ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
