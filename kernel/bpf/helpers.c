@@ -4281,6 +4281,7 @@ __bpf_kfunc int bpf_loader_verify_metadata(struct bpf_map *map,
 {
 	struct bpf_syscall_run_ctx *run_ctx;
 	struct bpf_prog *prog;
+	int err;
 
 	if (!current->bpf_ctx)
 		return -EPERM;
@@ -4297,6 +4298,15 @@ __bpf_kfunc int bpf_loader_verify_metadata(struct bpf_map *map,
 		return -EPERM;
 	if (memcmp(map->sha, hash, SHA256_DIGEST_SIZE))
 		return -EBADMSG;
+
+	/*
+	 * Metadata integrity is decided by the checks above; the LSM hook
+	 * is an observer of that verdict and may apply policy (e.g. deny),
+	 * but cannot vouch for integrity it did not verify itself.
+	 */
+	err = security_bpf_prog_load_post_integrity(prog);
+	if (err)
+		return err;
 
 	prog->aux->sig_verdict = BPF_SIG_METADATA_VERIFIED;
 	return 0;
