@@ -5384,6 +5384,23 @@ int security_bpf_prog_load(struct bpf_prog *prog, union bpf_attr *attr,
 }
 
 /**
+ * security_bpf_prog_load_post_integrity() - Notify LSMs that a signed loader
+ * has just verified its metadata map.
+ * @prog: the loader BPF program whose metadata check passed.
+ *
+ * Invoked by bpf_loader_verify_metadata() after the kernel-side hash check
+ * succeeds, before prog->aux->sig_verdict is promoted to
+ * BPF_SIG_METADATA_VERIFIED. A non-zero return aborts the kfunc and leaves
+ * the verdict at BPF_SIG_OK.
+ *
+ * Return: 0 on success, negative errno to deny.
+ */
+int security_bpf_prog_load_post_integrity(struct bpf_prog *prog)
+{
+	return call_int_hook(bpf_prog_load_post_integrity, prog);
+}
+
+/**
  * security_bpf_token_create() - Check if creating of BPF token is allowed
  * @token: BPF token object
  * @attr: BPF syscall attributes used to create BPF token
