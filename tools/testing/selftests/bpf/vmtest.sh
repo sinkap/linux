@@ -294,7 +294,7 @@ EOF
 		-m 4G \
 		-drive file="${rootfs_img}",format=raw,index=1,media=disk,if=virtio,cache=none \
 		-kernel "${kernel_bzimage}" \
-		-append "root=/dev/vda rw console=${QEMU_CONSOLE}"
+		-append "root=/dev/vda rw console=${QEMU_CONSOLE} ${VMTEST_EXTRA_CMDLINE:-}"
 }
 
 copy_logs()
