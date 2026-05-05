@@ -4280,6 +4280,7 @@ __bpf_kfunc int bpf_loader_verify_metadata(struct bpf_map *map,
 					   const u64 *hash, u32 hash__sz)
 {
 	struct bpf_prog *prog = current->bpf_running_loader_prog;
+	int err;
 
 	if (!prog || prog->aux->sig_verdict != BPF_SIG_OK)
 		return -EPERM;
@@ -4287,6 +4288,14 @@ __bpf_kfunc int bpf_loader_verify_metadata(struct bpf_map *map,
 		return -EINVAL;
 	if (memcmp(map->sha, hash, SHA256_DIGEST_SIZE))
 		return -EBADMSG;
+
+	/* Give policy LSMs a chance to deny based on the post-integrity
+	 * state before we record it. If denied, sig_verdict stays at
+	 * BPF_SIG_OK and the loader sees the kfunc fail.
+	 */
+	err = security_bpf_prog_load_post_integrity(prog);
+	if (err)
+		return err;
 
 	prog->aux->sig_verdict = BPF_SIG_METADATA_VERIFIED;
 	return 0;
