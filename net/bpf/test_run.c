@@ -1683,6 +1683,8 @@ int bpf_prog_test_run_syscall(struct bpf_prog *prog,
 {
 	void __user *ctx_in = u64_to_user_ptr(kattr->test.ctx_in);
 	__u32 ctx_size_in = kattr->test.ctx_size_in;
+	struct bpf_syscall_run_ctx run_ctx;
+	struct bpf_run_ctx *old_run_ctx;
 	void *ctx = NULL;
 	u32 retval;
 	int err = 0;
@@ -1704,9 +1706,12 @@ int bpf_prog_test_run_syscall(struct bpf_prog *prog,
 			return PTR_ERR(ctx);
 	}
 
+	run_ctx.prog = prog;
+	old_run_ctx = bpf_set_run_ctx(&run_ctx.run_ctx);
 	rcu_read_lock_trace();
 	retval = bpf_prog_run_pin_on_cpu(prog, ctx);
 	rcu_read_unlock_trace();
+	bpf_reset_run_ctx(old_run_ctx);
 
 	if (copy_to_user(&uattr->test.retval, &retval, sizeof(u32))) {
 		err = -EFAULT;

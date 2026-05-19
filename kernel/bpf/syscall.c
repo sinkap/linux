@@ -6537,6 +6537,8 @@ int kern_sys_bpf(int cmd, union bpf_attr *attr, unsigned int size)
 {
 	struct bpf_prog * __maybe_unused prog;
 	struct bpf_tramp_run_ctx __maybe_unused run_ctx;
+	struct bpf_syscall_run_ctx __maybe_unused sys_run_ctx;
+	struct bpf_run_ctx __maybe_unused *old_run_ctx;
 
 	switch (cmd) {
 #ifdef CONFIG_BPF_JIT /* __bpf_prog_enter_sleepable used by trampoline and JIT */
@@ -6563,7 +6565,10 @@ int kern_sys_bpf(int cmd, union bpf_attr *attr, unsigned int size)
 			bpf_prog_put(prog);
 			return -EBUSY;
 		}
+		sys_run_ctx.prog = prog;
+		old_run_ctx = bpf_set_run_ctx(&sys_run_ctx.run_ctx);
 		attr->test.retval = bpf_prog_run(prog, (void *) (long) attr->test.ctx_in);
+		bpf_reset_run_ctx(old_run_ctx);
 		__bpf_prog_exit_sleepable_recur(prog, 0 /* bpf_prog_run does runtime stats */,
 						&run_ctx);
 		bpf_prog_put(prog);

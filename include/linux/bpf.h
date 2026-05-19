@@ -1665,7 +1665,7 @@ struct bpf_stream_stage {
 enum bpf_sig_verdict {
 	BPF_SIG_UNSIGNED = 0,
 	BPF_SIG_OK,                  /* loader signature verified */
-	BPF_SIG_METADATA_VERIFIED,   /* loader signature + map content verified */
+	BPF_SIG_METADATA_VERIFIED,   /* loader called bpf_loader_verify_metadata() */
 };
 
 enum bpf_sig_keyring {
@@ -2443,6 +2443,15 @@ struct bpf_tramp_run_ctx {
 	struct bpf_run_ctx run_ctx;
 	u64 bpf_cookie;
 	struct bpf_run_ctx *saved_run_ctx;
+};
+
+/* Run context installed by bpf_prog_test_run_syscall() so kfuncs invoked
+ * from a BPF_PROG_TYPE_SYSCALL program (e.g. bpf_loader_verify_metadata)
+ * can recover the calling prog via container_of(current->bpf_ctx, ...).
+ */
+struct bpf_syscall_run_ctx {
+	struct bpf_run_ctx run_ctx;
+	struct bpf_prog *prog;
 };
 
 static inline struct bpf_run_ctx *bpf_set_run_ctx(struct bpf_run_ctx *new_ctx)

@@ -4257,6 +4257,50 @@ __bpf_kfunc int bpf_verify_pkcs7_signature(const struct bpf_dynptr *data_p,
 	return -EOPNOTSUPP;
 #endif /* CONFIG_SYSTEM_DATA_VERIFICATION */
 }
+
+/**
+ * bpf_loader_verify_metadata - perform the signed loader's metadata-map check
+ * in a single kernel-side step.
+ *
+ * Asserts the metadata map is exclusive, compares its frozen content hash
+ * against the expected SHA256 carried in the loader's signed instruction
+ * stream, and promotes sig_verdict from BPF_SIG_OK to
+ * BPF_SIG_METADATA_VERIFIED.
+ *
+ * @map:       metadata map bound to this loader via excl_prog_hash at sign time
+ * @hash:      pointer to the expected SHA256, spilled to the loader's BPF stack
+ *             from signed ld_imm64 immediates
+ * @hash__sz:  byte length of @hash (must equal SHA256_DIGEST_SIZE)
+ *
+ * Return: 0 on success, -EPERM if not called from a signed loader,
+ * -EINVAL if the map is not exclusive or the hash buffer is the wrong size,
+ * -EBADMSG if the hash does not match.
+ */
+__bpf_kfunc int bpf_loader_verify_metadata(struct bpf_map *map,
+					   const u64 *hash, u32 hash__sz)
+{
+	struct bpf_syscall_run_ctx *run_ctx;
+	struct bpf_prog *prog;
+
+	if (!current->bpf_ctx)
+		return -EPERM;
+	run_ctx = container_of(current->bpf_ctx, struct bpf_syscall_run_ctx,
+			       run_ctx);
+	prog = run_ctx->prog;
+	if (!prog || prog->aux->sig_verdict != BPF_SIG_OK)
+		return -EPERM;
+	if (!map->excl_prog_sha || hash__sz != SHA256_DIGEST_SIZE)
+		return -EINVAL;
+	if (memcmp(map->excl_prog_sha, prog->digest, SHA256_DIGEST_SIZE))
+		return -EPERM;
+	if (!READ_ONCE(map->frozen))
+		return -EPERM;
+	if (memcmp(map->sha, hash, SHA256_DIGEST_SIZE))
+		return -EBADMSG;
+
+	prog->aux->sig_verdict = BPF_SIG_METADATA_VERIFIED;
+	return 0;
+}
 #endif /* CONFIG_KEYS */
 
 typedef int (*bpf_task_work_callback_t)(struct bpf_map *map, void *key, void *value);
@@ -4764,6 +4808,17 @@ static const struct btf_kfunc_id_set generic_kfunc_set = {
 	.set   = &generic_btf_ids,
 };
 
+#if defined(CONFIG_KEYS) && defined(CONFIG_SYSTEM_DATA_VERIFICATION)
+BTF_KFUNCS_START(syscall_btf_ids)
+BTF_ID_FLAGS(func, bpf_loader_verify_metadata, KF_SLEEPABLE)
+BTF_KFUNCS_END(syscall_btf_ids)
+
+static const struct btf_kfunc_id_set syscall_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set   = &syscall_btf_ids,
+};
+#endif
+
 
 BTF_ID_LIST(generic_dtor_ids)
 BTF_ID(struct, task_struct)
@@ -4893,6 +4948,9 @@ static int __init kfunc_init(void)
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &generic_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &generic_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_CGROUP_SKB, &generic_kfunc_set);
+#if defined(CONFIG_KEYS) && defined(CONFIG_SYSTEM_DATA_VERIFICATION)
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &syscall_kfunc_set);
+#endif
 	ret = ret ?: register_btf_id_dtor_kfuncs(generic_dtors,
 						  ARRAY_SIZE(generic_dtors),
 						  THIS_MODULE);
