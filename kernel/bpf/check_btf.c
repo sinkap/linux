@@ -420,6 +420,12 @@ int bpf_check_btf_info_early(struct bpf_verifier_env *env,
 		return 0;
 	}
 
+	if (env->prog->aux->btf)
+		return check_btf_func_early(env, attr, uattr);
+
+	if (!attr->prog_btf_fd)
+		return -EINVAL;
+
 	btf = btf_get_by_fd(attr->prog_btf_fd);
 	if (IS_ERR(btf))
 		return PTR_ERR(btf);
