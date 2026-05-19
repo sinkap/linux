@@ -11,6 +11,8 @@
 #include <linux/bpf.h>
 #else
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include <linux/keyctl.h>
@@ -66,8 +68,10 @@ struct bpf_load_and_run_opts {
 	struct bpf_loader_ctx *ctx;
 	const void *data;
 	const void *insns;
+	const void *btf;
 	__u32 data_sz;
 	__u32 insns_sz;
+	__u32 btf_sz;
 	const char *errstr;
 	void *signature;
 	__u32 signature_sz;
@@ -86,6 +90,36 @@ static inline int skel_sys_bpf(enum bpf_cmd cmd, union bpf_attr *attr,
 #else
 	return syscall(__NR_bpf, cmd, attr, size);
 #endif
+}
+
+/* If fd is 0/1/2, dup it to a fd >= 3 and close the original. Keeps
+ * BPF sentinel-fd fields (e.g. attr->prog_btf_fd) from being mistaken
+ * for "absent" when stdio is closed in the caller. No-op in kernel
+ * context, where kthread fd 0 is not stdio.
+ */
+static inline int skel_ensure_good_fd(int fd)
+{
+#ifdef __KERNEL__
+	return fd;
+#else
+	int old_fd = fd, saved_errno;
+
+	if (fd < 0)
+		return fd;
+	if (fd < 3) {
+		fd = fcntl(old_fd, F_DUPFD_CLOEXEC, 3);
+		saved_errno = errno;
+		close(old_fd);
+		errno = saved_errno;
+	}
+	return fd;
+#endif
+}
+
+static inline int skel_sys_bpf_fd(enum bpf_cmd cmd, union bpf_attr *attr,
+				  unsigned int size)
+{
+	return skel_ensure_good_fd(skel_sys_bpf(cmd, attr, size));
 }
 
 #ifdef __KERNEL__
@@ -253,7 +287,7 @@ static inline int skel_map_create(enum bpf_map_type map_type,
 	attr.value_size = value_size;
 	attr.max_entries = max_entries;
 
-	return skel_sys_bpf(BPF_MAP_CREATE, &attr, attr_sz);
+	return skel_sys_bpf_fd(BPF_MAP_CREATE, &attr, attr_sz);
 }
 
 static inline int skel_map_update_elem(int fd, const void *key,
@@ -291,7 +325,7 @@ static inline int skel_map_get_fd_by_id(__u32 id)
 	memset(&attr, 0, attr_sz);
 	attr.map_id = id;
 
-	return skel_sys_bpf(BPF_MAP_GET_FD_BY_ID, &attr, attr_sz);
+	return skel_sys_bpf_fd(BPF_MAP_GET_FD_BY_ID, &attr, attr_sz);
 }
 
 static inline int skel_raw_tracepoint_open(const char *name, int prog_fd)
@@ -303,7 +337,7 @@ static inline int skel_raw_tracepoint_open(const char *name, int prog_fd)
 	attr.raw_tracepoint.name = (long) name;
 	attr.raw_tracepoint.prog_fd = prog_fd;
 
-	return skel_sys_bpf(BPF_RAW_TRACEPOINT_OPEN, &attr, attr_sz);
+	return skel_sys_bpf_fd(BPF_RAW_TRACEPOINT_OPEN, &attr, attr_sz);
 }
 
 static inline int skel_link_create(int prog_fd, int target_fd,
@@ -317,7 +351,7 @@ static inline int skel_link_create(int prog_fd, int target_fd,
 	attr.link_create.target_fd = target_fd;
 	attr.link_create.attach_type = attach_type;
 
-	return skel_sys_bpf(BPF_LINK_CREATE, &attr, attr_sz);
+	return skel_sys_bpf_fd(BPF_LINK_CREATE, &attr, attr_sz);
 }
 
 static inline int skel_obj_get_info_by_fd(int fd)
@@ -358,8 +392,9 @@ static inline int skel_map_freeze(int fd)
 static inline int bpf_load_and_run(struct bpf_load_and_run_opts *opts)
 {
 	const size_t prog_load_attr_sz = offsetofend(union bpf_attr, keyring_id);
+	const size_t btf_load_attr_sz = offsetofend(union bpf_attr, btf_token_fd);
 	const size_t test_run_attr_sz = offsetofend(union bpf_attr, test);
-	int map_fd = -1, prog_fd = -1, key = 0, err;
+	int map_fd = -1, prog_fd = -1, btf_fd = -1, key = 0, err;
 	union bpf_attr attr;
 
 	err = map_fd = skel_map_create(BPF_MAP_TYPE_ARRAY, "__loader.map", 4, opts->data_sz, 1,
@@ -392,11 +427,29 @@ static inline int bpf_load_and_run(struct bpf_load_and_run_opts *opts)
 	}
 #endif
 
+	if (opts->btf && opts->btf_sz) {
+		memset(&attr, 0, btf_load_attr_sz);
+		attr.btf = (long) opts->btf;
+		attr.btf_size = opts->btf_sz;
+		attr.btf_log_level = opts->ctx->log_level;
+		attr.btf_log_size = opts->ctx->log_size;
+		attr.btf_log_buf = opts->ctx->log_buf;
+		err = btf_fd = skel_sys_bpf_fd(BPF_BTF_LOAD, &attr,
+					       btf_load_attr_sz);
+		if (btf_fd < 0) {
+			opts->errstr = "failed to load loader BTF";
+			set_err;
+			goto out;
+		}
+	}
+
 	memset(&attr, 0, prog_load_attr_sz);
 	attr.prog_type = BPF_PROG_TYPE_SYSCALL;
 	attr.insns = (long) opts->insns;
 	attr.insn_cnt = opts->insns_sz / sizeof(struct bpf_insn);
 	attr.license = (long) "Dual BSD/GPL";
+	if (btf_fd >= 0)
+		attr.prog_btf_fd = btf_fd;
 #ifndef __KERNEL__
 	attr.signature = (long) opts->signature;
 	attr.signature_size = opts->signature_sz;
@@ -411,7 +464,7 @@ static inline int bpf_load_and_run(struct bpf_load_and_run_opts *opts)
 	attr.log_size = opts->ctx->log_size;
 	attr.log_buf = opts->ctx->log_buf;
 	attr.prog_flags = BPF_F_SLEEPABLE;
-	err = prog_fd = skel_sys_bpf(BPF_PROG_LOAD, &attr, prog_load_attr_sz);
+	err = prog_fd = skel_sys_bpf_fd(BPF_PROG_LOAD, &attr, prog_load_attr_sz);
 	if (prog_fd < 0) {
 		opts->errstr = "failed to load loader prog";
 		set_err;
@@ -442,6 +495,8 @@ out:
 		close(map_fd);
 	if (prog_fd >= 0)
 		close(prog_fd);
+	if (btf_fd >= 0)
+		close(btf_fd);
 	return err;
 }
 
