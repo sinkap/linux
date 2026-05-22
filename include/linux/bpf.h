@@ -295,7 +295,7 @@ struct bpf_map_owner {
 
 struct bpf_map {
 	u8 sha[SHA256_DIGEST_SIZE];
-	char *excl_prog_sha;
+	__bpf_md_ptr(char *, excl_prog_sha);
 	const struct bpf_map_ops *ops;
 	struct bpf_map *inner_map_meta;
 #ifdef CONFIG_SECURITY
