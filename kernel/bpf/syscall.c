@@ -1557,6 +1557,17 @@ static int map_create(union bpf_attr *attr, bpfptr_t uattr)
 	if (attr->excl_prog_hash) {
 		bpfptr_t uprog_hash = make_bpfptr(attr->excl_prog_hash, uattr.is_kernel);
 
+		/*
+		 * gen_loader emits a fixed-offset BPF_DW load of
+		 * map->excl_prog_sha right after the inline sha[] array;
+		 * pin the layout assumptions it relies on.
+		 */
+		BUILD_BUG_ON(offsetof(struct bpf_map, sha) != 0);
+		BUILD_BUG_ON(offsetof(struct bpf_map, excl_prog_sha) !=
+			     SHA256_DIGEST_SIZE);
+		BUILD_BUG_ON(sizeof_field(struct bpf_map, excl_prog_sha) !=
+			     sizeof(__u64));
+
 		if (attr->excl_prog_hash_size != SHA256_DIGEST_SIZE) {
 			err = -EINVAL;
 			goto free_map;
