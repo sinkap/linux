@@ -3,6 +3,7 @@
 #include <linux/btf.h>
 #include <linux/dma-buf.h>
 #include <linux/err.h>
+#include <linux/eventfd.h>
 #include <linux/highmem.h>
 #include <linux/irq_work.h>
 #include <linux/platform_device.h>
@@ -56,6 +57,11 @@ struct bpf_ringbuf {
 	struct dma_buf *dmabuf;
 	struct dma_buf_attachment *attach;
 	struct sg_table *sgt;
+	/* Optional: signalled from bpf_ringbuf_notify() after each committed
+	 * record so an external consumer (e.g. a SmartNIC ACC reading the
+	 * ringbuf pages over PCIe DMA) can wake without spin-polling.
+	 * Set when BPF_F_RB_NOTIFY_EVENTFD is passed to bpf_map_create. */
+	struct eventfd_ctx *notify_fd;
 	rqspinlock_t spinlock ____cacheline_aligned_in_smp;
 	/* For user-space producer ring buffers, an atomic_t busy bit is used
 	 * to synchronize access to the ring buffers in the kernel, rather than
@@ -113,6 +119,8 @@ struct bpf_ringbuf_hdr {
 	u32 len;
 	u32 pg_off;
 };
+
+static void bpf_ringbuf_free(struct bpf_ringbuf *rb);
 
 static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node)
 {
@@ -393,6 +401,10 @@ static void bpf_ringbuf_notify(struct irq_work *work)
 	struct bpf_ringbuf *rb = container_of(work, struct bpf_ringbuf, work);
 
 	wake_up_all(&rb->waitq);
+	/* Wake an external consumer (e.g. a SmartNIC ACC reading the ringbuf
+	 * pages over PCIe DMA) that cannot wait on our waitq. */
+	if (rb->notify_fd)
+		eventfd_signal(rb->notify_fd);
 }
 
 /* Maximum size of ring buffer area is limited by 32-bit page offset within
@@ -470,6 +482,10 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 		if (!attr->map_extra || !PAGE_ALIGNED(attr->map_extra))
 			return ERR_PTR(-EINVAL);
 		shmem_va = (unsigned long)attr->map_extra;
+		/* notify_fd < 0 means "no doorbell" (field defaults to
+		 * -1 when zeroed by userspace). */
+		if (attr->notify_fd < -1)
+			return ERR_PTR(-EINVAL);
 	} else if (attr->map_flags & BPF_F_RB_DMABUF) {
 		if (attr->map_type != BPF_MAP_TYPE_RINGBUF)
 			return ERR_PTR(-EINVAL);
@@ -500,6 +516,19 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 		return ERR_PTR(-ENOMEM);
 	}
 
+	/* Register the optional external-consumer doorbell eventfd.
+	 * Only honoured for BPF_F_RB_SHMEM (external backing pages). */
+	if (shmem_va && attr->notify_fd >= 0) {
+		struct eventfd_ctx *ctx = eventfd_ctx_fdget(attr->notify_fd);
+
+		if (IS_ERR(ctx)) {
+			bpf_ringbuf_free(rb_map->rb);
+			bpf_map_area_free(rb_map);
+			return ERR_CAST(ctx);
+		}
+		rb_map->rb->notify_fd = ctx;
+	}
+
 	return &rb_map->map;
 }
 
@@ -514,6 +543,7 @@ static void bpf_ringbuf_free(struct bpf_ringbuf *rb)
 	struct dma_buf *dmabuf = rb->dmabuf;
 	struct dma_buf_attachment *attach = rb->attach;
 	struct sg_table *sgt = rb->sgt;
+	struct eventfd_ctx *notify_fd = rb->notify_fd;
 
 	vunmap(rb);
 
@@ -545,6 +575,9 @@ static void bpf_ringbuf_free(struct bpf_ringbuf *rb)
 		break;
 	}
 	bpf_map_area_free(pages);
+
+	if (notify_fd)
+		eventfd_ctx_put(notify_fd);
 }
 
 static void ringbuf_map_free(struct bpf_map *map)

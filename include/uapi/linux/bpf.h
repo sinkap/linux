@@ -1576,6 +1576,14 @@ union bpf_attr {
 		__aligned_u64 excl_prog_hash;
 		/* Size of the passed excl_prog_hash. */
 		__u32 excl_prog_hash_size;
+
+		/* For BPF_MAP_TYPE_RINGBUF with BPF_F_RB_SHMEM: if >= 0 the
+		 * kernel takes a reference on this eventfd and signals it from
+		 * bpf_ringbuf_notify() after each committed record, waking an
+		 * external consumer (e.g. a SmartNIC ACC over PCIe DMA).
+		 * Set to -1 (default) to disable.
+		 */
+		__s32 notify_fd;
 	};
 
 	struct { /* anonymous struct used by BPF_MAP_*_ELEM and BPF_MAP_FREEZE commands */

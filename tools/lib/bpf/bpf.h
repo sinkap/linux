@@ -57,9 +57,16 @@ struct bpf_map_create_opts {
 
 	const void *excl_prog_hash;
 	__u32 excl_prog_hash_size;
+
+	/* For BPF_MAP_TYPE_RINGBUF with BPF_F_RB_SHMEM: if >= 0 the kernel
+	 * signals this eventfd from bpf_ringbuf_notify() after each record,
+	 * waking an external consumer (e.g. a SmartNIC ACC over PCIe DMA).
+	 * -1 (default) disables the feature.
+	 */
+	__s32 notify_fd;
 	size_t :0;
 };
-#define bpf_map_create_opts__last_field excl_prog_hash_size
+#define bpf_map_create_opts__last_field notify_fd
 
 LIBBPF_API int bpf_map_create(enum bpf_map_type map_type,
 			      const char *map_name,

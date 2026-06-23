@@ -1357,7 +1357,7 @@ free_map_tab:
 	return ret;
 }
 
-#define BPF_MAP_CREATE_LAST_FIELD excl_prog_hash_size
+#define BPF_MAP_CREATE_LAST_FIELD notify_fd
 /* called via syscall */
 static int map_create(union bpf_attr *attr, bpfptr_t uattr)
 {
