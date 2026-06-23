@@ -1390,6 +1390,7 @@ static int map_create(union bpf_attr *attr, bpfptr_t uattr)
 
 	if (attr->map_type != BPF_MAP_TYPE_BLOOM_FILTER &&
 	    attr->map_type != BPF_MAP_TYPE_ARENA &&
+	    attr->map_type != BPF_MAP_TYPE_RINGBUF &&
 	    attr->map_extra != 0)
 		return -EINVAL;
 

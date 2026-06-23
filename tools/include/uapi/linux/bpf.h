@@ -1456,6 +1456,18 @@ enum {
 
 /* Enable BPF ringbuf overwrite mode */
 	BPF_F_RB_OVERWRITE	= (1U << 19),
+
+/* Back BPF_MAP_TYPE_RINGBUF with externally-provided shared-memory pages
+ * supplied as a userspace VA in bpf_attr::map_extra. The kernel pins the
+ * pages with FOLL_LONGTERM and uses them for the ringbuf's consumer page,
+ * producer page, and data pages (in that order). The non-mmappable header
+ * meta pages are still kernel-allocated. The VA must be page-aligned and
+ * cover at least (2 + max_entries/PAGE_SIZE) pages. Intended for sharing
+ * a ringbuf across address spaces (e.g. between a VM and its host via
+ * memfd-backed memory-backend-file, or between a host and a device that
+ * DMA-maps the same pages).
+ */
+	BPF_F_RB_SHMEM		= (1U << 20),
 };
 
 /* Flags for BPF_PROG_QUERY. */

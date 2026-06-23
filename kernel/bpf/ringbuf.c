@@ -2,6 +2,7 @@
 #include <linux/bpf.h>
 #include <linux/btf.h>
 #include <linux/err.h>
+#include <linux/highmem.h>
 #include <linux/irq_work.h>
 #include <linux/slab.h>
 #include <linux/filter.h>
@@ -14,7 +15,8 @@
 #include <linux/btf_ids.h>
 #include <asm/rqspinlock.h>
 
-#define RINGBUF_CREATE_FLAG_MASK (BPF_F_NUMA_NODE | BPF_F_RB_OVERWRITE)
+#define RINGBUF_CREATE_FLAG_MASK \
+	(BPF_F_NUMA_NODE | BPF_F_RB_OVERWRITE | BPF_F_RB_SHMEM)
 
 /* non-mmap()'able part of bpf_ringbuf (everything up to consumer page) */
 #define RINGBUF_PGOFF \
@@ -32,6 +34,12 @@ struct bpf_ringbuf {
 	struct page **pages;
 	int nr_pages;
 	bool overwrite_mode;
+	/* If true, the consumer/producer/data pages were pinned from a
+	 * userspace VA via pin_user_pages_fast() (BPF_F_RB_SHMEM). They
+	 * must be released with unpin_user_pages() rather than __free_page().
+	 * Only the first RINGBUF_PGOFF entries of @pages are kernel-allocated.
+	 */
+	bool shmem_backed;
 	rqspinlock_t spinlock ____cacheline_aligned_in_smp;
 	/* For user-space producer ring buffers, an atomic_t busy bit is used
 	 * to synchronize access to the ring buffers in the kernel, rather than
@@ -151,6 +159,89 @@ err_free_pages:
 	return NULL;
 }
 
+/* BPF_F_RB_SHMEM variant: the non-mmappable header meta pages are
+ * kernel-allocated as usual, but the consumer page, producer page and
+ * data pages are pinned from a userspace VA (typically an mmap of a
+ * memfd_create() region). The same physical pages can therefore be
+ * observed from another process or another machine that shares the
+ * backing store.
+ */
+static struct bpf_ringbuf *bpf_ringbuf_area_alloc_shmem(size_t data_sz,
+							int numa_node,
+							unsigned long user_va)
+{
+	const gfp_t hdr_flags = GFP_KERNEL_ACCOUNT | __GFP_RETRY_MAYFAIL |
+				__GFP_NOWARN | __GFP_ZERO;
+	int nr_hdr_pages = RINGBUF_PGOFF;
+	int nr_data_pages = data_sz >> PAGE_SHIFT;
+	int nr_shared_pages = RINGBUF_POS_PAGES + nr_data_pages;
+	int nr_meta_pages = RINGBUF_NR_META_PAGES;
+	int nr_pages = nr_meta_pages + nr_data_pages;
+	struct page **pages, *page;
+	struct bpf_ringbuf *rb;
+	size_t array_size;
+	long pinned;
+	int i, j;
+
+	if (!user_va || !PAGE_ALIGNED(user_va))
+		return NULL;
+
+	array_size = (nr_meta_pages + 2 * nr_data_pages) * sizeof(*pages);
+	pages = bpf_map_area_alloc(array_size, numa_node);
+	if (!pages)
+		return NULL;
+
+	for (i = 0; i < nr_hdr_pages; i++) {
+		page = alloc_pages_node(numa_node, hdr_flags, 0);
+		if (!page)
+			goto err_free_hdr;
+		pages[i] = page;
+	}
+
+	pinned = pin_user_pages_fast(user_va, nr_shared_pages,
+				     FOLL_LONGTERM | FOLL_WRITE,
+				     &pages[nr_hdr_pages]);
+	if (pinned < 0)
+		goto err_free_hdr;
+	if (pinned != nr_shared_pages) {
+		unpin_user_pages(&pages[nr_hdr_pages], pinned);
+		goto err_free_hdr;
+	}
+
+	/* Zero the pinned consumer/producer/data pages. Userspace allocates
+	 * the backing region (memfd) which may carry stale content; the
+	 * ringbuf protocol expects consumer_pos/producer_pos to start at
+	 * zero, and the data area to be empty.
+	 */
+	for (j = 0; j < nr_shared_pages; j++)
+		clear_highpage(pages[nr_hdr_pages + j]);
+
+	/* Mirror data pages for wrap-around, matching the kernel-pages
+	 * variant's layout.
+	 */
+	for (j = nr_meta_pages; j < nr_pages; j++)
+		pages[nr_data_pages + j] = pages[j];
+
+	rb = vmap(pages, nr_meta_pages + 2 * nr_data_pages,
+		  VM_MAP | VM_USERMAP, PAGE_KERNEL);
+	if (!rb) {
+		unpin_user_pages(&pages[nr_hdr_pages], nr_shared_pages);
+		goto err_free_hdr;
+	}
+
+	kmemleak_not_leak(pages);
+	rb->pages = pages;
+	rb->nr_pages = nr_pages;
+	rb->shmem_backed = true;
+	return rb;
+
+err_free_hdr:
+	while (i-- > 0)
+		__free_page(pages[i]);
+	bpf_map_area_free(pages);
+	return NULL;
+}
+
 static void bpf_ringbuf_notify(struct irq_work *work)
 {
 	struct bpf_ringbuf *rb = container_of(work, struct bpf_ringbuf, work);
@@ -169,11 +260,16 @@ static void bpf_ringbuf_notify(struct irq_work *work)
  * considering that the maximum value of data_sz is (4GB - 1), there
  * will be no overflow, so just note the size limit in the comments.
  */
-static struct bpf_ringbuf *bpf_ringbuf_alloc(size_t data_sz, int numa_node, bool overwrite_mode)
+static struct bpf_ringbuf *bpf_ringbuf_alloc(size_t data_sz, int numa_node,
+					     bool overwrite_mode,
+					     unsigned long shmem_va)
 {
 	struct bpf_ringbuf *rb;
 
-	rb = bpf_ringbuf_area_alloc(data_sz, numa_node);
+	if (shmem_va)
+		rb = bpf_ringbuf_area_alloc_shmem(data_sz, numa_node, shmem_va);
+	else
+		rb = bpf_ringbuf_area_alloc(data_sz, numa_node);
 	if (!rb)
 		return NULL;
 
@@ -195,6 +291,7 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 {
 	bool overwrite_mode = false;
 	struct bpf_ringbuf_map *rb_map;
+	unsigned long shmem_va = 0;
 
 	if (attr->map_flags & ~RINGBUF_CREATE_FLAG_MASK)
 		return ERR_PTR(-EINVAL);
@@ -203,6 +300,21 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 		if (attr->map_type != BPF_MAP_TYPE_RINGBUF)
 			return ERR_PTR(-EINVAL);
 		overwrite_mode = true;
+	}
+
+	if (attr->map_flags & BPF_F_RB_SHMEM) {
+		/* User-producer ringbufs and overwrite mode are incompatible
+		 * with externally-supplied backing pages — restrict to the
+		 * standard kernel-producer ringbuf for now. */
+		if (attr->map_type != BPF_MAP_TYPE_RINGBUF)
+			return ERR_PTR(-EINVAL);
+		if (attr->map_flags & BPF_F_RB_OVERWRITE)
+			return ERR_PTR(-EINVAL);
+		if (!attr->map_extra || !PAGE_ALIGNED(attr->map_extra))
+			return ERR_PTR(-EINVAL);
+		shmem_va = (unsigned long)attr->map_extra;
+	} else if (attr->map_extra) {
+		return ERR_PTR(-EINVAL);
 	}
 
 	if (attr->key_size || attr->value_size ||
@@ -216,7 +328,8 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 
 	bpf_map_init_from_attr(&rb_map->map, attr);
 
-	rb_map->rb = bpf_ringbuf_alloc(attr->max_entries, rb_map->map.numa_node, overwrite_mode);
+	rb_map->rb = bpf_ringbuf_alloc(attr->max_entries, rb_map->map.numa_node,
+				       overwrite_mode, shmem_va);
 	if (!rb_map->rb) {
 		bpf_map_area_free(rb_map);
 		return ERR_PTR(-ENOMEM);
@@ -229,15 +342,24 @@ static void bpf_ringbuf_free(struct bpf_ringbuf *rb)
 {
 	irq_work_sync(&rb->work);
 
-	/* copy pages pointer and nr_pages to local variable, as we are going
-	 * to unmap rb itself with vunmap() below
-	 */
+	/* copy fields off rb before vunmap, since rb itself goes away */
 	struct page **pages = rb->pages;
 	int i, nr_pages = rb->nr_pages;
+	bool shmem_backed = rb->shmem_backed;
 
 	vunmap(rb);
-	for (i = 0; i < nr_pages; i++)
-		__free_page(pages[i]);
+
+	if (shmem_backed) {
+		int nr_hdr = RINGBUF_PGOFF;
+		int nr_shared = nr_pages - nr_hdr;
+
+		for (i = 0; i < nr_hdr; i++)
+			__free_page(pages[i]);
+		unpin_user_pages(&pages[nr_hdr], nr_shared);
+	} else {
+		for (i = 0; i < nr_pages; i++)
+			__free_page(pages[i]);
+	}
 	bpf_map_area_free(pages);
 }
 
