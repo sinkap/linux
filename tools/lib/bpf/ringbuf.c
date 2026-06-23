@@ -30,6 +30,10 @@ struct ring {
 	unsigned long *producer_pos;
 	unsigned long mask;
 	int map_fd;
+	/* true when consumer/producer/data pages were supplied by the
+	 * caller via ring_buffer__add_shmem() — libbpf does not own them
+	 * and must not munmap on free. */
+	bool shmem_backed;
 };
 
 struct ring_buffer {
@@ -59,13 +63,16 @@ struct ringbuf_hdr {
 
 static void ringbuf_free_ring(struct ring_buffer *rb, struct ring *r)
 {
-	if (r->consumer_pos) {
-		munmap(r->consumer_pos, rb->page_size);
-		r->consumer_pos = NULL;
-	}
-	if (r->producer_pos) {
-		munmap(r->producer_pos, rb->page_size + 2 * (r->mask + 1));
-		r->producer_pos = NULL;
+	if (!r->shmem_backed) {
+		if (r->consumer_pos) {
+			munmap(r->consumer_pos, rb->page_size);
+			r->consumer_pos = NULL;
+		}
+		if (r->producer_pos) {
+			munmap(r->producer_pos,
+			       rb->page_size + 2 * (r->mask + 1));
+			r->producer_pos = NULL;
+		}
 	}
 
 	free(r);
@@ -210,6 +217,105 @@ ring_buffer__new(int map_fd, ring_buffer_sample_fn sample_cb, void *ctx,
 	}
 
 	err = ring_buffer__add(rb, map_fd, sample_cb, ctx);
+	if (err)
+		goto err_out;
+
+	return rb;
+
+err_out:
+	ring_buffer__free(rb);
+	return errno = -err, NULL;
+}
+
+int
+ring_buffer__add_shmem(struct ring_buffer *rb, void *base, size_t data_sz,
+		       ring_buffer_sample_fn sample_cb, void *ctx,
+		       const struct ring_buffer_shmem_opts *opts)
+{
+	struct epoll_event *e;
+	struct ring *r;
+	void *tmp;
+	int err, notify_fd;
+
+	if (!OPTS_VALID(opts, ring_buffer_shmem_opts))
+		return libbpf_err(-EINVAL);
+	if (!base || data_sz == 0 || (data_sz & (data_sz - 1)))
+		return libbpf_err(-EINVAL);
+
+	notify_fd = OPTS_GET(opts, notify_eventfd, -1);
+
+	tmp = libbpf_reallocarray(rb->rings, rb->ring_cnt + 1, sizeof(*rb->rings));
+	if (!tmp)
+		return libbpf_err(-ENOMEM);
+	rb->rings = tmp;
+
+	tmp = libbpf_reallocarray(rb->events, rb->ring_cnt + 1, sizeof(*rb->events));
+	if (!tmp)
+		return libbpf_err(-ENOMEM);
+	rb->events = tmp;
+
+	r = calloc(1, sizeof(*r));
+	if (!r)
+		return libbpf_err(-ENOMEM);
+	rb->rings[rb->ring_cnt] = r;
+
+	r->map_fd = -1;
+	r->shmem_backed = true;
+	r->sample_cb = sample_cb;
+	r->ctx = ctx;
+	r->mask = data_sz - 1;
+
+	/* Layout (caller-managed):
+	 *   base + 0                  : consumer_pos page
+	 *   base + page_size          : producer_pos page
+	 *   base + 2*page_size        : data (data_sz bytes)
+	 *   base + 2*page_size+data_sz: mirror of data (data_sz bytes)
+	 */
+	r->consumer_pos = (unsigned long *)base;
+	r->producer_pos = (unsigned long *)((char *)base + rb->page_size);
+	r->data = (char *)base + 2 * rb->page_size;
+
+	e = &rb->events[rb->ring_cnt];
+	memset(e, 0, sizeof(*e));
+	e->events = EPOLLIN;
+	e->data.fd = rb->ring_cnt;
+	if (notify_fd >= 0) {
+		if (epoll_ctl(rb->epoll_fd, EPOLL_CTL_ADD, notify_fd, e) < 0) {
+			err = -errno;
+			pr_warn("ringbuf: shmem: epoll add notify_eventfd=%d: %s\n",
+				notify_fd, errstr(err));
+			free(r);
+			return libbpf_err(err);
+		}
+	}
+
+	rb->ring_cnt++;
+	return 0;
+}
+
+struct ring_buffer *
+ring_buffer__new_shmem(void *base, size_t data_sz,
+		       ring_buffer_sample_fn sample_cb, void *ctx,
+		       const struct ring_buffer_shmem_opts *opts)
+{
+	struct ring_buffer *rb;
+	int err;
+
+	rb = calloc(1, sizeof(*rb));
+	if (!rb)
+		return errno = ENOMEM, NULL;
+
+	rb->page_size = getpagesize();
+
+	rb->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+	if (rb->epoll_fd < 0) {
+		err = -errno;
+		pr_warn("ringbuf: failed to create epoll instance: %s\n",
+			errstr(err));
+		goto err_out;
+	}
+
+	err = ring_buffer__add_shmem(rb, base, data_sz, sample_cb, ctx, opts);
 	if (err)
 		goto err_out;
 

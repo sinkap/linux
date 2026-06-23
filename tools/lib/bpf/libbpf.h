@@ -1458,6 +1458,50 @@ LIBBPF_API int ring_buffer__consume(struct ring_buffer *rb);
 LIBBPF_API int ring_buffer__consume_n(struct ring_buffer *rb, size_t n);
 LIBBPF_API int ring_buffer__epoll_fd(const struct ring_buffer *rb);
 
+/*
+ * Consume a BPF_MAP_TYPE_RINGBUF whose backing pages are already
+ * mapped by the caller — typically because the producer used
+ * BPF_F_RB_SHMEM and the consumer received the pages over a shared
+ * memory channel (memfd shared across processes/VMs, or a DMA region
+ * delivered to a SmartNIC ACC).
+ *
+ * The caller hands libbpf a single base pointer pointing at the
+ * standard ringbuf layout:
+ *
+ *   offset 0                       : consumer_pos page (writable)
+ *   offset page_size               : producer_pos page
+ *   offset 2*page_size             : data, data_sz bytes
+ *   offset 2*page_size + data_sz   : mirror of data, data_sz bytes
+ *                                    (for wrap-around — required;
+ *                                    callers can produce it with a
+ *                                    second MAP_FIXED mmap of the
+ *                                    data range or with mremap)
+ *
+ * data_sz must be a power of two. libbpf does not mmap or munmap any
+ * of these pages — the caller owns them.
+ *
+ * If notify_eventfd is >= 0, libbpf adds it to its epoll set so
+ * ring_buffer__poll() can block on producer-side signals (e.g. an
+ * eventfd wired to a SmartNIC doorbell). If -1, poll() returns
+ * immediately and callers must drive consumption via
+ * ring_buffer__consume() / ring_buffer__consume_n().
+ */
+struct ring_buffer_shmem_opts {
+	size_t sz;             /* size of this struct */
+	int notify_eventfd;    /* -1 to disable */
+	size_t :0;
+};
+#define ring_buffer_shmem_opts__last_field notify_eventfd
+
+LIBBPF_API struct ring_buffer *
+ring_buffer__new_shmem(void *base, size_t data_sz,
+		       ring_buffer_sample_fn sample_cb, void *ctx,
+		       const struct ring_buffer_shmem_opts *opts);
+LIBBPF_API int
+ring_buffer__add_shmem(struct ring_buffer *rb, void *base, size_t data_sz,
+		       ring_buffer_sample_fn sample_cb, void *ctx,
+		       const struct ring_buffer_shmem_opts *opts);
+
 /**
  * @brief **ring_buffer__ring()** returns the ringbuffer object inside a given
  * ringbuffer manager representing a single BPF_MAP_TYPE_RINGBUF map instance.

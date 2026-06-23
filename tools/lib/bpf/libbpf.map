@@ -460,4 +460,6 @@ LIBBPF_1.8.0 {
 	global:
 		bpf_program__clone;
 		btf__new_empty_opts;
+		ring_buffer__add_shmem;
+		ring_buffer__new_shmem;
 } LIBBPF_1.7.0;
