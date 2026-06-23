@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/bpf.h>
 #include <linux/btf.h>
+#include <linux/dma-buf.h>
 #include <linux/err.h>
 #include <linux/highmem.h>
 #include <linux/irq_work.h>
+#include <linux/platform_device.h>
+#include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/filter.h>
 #include <linux/mm.h>
@@ -16,7 +19,8 @@
 #include <asm/rqspinlock.h>
 
 #define RINGBUF_CREATE_FLAG_MASK \
-	(BPF_F_NUMA_NODE | BPF_F_RB_OVERWRITE | BPF_F_RB_SHMEM)
+	(BPF_F_NUMA_NODE | BPF_F_RB_OVERWRITE | BPF_F_RB_SHMEM | \
+	 BPF_F_RB_DMABUF)
 
 /* non-mmap()'able part of bpf_ringbuf (everything up to consumer page) */
 #define RINGBUF_PGOFF \
@@ -27,6 +31,19 @@
 
 #define RINGBUF_MAX_RECORD_SZ (UINT_MAX/4)
 
+enum bpf_ringbuf_backing {
+	/* Default: every page allocated from the kernel page allocator. */
+	BPF_RB_BACK_KERNEL = 0,
+	/* BPF_F_RB_SHMEM: header pages kernel-allocated, consumer/producer/
+	 * data pages pinned from a userspace VA via pin_user_pages_fast().
+	 * Released with unpin_user_pages(). */
+	BPF_RB_BACK_SHMEM,
+	/* BPF_F_RB_DMABUF: header pages kernel-allocated, consumer/producer/
+	 * data pages taken from a dma-buf's sg_table. Released by unmapping
+	 * the attachment and putting the dma-buf reference. */
+	BPF_RB_BACK_DMABUF,
+};
+
 struct bpf_ringbuf {
 	wait_queue_head_t waitq;
 	struct irq_work work;
@@ -34,12 +51,11 @@ struct bpf_ringbuf {
 	struct page **pages;
 	int nr_pages;
 	bool overwrite_mode;
-	/* If true, the consumer/producer/data pages were pinned from a
-	 * userspace VA via pin_user_pages_fast() (BPF_F_RB_SHMEM). They
-	 * must be released with unpin_user_pages() rather than __free_page().
-	 * Only the first RINGBUF_PGOFF entries of @pages are kernel-allocated.
-	 */
-	bool shmem_backed;
+	enum bpf_ringbuf_backing backing;
+	/* Set when backing == BPF_RB_BACK_DMABUF, NULL otherwise. */
+	struct dma_buf *dmabuf;
+	struct dma_buf_attachment *attach;
+	struct sg_table *sgt;
 	rqspinlock_t spinlock ____cacheline_aligned_in_smp;
 	/* For user-space producer ring buffers, an atomic_t busy bit is used
 	 * to synchronize access to the ring buffers in the kernel, rather than
@@ -232,13 +248,143 @@ static struct bpf_ringbuf *bpf_ringbuf_area_alloc_shmem(size_t data_sz,
 	kmemleak_not_leak(pages);
 	rb->pages = pages;
 	rb->nr_pages = nr_pages;
-	rb->shmem_backed = true;
+	rb->backing = BPF_RB_BACK_SHMEM;
 	return rb;
 
 err_free_hdr:
 	while (i-- > 0)
 		__free_page(pages[i]);
 	bpf_map_area_free(pages);
+	return NULL;
+}
+
+/* Synthetic device for dma-buf attaches: dma_buf_attach() WARN_ON's a
+ * NULL dev. We never DMA-map through this device; the importer-side
+ * map_attachment() call below just runs the exporter's ->map_dma_buf
+ * which, for page-backed exporters we support (udmabuf, dma-heap
+ * system), returns an sg_table of struct pages that we walk for CPU
+ * access.
+ */
+static struct platform_device *bpf_ringbuf_dmabuf_pdev;
+
+static int __init bpf_ringbuf_dmabuf_init(void)
+{
+	bpf_ringbuf_dmabuf_pdev =
+		platform_device_register_simple("bpf_ringbuf_dmabuf", -1, NULL,
+						0);
+	if (IS_ERR(bpf_ringbuf_dmabuf_pdev))
+		return PTR_ERR(bpf_ringbuf_dmabuf_pdev);
+	return 0;
+}
+subsys_initcall(bpf_ringbuf_dmabuf_init);
+
+/* BPF_F_RB_DMABUF variant: the consumer/producer/data pages come from a
+ * dma-buf's scatterlist. The exporter must back the buffer with real
+ * struct pages (i.e. !sg_is_iomem). The buffer's pages stay in place
+ * for the lifetime of the ringbuf (static attach; no move_notify).
+ */
+static struct bpf_ringbuf *bpf_ringbuf_area_alloc_dmabuf(size_t data_sz,
+							 int numa_node,
+							 int dmabuf_fd)
+{
+	const gfp_t hdr_flags = GFP_KERNEL_ACCOUNT | __GFP_RETRY_MAYFAIL |
+				__GFP_NOWARN | __GFP_ZERO;
+	int nr_hdr_pages = RINGBUF_PGOFF;
+	int nr_data_pages = data_sz >> PAGE_SHIFT;
+	int nr_shared_pages = RINGBUF_POS_PAGES + nr_data_pages;
+	int nr_meta_pages = RINGBUF_NR_META_PAGES;
+	int nr_pages = nr_meta_pages + nr_data_pages;
+	struct dma_buf *dmabuf;
+	struct dma_buf_attachment *attach;
+	struct sg_table *sgt;
+	struct scatterlist *sg;
+	struct page **pages, *page;
+	struct bpf_ringbuf *rb;
+	size_t array_size;
+	int i, j, taken;
+
+	if (!bpf_ringbuf_dmabuf_pdev)
+		return NULL;
+	dmabuf = dma_buf_get(dmabuf_fd);
+	if (IS_ERR(dmabuf))
+		return NULL;
+
+	if (dmabuf->size < (size_t)nr_shared_pages * PAGE_SIZE)
+		goto err_put;
+
+	attach = dma_buf_attach(dmabuf, &bpf_ringbuf_dmabuf_pdev->dev);
+	if (IS_ERR(attach))
+		goto err_put;
+
+	sgt = dma_buf_map_attachment_unlocked(attach, DMA_BIDIRECTIONAL);
+	if (IS_ERR(sgt))
+		goto err_detach;
+
+	array_size = (nr_meta_pages + 2 * nr_data_pages) * sizeof(*pages);
+	pages = bpf_map_area_alloc(array_size, numa_node);
+	if (!pages)
+		goto err_unmap;
+
+	for (i = 0; i < nr_hdr_pages; i++) {
+		page = alloc_pages_node(numa_node, hdr_flags, 0);
+		if (!page)
+			goto err_free_hdr;
+		pages[i] = page;
+	}
+
+	taken = 0;
+	for_each_sgtable_sg(sgt, sg, j) {
+		struct page *base;
+		unsigned int sg_npages;
+
+		if (sg_dma_len(sg) == 0)
+			continue;
+		base = sg_page(sg);
+		if (!base) /* iomem-backed sg — not supported here */
+			goto err_free_hdr;
+
+		sg_npages = sg->length >> PAGE_SHIFT;
+		for (unsigned int k = 0; k < sg_npages &&
+		     taken < nr_shared_pages; k++) {
+			pages[nr_hdr_pages + taken] = base + k;
+			taken++;
+		}
+		if (taken == nr_shared_pages)
+			break;
+	}
+	if (taken != nr_shared_pages)
+		goto err_free_hdr;
+
+	for (j = 0; j < nr_shared_pages; j++)
+		clear_highpage(pages[nr_hdr_pages + j]);
+
+	for (j = nr_meta_pages; j < nr_pages; j++)
+		pages[nr_data_pages + j] = pages[j];
+
+	rb = vmap(pages, nr_meta_pages + 2 * nr_data_pages,
+		  VM_MAP | VM_USERMAP, PAGE_KERNEL);
+	if (!rb)
+		goto err_free_hdr;
+
+	kmemleak_not_leak(pages);
+	rb->pages = pages;
+	rb->nr_pages = nr_pages;
+	rb->backing = BPF_RB_BACK_DMABUF;
+	rb->dmabuf = dmabuf;
+	rb->attach = attach;
+	rb->sgt = sgt;
+	return rb;
+
+err_free_hdr:
+	while (i-- > 0)
+		__free_page(pages[i]);
+	bpf_map_area_free(pages);
+err_unmap:
+	dma_buf_unmap_attachment_unlocked(attach, sgt, DMA_BIDIRECTIONAL);
+err_detach:
+	dma_buf_detach(dmabuf, attach);
+err_put:
+	dma_buf_put(dmabuf);
 	return NULL;
 }
 
@@ -262,12 +408,16 @@ static void bpf_ringbuf_notify(struct irq_work *work)
  */
 static struct bpf_ringbuf *bpf_ringbuf_alloc(size_t data_sz, int numa_node,
 					     bool overwrite_mode,
-					     unsigned long shmem_va)
+					     unsigned long shmem_va,
+					     int dmabuf_fd)
 {
 	struct bpf_ringbuf *rb;
 
 	if (shmem_va)
 		rb = bpf_ringbuf_area_alloc_shmem(data_sz, numa_node, shmem_va);
+	else if (dmabuf_fd >= 0)
+		rb = bpf_ringbuf_area_alloc_dmabuf(data_sz, numa_node,
+						   dmabuf_fd);
 	else
 		rb = bpf_ringbuf_area_alloc(data_sz, numa_node);
 	if (!rb)
@@ -292,6 +442,7 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 	bool overwrite_mode = false;
 	struct bpf_ringbuf_map *rb_map;
 	unsigned long shmem_va = 0;
+	int dmabuf_fd = -1;
 
 	if (attr->map_flags & ~RINGBUF_CREATE_FLAG_MASK)
 		return ERR_PTR(-EINVAL);
@@ -301,6 +452,12 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 			return ERR_PTR(-EINVAL);
 		overwrite_mode = true;
 	}
+
+	/* SHMEM and DMABUF are mutually exclusive — both consume map_extra
+	 * and replace the data-page backing. */
+	if ((attr->map_flags & BPF_F_RB_SHMEM) &&
+	    (attr->map_flags & BPF_F_RB_DMABUF))
+		return ERR_PTR(-EINVAL);
 
 	if (attr->map_flags & BPF_F_RB_SHMEM) {
 		/* User-producer ringbufs and overwrite mode are incompatible
@@ -313,6 +470,14 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 		if (!attr->map_extra || !PAGE_ALIGNED(attr->map_extra))
 			return ERR_PTR(-EINVAL);
 		shmem_va = (unsigned long)attr->map_extra;
+	} else if (attr->map_flags & BPF_F_RB_DMABUF) {
+		if (attr->map_type != BPF_MAP_TYPE_RINGBUF)
+			return ERR_PTR(-EINVAL);
+		if (attr->map_flags & BPF_F_RB_OVERWRITE)
+			return ERR_PTR(-EINVAL);
+		dmabuf_fd = (int)(attr->map_extra & 0xffffffffULL);
+		if (dmabuf_fd < 0)
+			return ERR_PTR(-EINVAL);
 	} else if (attr->map_extra) {
 		return ERR_PTR(-EINVAL);
 	}
@@ -329,7 +494,7 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 	bpf_map_init_from_attr(&rb_map->map, attr);
 
 	rb_map->rb = bpf_ringbuf_alloc(attr->max_entries, rb_map->map.numa_node,
-				       overwrite_mode, shmem_va);
+				       overwrite_mode, shmem_va, dmabuf_fd);
 	if (!rb_map->rb) {
 		bpf_map_area_free(rb_map);
 		return ERR_PTR(-ENOMEM);
@@ -345,20 +510,39 @@ static void bpf_ringbuf_free(struct bpf_ringbuf *rb)
 	/* copy fields off rb before vunmap, since rb itself goes away */
 	struct page **pages = rb->pages;
 	int i, nr_pages = rb->nr_pages;
-	bool shmem_backed = rb->shmem_backed;
+	enum bpf_ringbuf_backing backing = rb->backing;
+	struct dma_buf *dmabuf = rb->dmabuf;
+	struct dma_buf_attachment *attach = rb->attach;
+	struct sg_table *sgt = rb->sgt;
 
 	vunmap(rb);
 
-	if (shmem_backed) {
+	switch (backing) {
+	case BPF_RB_BACK_SHMEM: {
 		int nr_hdr = RINGBUF_PGOFF;
 		int nr_shared = nr_pages - nr_hdr;
 
 		for (i = 0; i < nr_hdr; i++)
 			__free_page(pages[i]);
 		unpin_user_pages(&pages[nr_hdr], nr_shared);
-	} else {
+		break;
+	}
+	case BPF_RB_BACK_DMABUF: {
+		int nr_hdr = RINGBUF_PGOFF;
+
+		for (i = 0; i < nr_hdr; i++)
+			__free_page(pages[i]);
+		dma_buf_unmap_attachment_unlocked(attach, sgt,
+						  DMA_BIDIRECTIONAL);
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+		break;
+	}
+	case BPF_RB_BACK_KERNEL:
+	default:
 		for (i = 0; i < nr_pages; i++)
 			__free_page(pages[i]);
+		break;
 	}
 	bpf_map_area_free(pages);
 }

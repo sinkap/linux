@@ -1468,6 +1468,16 @@ enum {
  * DMA-maps the same pages).
  */
 	BPF_F_RB_SHMEM		= (1U << 20),
+
+/* Back BPF_MAP_TYPE_RINGBUF with the pages of a dma-buf. The low 32 bits
+ * of bpf_attr::map_extra are interpreted as a dma-buf fd. The exporter
+ * must back the buffer with real struct page memory (CPU-coherent, no
+ * raw iomem) and must not move the buffer; tested exporters include
+ * udmabuf and dma-heap system. Useful for handing a ringbuf to a device
+ * (e.g. a smart NIC) that DMA-maps the same dma-buf from the kernel
+ * side: BPF writes events, the device reads them via its own DMA.
+ */
+	BPF_F_RB_DMABUF		= (1U << 21),
 };
 
 /* Flags for BPF_PROG_QUERY. */
