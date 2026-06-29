@@ -5840,6 +5840,93 @@ err_put:
 	return err;
 }
 
+/* ---- FD link: pin arbitrary fds via bpf_link/bpffs ---- */
+
+struct bpf_fd_link {
+	struct bpf_link link;
+	struct file *external_file;
+};
+
+static void bpf_fd_link_release(struct bpf_link *link)
+{
+	struct bpf_fd_link *efl =
+		container_of(link, struct bpf_fd_link, link);
+
+	if (efl->external_file) {
+		fput(efl->external_file);
+		efl->external_file = NULL;
+	}
+}
+
+static void bpf_fd_link_dealloc(struct bpf_link *link)
+{
+	struct bpf_fd_link *efl =
+		container_of(link, struct bpf_fd_link, link);
+
+	if (efl->external_file)
+		fput(efl->external_file);
+	kfree(efl);
+}
+
+static int bpf_fd_link_fill_info(const struct bpf_link *link,
+				 struct bpf_link_info *info)
+{
+	return 0;
+}
+
+static void bpf_fd_link_show_fdinfo(const struct bpf_link *link,
+				    struct seq_file *seq)
+{
+	seq_puts(seq, "link_type:\tfd\n");
+}
+
+static const struct bpf_link_ops bpf_fd_link_ops = {
+	.release = bpf_fd_link_release,
+	.dealloc = bpf_fd_link_dealloc,
+	.fill_link_info = bpf_fd_link_fill_info,
+	.show_fdinfo = bpf_fd_link_show_fdinfo,
+};
+
+static int bpf_fd_link_create(union bpf_attr *attr)
+{
+	struct bpf_link_primer link_primer;
+	struct bpf_fd_link *efl;
+	struct file *external_file;
+	int err;
+
+	external_file = fget(attr->link_create.target_fd);
+	if (!external_file)
+		return -EBADF;
+
+	/* Reject BPF fds — they have native pinning support */
+	if (external_file->f_op == &bpf_map_fops ||
+	    external_file->f_op == &bpf_prog_fops ||
+	    external_file->f_op == &bpf_link_fops ||
+	    external_file->f_op == &bpf_link_fops_poll) {
+		fput(external_file);
+		return -EINVAL;
+	}
+
+	efl = kzalloc(sizeof(*efl), GFP_KERNEL);
+	if (!efl) {
+		fput(external_file);
+		return -ENOMEM;
+	}
+
+	bpf_link_init(&efl->link, BPF_LINK_TYPE_FD,
+		      &bpf_fd_link_ops, NULL);
+	efl->external_file = external_file;
+
+	err = bpf_link_prime(&efl->link, &link_primer);
+	if (err) {
+		fput(external_file);
+		kfree(efl);
+		return err;
+	}
+
+	return bpf_link_settle(&link_primer);
+}
+
 #define BPF_LINK_CREATE_LAST_FIELD link_create.uprobe_multi.path_fd
 static int link_create(union bpf_attr *attr, bpfptr_t uattr)
 {
@@ -5851,6 +5938,9 @@ static int link_create(union bpf_attr *attr, bpfptr_t uattr)
 
 	if (attr->link_create.attach_type == BPF_STRUCT_OPS)
 		return bpf_struct_ops_link_create(attr);
+
+	if (attr->link_create.attach_type == BPF_DEPENDENT_FD)
+		return bpf_fd_link_create(attr);
 
 	prog = bpf_prog_get(attr->link_create.prog_fd);
 	if (IS_ERR(prog))
