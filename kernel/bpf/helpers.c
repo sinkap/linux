@@ -29,6 +29,11 @@
 #include <linux/task_work.h>
 #include <linux/irq_work.h>
 #include <linux/buildid.h>
+#include <linux/io.h>
+
+#include <linux/in.h>
+#include <net/ip.h>
+#include <net/inet_common.h>
 
 #include "../../lib/kstrtox.h"
 
@@ -3658,7 +3663,6 @@ __bpf_kfunc int bpf_copy_from_user_str(void *dst, u32 dst__sz, const void __user
 
 /**
  * bpf_copy_from_user_task_str() - Copy a string from an task's address space
- * @dst:             Destination address, in kernel space.  This buffer must be
  *                   at least @dst__sz bytes long.
  * @dst__sz:         Maximum number of bytes to copy, includes the trailing NUL.
  * @unsafe_ptr__ign: Source address in the task's address space.
@@ -4766,6 +4770,151 @@ __bpf_kfunc int bpf_timer_cancel_async(struct bpf_timer *timer)
 		ret = bpf_async_schedule_op(cb, BPF_ASYNC_CANCEL, 0, 0);
 		return ret ? ret : -ECANCELED;
 	}
+struct bpf_mmio_region {
+	refcount_t usage;
+	void __iomem *addr;
+	u64 phys;
+	u32 size;
+};
+
+static void bpf_mmio_region_free(struct bpf_mmio_region *r)
+{
+	if (r->addr)
+		iounmap(r->addr);
+	kfree(r);
+}
+
+CFI_NOSEAL(bpf_mmio_region_dtor);
+void bpf_mmio_region_dtor(void *obj)
+{
+	struct bpf_mmio_region *r = obj;
+
+	if (refcount_dec_and_test(&r->usage))
+		bpf_mmio_region_free(r);
+}
+
+/**
+ * bpf_mmio_map - Map a physical MMIO region for BPF access.
+ * @phys: Page-aligned physical address.
+ * @size: Size in bytes (will be page-aligned).
+ *
+ * Returns an acquired reference to a bpf_mmio_region, or NULL on failure.
+ */
+__bpf_kfunc struct bpf_mmio_region *bpf_mmio_map(u64 phys, u32 size)
+{
+	struct bpf_mmio_region *r;
+
+	if (!size || !PAGE_ALIGNED(phys))
+		return NULL;
+
+	size = PAGE_ALIGN(size);
+
+	r = kzalloc(sizeof(*r), GFP_ATOMIC);
+	if (!r)
+		return NULL;
+
+	r->addr = ioremap(phys, size);
+	if (!r->addr) {
+		kfree(r);
+		return NULL;
+	}
+
+	r->phys = phys;
+	r->size = size;
+	refcount_set(&r->usage, 1);
+	return r;
+}
+
+/**
+ * bpf_mmio_release - Release an MMIO region.
+ * @r: Region to release (must be an owned reference).
+ */
+__bpf_kfunc void bpf_mmio_release(struct bpf_mmio_region *r)
+{
+	if (refcount_dec_and_test(&r->usage))
+		bpf_mmio_region_free(r);
+}
+
+static inline int bpf_mmio_check(struct bpf_mmio_region *r, u32 offset,
+				 u32 width)
+{
+	if (offset & (width - 1))
+		return -EINVAL;
+	if ((u64)offset + width > r->size)
+		return -ERANGE;
+	return 0;
+}
+
+__bpf_kfunc int bpf_mmio_writeb(struct bpf_mmio_region *r, u32 offset, u8 val)
+{
+	int err;
+
+	err = bpf_mmio_check(r, offset, 1);
+	if (err)
+		return err;
+	writeb(val, r->addr + offset);
+	return 0;
+}
+
+__bpf_kfunc int bpf_mmio_writew(struct bpf_mmio_region *r, u32 offset, u16 val)
+{
+	int err;
+
+	err = bpf_mmio_check(r, offset, 2);
+	if (err)
+		return err;
+	writew(val, r->addr + offset);
+	return 0;
+}
+
+__bpf_kfunc int bpf_mmio_writel(struct bpf_mmio_region *r, u32 offset, u32 val)
+{
+	int err;
+
+	err = bpf_mmio_check(r, offset, 4);
+	if (err)
+		return err;
+	writel(val, r->addr + offset);
+	return 0;
+}
+
+__bpf_kfunc int bpf_mmio_writeq(struct bpf_mmio_region *r, u32 offset, u64 val)
+{
+	int err;
+
+	err = bpf_mmio_check(r, offset, 8);
+	if (err)
+		return err;
+	writeq(val, r->addr + offset);
+	return 0;
+}
+
+__bpf_kfunc u8 bpf_mmio_readb(struct bpf_mmio_region *r, u32 offset)
+{
+	if (bpf_mmio_check(r, offset, 1))
+		return 0;
+	return readb(r->addr + offset);
+}
+
+__bpf_kfunc u16 bpf_mmio_readw(struct bpf_mmio_region *r, u32 offset)
+{
+	if (bpf_mmio_check(r, offset, 2))
+		return 0;
+	return readw(r->addr + offset);
+}
+
+__bpf_kfunc u32 bpf_mmio_readl(struct bpf_mmio_region *r, u32 offset)
+{
+	if (bpf_mmio_check(r, offset, 4))
+		return 0;
+	return readl(r->addr + offset);
+}
+
+__bpf_kfunc u64 bpf_mmio_readq(struct bpf_mmio_region *r, u32 offset)
+{
+	if (bpf_mmio_check(r, offset, 8))
+		return 0;
+	return readq(r->addr + offset);
 }
 
 __bpf_kfunc_end_defs();
@@ -4861,6 +5010,16 @@ BTF_ID_FLAGS(func, bpf_verify_pkcs7_signature, KF_SLEEPABLE)
 #ifdef CONFIG_S390
 BTF_ID_FLAGS(func, bpf_get_lowcore)
 #endif
+BTF_ID_FLAGS(func, bpf_mmio_map, KF_ACQUIRE | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_mmio_release, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_mmio_writeb, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_writew, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_writel, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_writeq, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_readb, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_readw, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_readl, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_readq, KF_RCU)
 BTF_KFUNCS_END(generic_btf_ids)
 
 static const struct btf_kfunc_id_set generic_kfunc_set = {
@@ -4876,6 +5035,8 @@ BTF_ID(func, bpf_task_release_dtor)
 BTF_ID(struct, cgroup)
 BTF_ID(func, bpf_cgroup_release_dtor)
 #endif
+BTF_ID(struct, bpf_mmio_region)
+BTF_ID(func, bpf_mmio_region_dtor)
 
 BTF_KFUNCS_START(common_btf_ids)
 BTF_ID_FLAGS(func, bpf_cast_to_kern_ctx, KF_FASTCALL)
@@ -4984,6 +5145,15 @@ static int __init kfunc_init(void)
 			.kfunc_btf_id = generic_dtor_ids[1]
 		},
 #ifdef CONFIG_CGROUPS
+		{
+			.btf_id       = generic_dtor_ids[2],
+			.kfunc_btf_id = generic_dtor_ids[3]
+		},
+		{
+			.btf_id       = generic_dtor_ids[4],
+			.kfunc_btf_id = generic_dtor_ids[5]
+		},
+#else
 		{
 			.btf_id       = generic_dtor_ids[2],
 			.kfunc_btf_id = generic_dtor_ids[3]
