@@ -7,6 +7,10 @@
 #include <linux/filter.h>
 #include <linux/mm.h>
 #include <linux/vmalloc.h>
+#include <linux/io.h>
+#if defined(CONFIG_ARM64)
+#include <asm/cacheflush.h>
+#endif
 #include <linux/wait.h>
 #include <linux/poll.h>
 #include <linux/kmemleak.h>
@@ -14,7 +18,29 @@
 #include <linux/btf_ids.h>
 #include <asm/rqspinlock.h>
 
-#define RINGBUF_CREATE_FLAG_MASK (BPF_F_NUMA_NODE | BPF_F_RB_OVERWRITE)
+/*
+ * Cache maintenance helpers for reserved ringbufs shared between
+ * non-coherent processors.
+ *
+ * bpf_ringbuf_inval: invalidate cache before reading data written by remote
+ * bpf_ringbuf_clean: clean cache after writing data read by remote
+ */
+#if defined(CONFIG_ARM64)
+static inline void bpf_ringbuf_inval(void *addr, int len)
+{
+	dcache_inval_poc((unsigned long)addr, (unsigned long)addr + len);
+}
+
+static inline void bpf_ringbuf_clean(void *addr, int len)
+{
+	dcache_clean_poc((unsigned long)addr, (unsigned long)addr + len);
+}
+#else
+static inline void bpf_ringbuf_inval(void *addr, int len) {}
+static inline void bpf_ringbuf_clean(void *addr, int len) {}
+#endif
+
+#define RINGBUF_CREATE_FLAG_MASK (BPF_F_NUMA_NODE | BPF_F_RB_OVERWRITE | BPF_F_RINGBUF_RESERVED)
 
 /* non-mmap()'able part of bpf_ringbuf (everything up to consumer page) */
 #define RINGBUF_PGOFF \
@@ -72,6 +98,8 @@ struct bpf_ringbuf {
 	 * validate each sample to ensure that they're correctly formatted, and
 	 * fully contained within the ring buffer.
 	 */
+	bool reserved_pages;
+
 	unsigned long consumer_pos __aligned(PAGE_SIZE);
 	unsigned long producer_pos __aligned(PAGE_SIZE);
 	unsigned long pending_pos;
@@ -90,7 +118,8 @@ struct bpf_ringbuf_hdr {
 	u32 pg_off;
 };
 
-static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node)
+static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node,
+						   phys_addr_t phys_addr)
 {
 	const gfp_t flags = GFP_KERNEL_ACCOUNT | __GFP_RETRY_MAYFAIL |
 			    __GFP_NOWARN | __GFP_ZERO;
@@ -100,6 +129,7 @@ static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node)
 	struct page **pages, *page;
 	struct bpf_ringbuf *rb;
 	size_t array_size;
+	bool reserved = (phys_addr != 0);
 	int i;
 
 	/* Each data page is mapped twice to allow "virtual"
@@ -119,16 +149,27 @@ static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node)
 	 * when mmap()'ed in user-space, simplifying both kernel and
 	 * user-space implementations significantly.
 	 */
+
+	unsigned long pfn = phys_addr >> PAGE_SHIFT;
+
+	if (reserved && !pfn_valid(pfn))
+		return NULL;
+
 	array_size = (nr_meta_pages + 2 * nr_data_pages) * sizeof(*pages);
 	pages = bpf_map_area_alloc(array_size, numa_node);
 	if (!pages)
 		return NULL;
 
 	for (i = 0; i < nr_pages; i++) {
-		page = alloc_pages_node(numa_node, flags, 0);
-		if (!page) {
-			nr_pages = i;
-			goto err_free_pages;
+		if (reserved) {
+			page = pfn_to_page(pfn + i);
+			get_page(page);
+		} else {
+			page = alloc_pages_node(numa_node, flags, 0);
+			if (!page) {
+				nr_pages = i;
+				goto err_free_pages;
+			}
 		}
 		pages[i] = page;
 		if (i >= nr_meta_pages)
@@ -139,14 +180,21 @@ static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node)
 		  VM_MAP | VM_USERMAP, PAGE_KERNEL);
 	if (rb) {
 		kmemleak_not_leak(pages);
+		if (reserved)
+			memset(rb, 0, (nr_meta_pages + nr_data_pages) << PAGE_SHIFT);
 		rb->pages = pages;
 		rb->nr_pages = nr_pages;
+		rb->reserved_pages = reserved;
 		return rb;
 	}
 
 err_free_pages:
-	for (i = 0; i < nr_pages; i++)
-		__free_page(pages[i]);
+	for (i = 0; i < nr_pages; i++) {
+		if (reserved)
+			put_page(pages[i]);
+		else
+			__free_page(pages[i]);
+	}
 	bpf_map_area_free(pages);
 	return NULL;
 }
@@ -169,11 +217,12 @@ static void bpf_ringbuf_notify(struct irq_work *work)
  * considering that the maximum value of data_sz is (4GB - 1), there
  * will be no overflow, so just note the size limit in the comments.
  */
-static struct bpf_ringbuf *bpf_ringbuf_alloc(size_t data_sz, int numa_node, bool overwrite_mode)
+static struct bpf_ringbuf *bpf_ringbuf_alloc(size_t data_sz, int numa_node,
+					     bool overwrite_mode, phys_addr_t phys_addr)
 {
 	struct bpf_ringbuf *rb;
 
-	rb = bpf_ringbuf_area_alloc(data_sz, numa_node);
+	rb = bpf_ringbuf_area_alloc(data_sz, numa_node, phys_addr);
 	if (!rb)
 		return NULL;
 
@@ -210,13 +259,20 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 	    !PAGE_ALIGNED(attr->max_entries))
 		return ERR_PTR(-EINVAL);
 
+	/* BPF_F_RINGBUF_RESERVED requires a physical address in map_extra */
+	if ((attr->map_flags & BPF_F_RINGBUF_RESERVED) && !attr->map_extra)
+		return ERR_PTR(-EINVAL);
+
 	rb_map = bpf_map_area_alloc(sizeof(*rb_map), NUMA_NO_NODE);
 	if (!rb_map)
 		return ERR_PTR(-ENOMEM);
 
 	bpf_map_init_from_attr(&rb_map->map, attr);
 
-	rb_map->rb = bpf_ringbuf_alloc(attr->max_entries, rb_map->map.numa_node, overwrite_mode);
+	rb_map->rb = bpf_ringbuf_alloc(attr->max_entries, rb_map->map.numa_node,
+				       overwrite_mode,
+				       (attr->map_flags & BPF_F_RINGBUF_RESERVED) ?
+					(phys_addr_t)attr->map_extra : 0);
 	if (!rb_map->rb) {
 		bpf_map_area_free(rb_map);
 		return ERR_PTR(-ENOMEM);
@@ -234,10 +290,15 @@ static void bpf_ringbuf_free(struct bpf_ringbuf *rb)
 	 */
 	struct page **pages = rb->pages;
 	int i, nr_pages = rb->nr_pages;
+	bool reserved = rb->reserved_pages;
 
 	vunmap(rb);
-	for (i = 0; i < nr_pages; i++)
-		__free_page(pages[i]);
+	for (i = 0; i < nr_pages; i++) {
+		if (reserved)
+			put_page(pages[i]);
+		else
+			__free_page(pages[i]);
+	}
 	bpf_map_area_free(pages);
 }
 
@@ -339,6 +400,11 @@ static __poll_t ringbuf_map_poll_kern(struct bpf_map *map, struct file *filp,
 	struct bpf_ringbuf_map *rb_map;
 
 	rb_map = container_of(map, struct bpf_ringbuf_map, map);
+
+	/* Reserved ringbufs have no valid waitqueue — polling not supported */
+	if (rb_map->rb->reserved_pages)
+		return EPOLLERR;
+
 	poll_wait(filp, &rb_map->rb->waitq, pts);
 
 	if (ringbuf_avail_data_sz(rb_map->rb))
@@ -473,6 +539,9 @@ static void *__bpf_ringbuf_reserve(struct bpf_ringbuf *rb, u64 size)
 	if (len > ringbuf_total_data_sz(rb))
 		return NULL;
 
+	/* Invalidate consumer_pos before reading — remote may have updated it */
+	if (rb->reserved_pages)
+		bpf_ringbuf_inval(&rb->consumer_pos, sizeof(rb->consumer_pos));
 	cons_pos = smp_load_acquire(&rb->consumer_pos);
 
 	if (raw_res_spin_lock_irqsave(&rb->spinlock, flags))
@@ -561,7 +630,7 @@ static void bpf_ringbuf_commit(void *sample, u64 flags, bool discard)
 	unsigned long rec_pos, cons_pos;
 	struct bpf_ringbuf_hdr *hdr;
 	struct bpf_ringbuf *rb;
-	u32 new_len;
+	u32 new_len, rec_size;
 
 	hdr = sample - BPF_RINGBUF_HDR_SZ;
 	rb = bpf_ringbuf_restore_from_rec(hdr);
@@ -571,6 +640,21 @@ static void bpf_ringbuf_commit(void *sample, u64 flags, bool discard)
 
 	/* update record header with correct final size prefix */
 	xchg(&hdr->len, new_len);
+
+	/*
+	 * For reserved ringbufs: clean record + producer_pos so the
+	 * remote consumer can see the data and new producer position.
+	 * Then invalidate consumer_pos to read the remote's progress.
+	 */
+	if (rb->reserved_pages) {
+		rec_size = round_up((new_len & ~BPF_RINGBUF_DISCARD_BIT) +
+				    BPF_RINGBUF_HDR_SZ, 8);
+		bpf_ringbuf_clean(hdr, rec_size);
+		bpf_ringbuf_clean(&rb->producer_pos,
+				  sizeof(rb->producer_pos));
+		bpf_ringbuf_inval(&rb->consumer_pos,
+				  sizeof(rb->consumer_pos));
+	}
 
 	/* if consumer caught up and is waiting for our record, notify about
 	 * new data availability
