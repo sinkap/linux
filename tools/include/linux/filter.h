@@ -213,6 +213,16 @@
 /* Legacy alias */
 #define BPF_STX_XADD(SIZE, DST, SRC, OFF) BPF_ATOMIC_OP(SIZE, BPF_ADD, DST, SRC, OFF)
 
+/* Cache maintenance on the cache block containing dst_reg + off16 */
+
+#define BPF_CACHE_OP(OP, DST, OFF)				\
+	((struct bpf_insn) {					\
+		.code  = BPF_STX | BPF_B | BPF_ATOMIC,		\
+		.dst_reg = DST,					\
+		.src_reg = 0,					\
+		.off   = OFF,					\
+		.imm   = OP })
+
 /* Memory store, *(uint *) (dst_reg + off16) = imm32 */
 
 #define BPF_ST_MEM(SIZE, DST, OFF, IMM)				\

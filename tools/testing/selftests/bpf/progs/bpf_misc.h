@@ -271,6 +271,10 @@
 #endif
 
 #if defined(__TARGET_ARCH_arm64) || defined(__TARGET_ARCH_x86)
+#define CAN_USE_CACHE_OPS
+#endif
+
+#if defined(__TARGET_ARCH_arm64) || defined(__TARGET_ARCH_x86)
 #define SPEC_V1
 #endif
 
