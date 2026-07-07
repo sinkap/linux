@@ -1116,6 +1116,7 @@ enum bpf_attach_type {
 	BPF_NETKIT_PRIMARY,
 	BPF_NETKIT_PEER,
 	BPF_TRACE_KPROBE_SESSION,
+	BPF_DEPENDENT_FD,
 	__MAX_BPF_ATTACH_TYPE
 };
 
@@ -1140,10 +1141,18 @@ enum bpf_link_type {
 	BPF_LINK_TYPE_UPROBE_MULTI = 12,
 	BPF_LINK_TYPE_NETKIT = 13,
 	BPF_LINK_TYPE_SOCKMAP = 14,
+	BPF_LINK_TYPE_FD = 15,
 	__MAX_BPF_LINK_TYPE,
 };
 
 #define MAX_BPF_LINK_TYPE __MAX_BPF_LINK_TYPE
+
+/* Kind of file pinned by a BPF_LINK_TYPE_FD link (bpf_link_info.fd.kind). */
+enum bpf_fd_link_kind {
+	BPF_FD_LINK_KIND_UNKNOWN = 0,
+	BPF_FD_LINK_KIND_EVENTFD,
+	BPF_FD_LINK_KIND_DMABUF,
+};
 
 enum bpf_perf_event_type {
 	BPF_PERF_EVENT_UNSPEC = 0,
@@ -6671,6 +6680,10 @@ struct bpf_link_info {
 		struct {
 			__u32 map_id;
 		} struct_ops;
+		struct {
+			__u64 ino;	/* inode of the pinned file */
+			__u32 kind;	/* enum bpf_fd_link_kind */
+		} fd;
 		struct {
 			__u32 pf;
 			__u32 hooknum;
