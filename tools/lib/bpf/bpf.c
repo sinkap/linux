@@ -823,6 +823,8 @@ int bpf_link_create(int prog_fd, int target_fd,
 		if (!OPTS_ZEROED(opts, tcx))
 			return libbpf_err(-EINVAL);
 		break;
+	case BPF_DEPENDENT_FD:
+		break;
 	case BPF_NETKIT_PRIMARY:
 	case BPF_NETKIT_PEER:
 		relative_fd = OPTS_GET(opts, netkit.relative_fd, 0);
