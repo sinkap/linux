@@ -2900,6 +2900,10 @@ int bpf_link_new_fd(struct bpf_link *link);
 struct bpf_link *bpf_link_get_from_fd(u32 ufd);
 struct bpf_link *bpf_link_get_curr_or_next(u32 *id);
 
+int bpf_fd_link_register_kind(const struct file_operations *fops,
+			      const char *name);
+void bpf_fd_link_unregister_kind(const struct file_operations *fops);
+
 void bpf_token_inc(struct bpf_token *token);
 void bpf_token_put(struct bpf_token *token);
 int bpf_token_create(union bpf_attr *attr);
@@ -3331,6 +3335,16 @@ static inline int bpf_link_settle(struct bpf_link_primer *primer)
 }
 
 static inline void bpf_link_cleanup(struct bpf_link_primer *primer)
+{
+}
+
+static inline int bpf_fd_link_register_kind(const struct file_operations *fops,
+					    const char *name)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void bpf_fd_link_unregister_kind(const struct file_operations *fops)
 {
 }
 
