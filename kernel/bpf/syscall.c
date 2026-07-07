@@ -32,6 +32,8 @@
 #include <linux/pgtable.h>
 #include <linux/bpf_lsm.h>
 #include <linux/poll.h>
+#include <linux/eventfd.h>
+#include <linux/dma-buf.h>
 #include <linux/sort.h>
 #include <linux/bpf-netns.h>
 #include <linux/rcupdate_trace.h>
@@ -5840,6 +5842,173 @@ err_put:
 	return err;
 }
 
+/* ---- FD link: pin external fds via bpf_link/bpffs ---- */
+
+/*
+ * Classify @file, the already-pinned target. Only leaf file types that
+ * cannot themselves hold references to other files are allowed; returns
+ * the kind, or -EPERM for anything else.
+ *
+ * Classification is done on the pinned @file, not on @fd, so an fd that is
+ * dup2()'d to a different (e.g. ref-holding) file after being classified
+ * cannot slip through: the eventfd probe is file-based, and the dma-buf
+ * probe requires @fd to still resolve to the very same @file.
+ */
+static int bpf_fd_link_classify(struct file *file, int fd)
+{
+	if (IS_ENABLED(CONFIG_EVENTFD)) {
+		struct eventfd_ctx *ev = eventfd_ctx_fileget(file);
+
+		if (!IS_ERR(ev)) {
+			eventfd_ctx_put(ev);
+			return BPF_FD_LINK_KIND_EVENTFD;
+		}
+	}
+	if (IS_ENABLED(CONFIG_DMA_SHARED_BUFFER)) {
+		struct dma_buf *dmabuf = dma_buf_get(fd);
+
+		if (!IS_ERR(dmabuf)) {
+			bool same = dmabuf->file == file;
+
+			dma_buf_put(dmabuf);
+			if (same)
+				return BPF_FD_LINK_KIND_DMABUF;
+		}
+	}
+	return -EPERM;
+}
+
+static const char *bpf_fd_link_kind_str(__u32 kind)
+{
+	switch (kind) {
+	case BPF_FD_LINK_KIND_EVENTFD:	return "eventfd";
+	case BPF_FD_LINK_KIND_DMABUF:	return "dmabuf";
+	default:			return "unknown";
+	}
+}
+
+struct bpf_fd_link {
+	struct bpf_link link;
+	struct file *external_file;
+	__u32 kind;		/* BPF_FD_LINK_KIND_* */
+};
+
+static void bpf_fd_link_release(struct bpf_link *link)
+{
+	struct bpf_fd_link *efl =
+		container_of(link, struct bpf_fd_link, link);
+
+	if (efl->external_file) {
+		fput(efl->external_file);
+		efl->external_file = NULL;
+	}
+}
+
+static void bpf_fd_link_dealloc(struct bpf_link *link)
+{
+	struct bpf_fd_link *efl =
+		container_of(link, struct bpf_fd_link, link);
+
+	if (efl->external_file)
+		fput(efl->external_file);
+	kfree(efl);
+}
+
+static int bpf_fd_link_fill_info(const struct bpf_link *link,
+				 struct bpf_link_info *info)
+{
+	const struct bpf_fd_link *efl =
+		container_of(link, struct bpf_fd_link, link);
+
+	/* link_type/id are filled by the core; report what is pinned. */
+	info->fd.kind = efl->kind;
+	if (efl->external_file)
+		info->fd.ino = file_inode(efl->external_file)->i_ino;
+	return 0;
+}
+
+static void bpf_fd_link_show_fdinfo(const struct bpf_link *link,
+				    struct seq_file *seq)
+{
+	const struct bpf_fd_link *efl =
+		container_of(link, struct bpf_fd_link, link);
+
+	seq_puts(seq, "link_type:\tfd\n");
+	seq_printf(seq, "fd_kind:\t%s\n", bpf_fd_link_kind_str(efl->kind));
+	if (efl->external_file)
+		seq_printf(seq, "fd_ino:\t%llu\n",
+			   (unsigned long long)file_inode(efl->external_file)->i_ino);
+}
+
+static const struct bpf_link_ops bpf_fd_link_ops = {
+	.release = bpf_fd_link_release,
+	.dealloc = bpf_fd_link_dealloc,
+	.fill_link_info = bpf_fd_link_fill_info,
+	.show_fdinfo = bpf_fd_link_show_fdinfo,
+};
+
+static int bpf_fd_link_create(union bpf_attr *attr)
+{
+	struct bpf_link_primer link_primer;
+	struct bpf_fd_link *efl;
+	struct file *external_file;
+	int err;
+
+	/* Pinning an fd via a bpf_link is privileged: a bpffs pin outlives
+	 * the creating process, so an unprivileged task holding a registered
+	 * fd type (eventfd, dma-buf, ...) could keep the underlying object
+	 * alive indefinitely and hand access to it, via the pin's FS ACLs,
+	 * to anyone who can reach the bpffs entry (bpffs is mountable in a
+	 * user namespace). Every other LINK_CREATE path implicitly requires
+	 * privilege because it takes a prog fd whose load was itself gated;
+	 * this one takes none, so gate it explicitly.
+	 */
+	if (!bpf_capable())
+		return -EPERM;
+
+	/* Pin the file first, then classify the pinned file: classifying the
+	 * fd and fget()'ing it separately would let a dup2() swap in a
+	 * different file in between.
+	 *
+	 * Only leaf file types that cannot themselves hold references to
+	 * other files may be pinned. A pinned link holding e.g. an io_uring
+	 * file whose fixed-file table holds this link's fd would form a
+	 * reference cycle no one can ever reclaim; the kernel has no generic
+	 * file-graph GC (unix sockets carry their own for SCM_RIGHTS).
+	 * Extend the whitelist as new leaf types are needed. BPF fds are
+	 * excluded by construction — they have native bpffs pinning anyway.
+	 */
+	external_file = fget(attr->link_create.target_fd);
+	if (!external_file)
+		return -EBADF;
+
+	err = bpf_fd_link_classify(external_file, attr->link_create.target_fd);
+	if (err < 0) {
+		fput(external_file);
+		return err;
+	}
+
+	efl = kzalloc(sizeof(*efl), GFP_KERNEL);
+	if (!efl) {
+		fput(external_file);
+		return -ENOMEM;
+	}
+	efl->kind = err;
+
+	bpf_link_init(&efl->link, BPF_LINK_TYPE_FD,
+		      &bpf_fd_link_ops, NULL, BPF_DEPENDENT_FD);
+	efl->external_file = external_file;
+
+	err = bpf_link_prime(&efl->link, &link_primer);
+	if (err) {
+		fput(external_file);
+		kfree(efl);
+		return err;
+	}
+
+	return bpf_link_settle(&link_primer);
+}
+
 #define BPF_LINK_CREATE_LAST_FIELD link_create.uprobe_multi.path_fd
 static int link_create(union bpf_attr *attr, bpfptr_t uattr)
 {
@@ -5851,6 +6020,9 @@ static int link_create(union bpf_attr *attr, bpfptr_t uattr)
 
 	if (attr->link_create.attach_type == BPF_STRUCT_OPS)
 		return bpf_struct_ops_link_create(attr);
+
+	if (attr->link_create.attach_type == BPF_DEPENDENT_FD)
+		return bpf_fd_link_create(attr);
 
 	prog = bpf_prog_get(attr->link_create.prog_fd);
 	if (IS_ERR(prog))
