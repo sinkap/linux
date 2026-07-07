@@ -13,6 +13,7 @@
 #include <linux/bpf_verifier.h>
 #include <linux/memory.h>
 #include <linux/sort.h>
+#include <asm/cacheflush.h>
 #include <asm/extable.h>
 #include <asm/ftrace.h>
 #include <asm/set_memory.h>
@@ -1466,6 +1467,35 @@ static int emit_atomic_ld_st_index(u8 **pprog, u32 atomic_op, u32 size,
 	return 0;
 }
 
+static int emit_cache_op(u8 **pprog, u32 atomic_op, u32 dst_reg, s16 off)
+{
+	u8 *prog = *pprog;
+
+	/*
+	 * CLFLUSH writes the cache line back and invalidates it, which
+	 * implements BPF_CACHE_FLUSH directly and is a valid, stronger
+	 * implementation of BPF_CACHE_INVAL and BPF_CACHE_CLEAN.
+	 *
+	 * clflush m8: 0F AE /7
+	 */
+	if (is_ereg(dst_reg))
+		EMIT1(add_1mod(0x40, dst_reg));
+	EMIT2(0x0F, 0xAE);
+	/* Always emit a displacement, see emit_insn_suffix() */
+	if (is_imm8(off))
+		EMIT2(add_1reg(0x78, dst_reg), off);
+	else
+		EMIT1_off32(add_1reg(0xB8, dst_reg), off);
+	/*
+	 * CLFLUSH is only guaranteed to be ordered by MFENCE. Emit one so
+	 * that the operation completes before any subsequent memory access.
+	 */
+	EMIT3(0x0F, 0xAE, 0xF0);
+
+	*pprog = prog;
+	return 0;
+}
+
 /*
  * Metadata encoding for exception handling in JITed code.
  *
@@ -2483,6 +2513,13 @@ populate_extable:
 
 		case BPF_STX | BPF_ATOMIC | BPF_B:
 		case BPF_STX | BPF_ATOMIC | BPF_H:
+			if (bpf_atomic_is_cache_op(insn)) {
+				err = emit_cache_op(&prog, insn->imm, dst_reg,
+						    insn->off);
+				if (err)
+					return err;
+				break;
+			}
 			if (!bpf_atomic_is_load_store(insn)) {
 				pr_err("bpf_jit: 1- and 2-byte RMW atomics are not supported\n");
 				return -EFAULT;
@@ -4191,6 +4228,10 @@ bool bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena)
 	if (!in_arena)
 		return true;
 	switch (insn->code) {
+	case BPF_STX | BPF_ATOMIC | BPF_B:
+		if (bpf_atomic_is_cache_op(insn))
+			return false;
+		break;
 	case BPF_STX | BPF_ATOMIC | BPF_W:
 	case BPF_STX | BPF_ATOMIC | BPF_DW:
 		if (insn->imm == (BPF_AND | BPF_FETCH) ||
@@ -4199,6 +4240,17 @@ bool bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena)
 			return false;
 	}
 	return true;
+}
+
+bool bpf_jit_supports_cache_ops(void)
+{
+	return boot_cpu_has(X86_FEATURE_CLFLUSH);
+}
+
+void bpf_arch_cache_op(s32 op, void *addr)
+{
+	/* Writeback + invalidate implements all BPF_CACHE_* operations */
+	clflush_cache_range(addr, 1);
 }
 
 bool bpf_jit_supports_ptr_xchg(void)
