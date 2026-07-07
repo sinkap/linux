@@ -370,6 +370,9 @@ static inline bool insn_is_cast_user(const struct bpf_insn *insn)
  *   BPF_CMPXCHG              r0 = atomic_cmpxchg(dst_reg + off16, r0, src_reg)
  *   BPF_LOAD_ACQ             dst_reg = smp_load_acquire(src_reg + off16)
  *   BPF_STORE_REL            smp_store_release(dst_reg + off16, src_reg)
+ *   BPF_CACHE_INVAL          cache_inval(dst_reg + off16)
+ *   BPF_CACHE_CLEAN          cache_clean(dst_reg + off16)
+ *   BPF_CACHE_FLUSH          cache_flush(dst_reg + off16)
  */
 
 #define BPF_ATOMIC_OP(SIZE, OP, DST, SRC, OFF)			\
@@ -382,6 +385,16 @@ static inline bool insn_is_cast_user(const struct bpf_insn *insn)
 
 /* Legacy alias */
 #define BPF_STX_XADD(SIZE, DST, SRC, OFF) BPF_ATOMIC_OP(SIZE, BPF_ADD, DST, SRC, OFF)
+
+/* Cache maintenance on the cache block containing dst_reg + off16 */
+
+#define BPF_CACHE_OP(OP, DST, OFF)				\
+	((struct bpf_insn) {					\
+		.code  = BPF_STX | BPF_B | BPF_ATOMIC,		\
+		.dst_reg = DST,					\
+		.src_reg = 0,					\
+		.off   = OFF,					\
+		.imm   = OP })
 
 /* Memory store, *(uint *) (dst_reg + off16) = imm32 */
 
@@ -1188,6 +1201,8 @@ bool bpf_jit_supports_exceptions(void);
 bool bpf_jit_supports_ptr_xchg(void);
 bool bpf_jit_supports_arena(void);
 bool bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena);
+bool bpf_jit_supports_cache_ops(void);
+void bpf_arch_cache_op(s32 op, void *addr);
 bool bpf_jit_supports_private_stack(void);
 bool bpf_jit_supports_timed_may_goto(void);
 bool bpf_jit_supports_fsession(void);

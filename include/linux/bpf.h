@@ -1133,6 +1133,22 @@ bpf_atomic_is_load_store(const struct bpf_insn *atomic_insn)
 	}
 }
 
+/* Given a BPF_ATOMIC instruction @atomic_insn, return true if it is a
+ * cache maintenance instruction.
+ */
+static inline bool
+bpf_atomic_is_cache_op(const struct bpf_insn *atomic_insn)
+{
+	switch (atomic_insn->imm) {
+	case BPF_CACHE_INVAL:
+	case BPF_CACHE_CLEAN:
+	case BPF_CACHE_FLUSH:
+		return true;
+	default:
+		return false;
+	}
+}
+
 struct bpf_prog_ops {
 	int (*test_run)(struct bpf_prog *prog, const union bpf_attr *kattr,
 			union bpf_attr __user *uattr);

@@ -6573,6 +6573,62 @@ static int check_atomic_store(struct bpf_verifier_env *env,
 	return 0;
 }
 
+static int check_cache_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
+{
+	struct bpf_reg_state *dst_reg;
+	int err;
+
+	if (!bpf_jit_supports_cache_ops()) {
+		verbose(env,
+			"cache maintenance instructions are not supported on this architecture\n");
+		return -EOPNOTSUPP;
+	}
+
+	/* Cache maintenance can be abused to construct side channels
+	 * (e.g. flush+reload), restrict it to privileged programs.
+	 */
+	if (!env->allow_ptr_leaks) {
+		verbose(env, "cache maintenance instructions require CAP_PERFMON\n");
+		return -EPERM;
+	}
+
+	if (BPF_SIZE(insn->code) != BPF_B) {
+		verbose(env,
+			"cache maintenance instructions only support the BPF_B size modifier\n");
+		return -EINVAL;
+	}
+
+	if (insn->src_reg != BPF_REG_0) {
+		verbose(env, "cache maintenance instructions use reserved fields\n");
+		return -EINVAL;
+	}
+
+	/* check address operand */
+	err = check_reg_arg(env, insn->dst_reg, SRC_OP);
+	if (err)
+		return err;
+
+	if (!atomic_ptr_type_ok(env, insn->dst_reg, insn)) {
+		verbose(env, "cache maintenance on R%d %s is not allowed\n",
+			insn->dst_reg,
+			reg_type_str(env, reg_state(env, insn->dst_reg)->type));
+		return -EACCES;
+	}
+
+	dst_reg = cur_regs(env) + insn->dst_reg;
+	if (dst_reg->type == PTR_TO_STACK) {
+		verbose(env, "cache maintenance on stack memory is not allowed\n");
+		return -EACCES;
+	}
+
+	/* BPF_CACHE_INVAL may discard data that has not been written back
+	 * yet, so require write access for all cache maintenance operations.
+	 */
+	return check_mem_access(env, env->insn_idx, dst_reg, argno_from_reg(insn->dst_reg),
+				insn->off, BPF_SIZE(insn->code), BPF_WRITE, -1, true,
+				false);
+}
+
 static int check_atomic(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
 	switch (insn->imm) {
@@ -6601,6 +6657,10 @@ static int check_atomic(struct bpf_verifier_env *env, struct bpf_insn *insn)
 			return -EOPNOTSUPP;
 		}
 		return check_atomic_store(env, insn);
+	case BPF_CACHE_INVAL:
+	case BPF_CACHE_CLEAN:
+	case BPF_CACHE_FLUSH:
+		return check_cache_op(env, insn);
 	default:
 		verbose(env, "BPF_ATOMIC uses invalid atomic opcode %02x\n",
 			insn->imm);

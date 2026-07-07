@@ -2377,6 +2377,17 @@ out:
 				goto default_label;
 			}
 			break;
+		/* Cache maintenance instructions only support the BPF_B size
+		 * modifier and are only accepted by the verifier when the
+		 * architecture implements bpf_arch_cache_op().
+		 */
+		case BPF_CACHE_INVAL:
+		case BPF_CACHE_CLEAN:
+		case BPF_CACHE_FLUSH:
+			if (BPF_SIZE(insn->code) != BPF_B)
+				goto default_label;
+			bpf_arch_cache_op(IMM, (void *)(unsigned long)(DST + insn->off));
+			break;
 
 		default:
 			goto default_label;
@@ -3312,6 +3323,24 @@ bool __weak bpf_jit_supports_arena(void)
 bool __weak bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena)
 {
 	return false;
+}
+
+/* Return TRUE if the JIT and the interpreter support the BPF cache
+ * maintenance instructions (see bpf_arch_cache_op()).
+ */
+bool __weak bpf_jit_supports_cache_ops(void)
+{
+	return false;
+}
+
+/* Perform the cache maintenance operation @op on the cache block containing
+ * @addr. Architectures must provide an implementation if their
+ * bpf_jit_supports_cache_ops() returns true; the verifier rejects cache
+ * maintenance instructions otherwise, so this default is unreachable.
+ */
+void __weak bpf_arch_cache_op(s32 op, void *addr)
+{
+	WARN_ON_ONCE(1);
 }
 
 bool __weak bpf_jit_supports_fsession(void)

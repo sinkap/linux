@@ -279,6 +279,16 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
 				insn->code,
 				bpf_ldst_string[BPF_SIZE(insn->code) >> 3],
 				insn->dst_reg, insn->off, insn->src_reg);
+		} else if (BPF_MODE(insn->code) == BPF_ATOMIC &&
+			   (insn->imm == BPF_CACHE_INVAL ||
+			    insn->imm == BPF_CACHE_CLEAN ||
+			    insn->imm == BPF_CACHE_FLUSH)) {
+			verbose(cbs->private_data, "(%02x) cache_%s((%s *)(r%d %+d))\n",
+				insn->code,
+				insn->imm == BPF_CACHE_INVAL ? "inval" :
+				insn->imm == BPF_CACHE_CLEAN ? "clean" : "flush",
+				bpf_ldst_string[BPF_SIZE(insn->code) >> 3],
+				insn->dst_reg, insn->off);
 		} else {
 			verbose(cbs->private_data, "BUG_%02x\n", insn->code);
 		}

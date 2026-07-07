@@ -1358,7 +1358,11 @@ static int record_load_store_access(struct bpf_verifier_env *env,
 		break;
 	case BPF_STX:
 		if (BPF_MODE(insn->code) == BPF_ATOMIC) {
-			if (insn->imm == BPF_STORE_REL)
+			/* Cache maintenance may discard not yet written back
+			 * data, treat it as a write.
+			 */
+			if (insn->imm == BPF_STORE_REL ||
+			    bpf_atomic_is_cache_op(insn))
 				sz = -sz;
 			if (insn->imm == BPF_LOAD_ACQ)
 				ptr = &at[insn->src_reg];
@@ -2125,6 +2129,12 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 			case BPF_STORE_REL:
 				def = 0;
 				use = dst | src;
+				break;
+			case BPF_CACHE_INVAL:
+			case BPF_CACHE_CLEAN:
+			case BPF_CACHE_FLUSH:
+				def = 0;
+				use = dst;
 				break;
 			default:
 				use = dst | src;

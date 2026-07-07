@@ -54,6 +54,14 @@
 #define BPF_LOAD_ACQ	0x100	/* load-acquire */
 #define BPF_STORE_REL	0x110	/* store-release */
 
+/* Cache maintenance operations, only valid with BPF_STX | BPF_ATOMIC | BPF_B.
+ * They operate on the cache block containing the byte at dst_reg + off, do
+ * not use src_reg and do not write to any register.
+ */
+#define BPF_CACHE_INVAL	0x120	/* invalidate cache block */
+#define BPF_CACHE_CLEAN	0x130	/* write back cache block */
+#define BPF_CACHE_FLUSH	0x140	/* write back and invalidate cache block */
+
 enum bpf_cond_pseudo_jmp {
 	BPF_MAY_GOTO = 0,
 };
