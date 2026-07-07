@@ -12,7 +12,10 @@
 #include <uapi/linux/btf.h>
 #include <linux/btf_ids.h>
 
-#define RINGBUF_CREATE_FLAG_MASK (BPF_F_NUMA_NODE)
+#include "cache_maint.h"
+#include "dmabuf_backing.h"
+
+#define RINGBUF_CREATE_FLAG_MASK (BPF_F_NUMA_NODE | BPF_F_DMABUF)
 
 /* non-mmap()'able part of bpf_ringbuf (everything up to consumer page) */
 #define RINGBUF_PGOFF \
@@ -69,6 +72,8 @@ struct bpf_ringbuf {
 	 * validate each sample to ensure that they're correctly formatted, and
 	 * fully contained within the ring buffer.
 	 */
+	bool dmabuf_backed;
+
 	unsigned long consumer_pos __aligned(PAGE_SIZE);
 	unsigned long producer_pos __aligned(PAGE_SIZE);
 	unsigned long pending_pos;
@@ -78,6 +83,10 @@ struct bpf_ringbuf {
 struct bpf_ringbuf_map {
 	struct bpf_map map;
 	struct bpf_ringbuf *rb;
+	/* set for BPF_F_DMABUF: the dma-buf whose pages back the
+	 * position and data pages, kept attached for the map's lifetime
+	 */
+	struct bpf_dmabuf_backing dmabuf;
 };
 
 /* 8-byte ring buffer record header structure */
@@ -86,7 +95,8 @@ struct bpf_ringbuf_hdr {
 	u32 pg_off;
 };
 
-static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node)
+static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node,
+						   struct bpf_dmabuf_backing *dmabuf)
 {
 	const gfp_t flags = GFP_KERNEL_ACCOUNT | __GFP_RETRY_MAYFAIL |
 			    __GFP_NOWARN | __GFP_ZERO;
@@ -96,6 +106,7 @@ static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node)
 	struct page **pages, *page;
 	struct bpf_ringbuf *rb;
 	size_t array_size;
+	bool dmabuf_backed = (dmabuf != NULL);
 	int i;
 
 	/* Each data page is mapped twice to allow "virtual"
@@ -115,16 +126,41 @@ static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node)
 	 * when mmap()'ed in user-space, simplifying both kernel and
 	 * user-space implementations significantly.
 	 */
+
+	/* The kernel-private part of struct bpf_ringbuf (waitq, irq_work,
+	 * spinlock, pages array pointer, ...) must never live in the
+	 * shared buffer: the remote node can read and write that memory,
+	 * so keeping kernel state there would leak kernel pointers and let
+	 * the remote corrupt them. Only the consumer/producer position
+	 * pages and the data pages come from the dma-buf:
+	 *
+	 *   dma-buf page 0:  consumer_pos page
+	 *   dma-buf page 1:  producer_pos page
+	 *   dma-buf page 2+: data pages
+	 *
+	 * The dma-buf pages are pinned by the attachment held in
+	 * bpf_ringbuf_map for the map's lifetime; no extra references are
+	 * taken here and the free paths must not touch them.
+	 */
+	unsigned long nr_shared_pages = RINGBUF_POS_PAGES + nr_data_pages;
+
+	if (dmabuf_backed && dmabuf->nr_pages < nr_shared_pages)
+		return NULL;
+
 	array_size = (nr_meta_pages + 2 * nr_data_pages) * sizeof(*pages);
 	pages = bpf_map_area_alloc(array_size, numa_node);
 	if (!pages)
 		return NULL;
 
 	for (i = 0; i < nr_pages; i++) {
-		page = alloc_pages_node(numa_node, flags, 0);
-		if (!page) {
-			nr_pages = i;
-			goto err_free_pages;
+		if (dmabuf_backed && i >= RINGBUF_PGOFF) {
+			page = dmabuf->pages[i - RINGBUF_PGOFF];
+		} else {
+			page = alloc_pages_node(numa_node, flags, 0);
+			if (!page) {
+				nr_pages = i;
+				goto err_free_pages;
+			}
 		}
 		pages[i] = page;
 		if (i >= nr_meta_pages)
@@ -135,14 +171,20 @@ static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node)
 		  VM_MAP | VM_USERMAP, PAGE_KERNEL);
 	if (rb) {
 		kmemleak_not_leak(pages);
+		if (dmabuf_backed)
+			memset(&rb->consumer_pos, 0,
+			       nr_shared_pages << PAGE_SHIFT);
 		rb->pages = pages;
 		rb->nr_pages = nr_pages;
+		rb->dmabuf_backed = dmabuf_backed;
 		return rb;
 	}
 
 err_free_pages:
-	for (i = 0; i < nr_pages; i++)
-		__free_page(pages[i]);
+	for (i = 0; i < nr_pages; i++) {
+		if (!dmabuf_backed || i < RINGBUF_PGOFF)
+			__free_page(pages[i]);
+	}
 	bpf_map_area_free(pages);
 	return NULL;
 }
@@ -165,11 +207,12 @@ static void bpf_ringbuf_notify(struct irq_work *work)
  * considering that the maximum value of data_sz is (4GB - 1), there
  * will be no overflow, so just note the size limit in the comments.
  */
-static struct bpf_ringbuf *bpf_ringbuf_alloc(size_t data_sz, int numa_node)
+static struct bpf_ringbuf *bpf_ringbuf_alloc(size_t data_sz, int numa_node,
+					     struct bpf_dmabuf_backing *dmabuf)
 {
 	struct bpf_ringbuf *rb;
 
-	rb = bpf_ringbuf_area_alloc(data_sz, numa_node);
+	rb = bpf_ringbuf_area_alloc(data_sz, numa_node, dmabuf);
 	if (!rb)
 		return NULL;
 
@@ -182,6 +225,15 @@ static struct bpf_ringbuf *bpf_ringbuf_alloc(size_t data_sz, int numa_node)
 	rb->consumer_pos = 0;
 	rb->producer_pos = 0;
 	rb->pending_pos = 0;
+
+	/* Push the zeroed positions and data out to DRAM. Without this the
+	 * init values sit dirty in the local cache: the remote node would
+	 * read garbage, and the dcache_inval of consumer_pos on the first
+	 * reserve could discard the zeroing even locally.
+	 */
+	if (rb->dmabuf_backed)
+		bpf_nc_cache_clean(&rb->consumer_pos,
+				   (RINGBUF_POS_PAGES + (data_sz >> PAGE_SHIFT)) << PAGE_SHIFT);
 
 	return rb;
 }
@@ -198,14 +250,48 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 	    !PAGE_ALIGNED(attr->max_entries))
 		return ERR_PTR(-EINVAL);
 
+	if (attr->map_flags & BPF_F_DMABUF) {
+		/* Without cache maintenance a dma-buf backed ringbuf
+		 * silently fails to reach the non-coherent consumer; refuse
+		 * rather than misbehave.
+		 */
+		if (!bpf_nc_cache_maint_available())
+			return ERR_PTR(-EOPNOTSUPP);
+		/* Maintenance is symmetric: a kernel-producer ringbuf cleans
+		 * on submit, a kernel-consumer (USER_RINGBUF) invalidates on
+		 * consume. Both are supported.
+		 */
+		/* map_extra must fit in an fd */
+		if (attr->map_extra > INT_MAX)
+			return ERR_PTR(-EINVAL);
+	}
+
 	rb_map = bpf_map_area_alloc(sizeof(*rb_map), NUMA_NO_NODE);
 	if (!rb_map)
 		return ERR_PTR(-ENOMEM);
 
 	bpf_map_init_from_attr(&rb_map->map, attr);
 
-	rb_map->rb = bpf_ringbuf_alloc(attr->max_entries, rb_map->map.numa_node);
+	if (attr->map_flags & BPF_F_DMABUF) {
+		/* map_extra is a dma-buf fd; the exporter owns the shared
+		 * physical memory and the fd is what authorizes its use
+		 */
+		int err = bpf_dmabuf_backing_get((int)attr->map_extra,
+						 RINGBUF_POS_PAGES +
+						 (attr->max_entries >> PAGE_SHIFT),
+						 &rb_map->dmabuf);
+
+		if (err) {
+			bpf_map_area_free(rb_map);
+			return ERR_PTR(err);
+		}
+	}
+
+	rb_map->rb = bpf_ringbuf_alloc(attr->max_entries, rb_map->map.numa_node,
+				       (attr->map_flags & BPF_F_DMABUF) ?
+					&rb_map->dmabuf : NULL);
 	if (!rb_map->rb) {
+		bpf_dmabuf_backing_put(&rb_map->dmabuf);
 		bpf_map_area_free(rb_map);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -220,10 +306,16 @@ static void bpf_ringbuf_free(struct bpf_ringbuf *rb)
 	 */
 	struct page **pages = rb->pages;
 	int i, nr_pages = rb->nr_pages;
+	bool dmabuf_backed = rb->dmabuf_backed;
 
 	vunmap(rb);
-	for (i = 0; i < nr_pages; i++)
-		__free_page(pages[i]);
+	/* dma-buf pages (i >= RINGBUF_PGOFF for dmabuf_backed ringbufs) are
+	 * owned by the attachment in bpf_ringbuf_map and released there
+	 */
+	for (i = 0; i < nr_pages; i++) {
+		if (!dmabuf_backed || i < RINGBUF_PGOFF)
+			__free_page(pages[i]);
+	}
 	bpf_map_area_free(pages);
 }
 
@@ -233,6 +325,7 @@ static void ringbuf_map_free(struct bpf_map *map)
 
 	rb_map = container_of(map, struct bpf_ringbuf_map, map);
 	bpf_ringbuf_free(rb_map->rb);
+	bpf_dmabuf_backing_put(&rb_map->dmabuf);
 	bpf_map_area_free(rb_map);
 }
 
@@ -316,6 +409,11 @@ static __poll_t ringbuf_map_poll_kern(struct bpf_map *map, struct file *filp,
 	struct bpf_ringbuf_map *rb_map;
 
 	rb_map = container_of(map, struct bpf_ringbuf_map, map);
+
+	/* dma-buf backed ringbufs have no valid waitqueue — polling not supported */
+	if (rb_map->rb->dmabuf_backed)
+		return EPOLLERR;
+
 	poll_wait(filp, &rb_map->rb->waitq, pts);
 
 	if (ringbuf_avail_data_sz(rb_map->rb))
@@ -418,6 +516,9 @@ static void *__bpf_ringbuf_reserve(struct bpf_ringbuf *rb, u64 size)
 	if (len > ringbuf_total_data_sz(rb))
 		return NULL;
 
+	/* Invalidate consumer_pos before reading — remote may have updated it */
+	if (rb->dmabuf_backed)
+		bpf_nc_cache_inval(&rb->consumer_pos, sizeof(rb->consumer_pos));
 	cons_pos = smp_load_acquire(&rb->consumer_pos);
 
 	if (in_nmi()) {
@@ -459,6 +560,14 @@ static void *__bpf_ringbuf_reserve(struct bpf_ringbuf *rb, u64 size)
 	hdr->len = size | BPF_RINGBUF_BUSY_BIT;
 	hdr->pg_off = pg_off;
 
+	/* The BUSY header must reach DRAM before producer_pos can: once
+	 * another record's commit (or a random eviction) publishes a
+	 * producer_pos covering this record, the remote consumer will read
+	 * this header from DRAM and must see BUSY rather than stale bytes.
+	 */
+	if (rb->dmabuf_backed)
+		bpf_nc_cache_clean(hdr, BPF_RINGBUF_HDR_SZ);
+
 	/* pairs with consumer's smp_load_acquire() */
 	smp_store_release(&rb->producer_pos, new_prod_pos);
 
@@ -491,7 +600,7 @@ static void bpf_ringbuf_commit(void *sample, u64 flags, bool discard)
 	unsigned long rec_pos, cons_pos;
 	struct bpf_ringbuf_hdr *hdr;
 	struct bpf_ringbuf *rb;
-	u32 new_len;
+	u32 new_len, rec_size;
 
 	hdr = sample - BPF_RINGBUF_HDR_SZ;
 	rb = bpf_ringbuf_restore_from_rec(hdr);
@@ -499,8 +608,40 @@ static void bpf_ringbuf_commit(void *sample, u64 flags, bool discard)
 	if (discard)
 		new_len |= BPF_RINGBUF_DISCARD_BIT;
 
+	/* Clean the payload while the header still carries the BUSY bit:
+	 * the remote consumer must never observe a completed header for a
+	 * record whose data lines have not reached DRAM yet. A single
+	 * clean over hdr+payload after the xchg would let the hardware
+	 * write the header line out first.
+	 */
+	if (rb->dmabuf_backed) {
+		rec_size = round_up((new_len & ~BPF_RINGBUF_DISCARD_BIT) +
+				    BPF_RINGBUF_HDR_SZ, 8);
+		bpf_nc_cache_clean(hdr, rec_size);
+	}
+
 	/* update record header with correct final size prefix */
 	xchg(&hdr->len, new_len);
+
+	/*
+	 * For dmabuf_backed ringbufs: publish the completed header and
+	 * producer_pos, then invalidate consumer_pos to read the remote's
+	 * progress.
+	 */
+	if (rb->dmabuf_backed) {
+		bpf_nc_cache_clean(hdr, BPF_RINGBUF_HDR_SZ);
+		bpf_nc_cache_clean(&rb->producer_pos,
+				   sizeof(rb->producer_pos));
+		bpf_nc_cache_inval(&rb->consumer_pos,
+				   sizeof(rb->consumer_pos));
+	}
+
+	/* The consumer is on another node reached out of band, not via the
+	 * local waitqueue (poll() returns EPOLLERR); the irq_work wakeup
+	 * would have nothing to wake.
+	 */
+	if (rb->dmabuf_backed)
+		return;
 
 	/* if consumer caught up and is waiting for our record, notify about
 	 * new data availability
@@ -573,6 +714,13 @@ BPF_CALL_2(bpf_ringbuf_query, struct bpf_map *, map, u64, flags)
 	struct bpf_ringbuf *rb;
 
 	rb = container_of(map, struct bpf_ringbuf_map, map)->rb;
+
+	/* consumer_pos is updated by the remote consumer behind our back;
+	 * invalidate before any query that reads it.
+	 */
+	if (rb->dmabuf_backed &&
+	    (flags == BPF_RB_AVAIL_DATA || flags == BPF_RB_CONS_POS))
+		bpf_nc_cache_inval(&rb->consumer_pos, sizeof(rb->consumer_pos));
 
 	switch (flags) {
 	case BPF_RB_AVAIL_DATA:
@@ -679,6 +827,12 @@ static int __bpf_user_ringbuf_peek(struct bpf_ringbuf *rb, void **sample, u32 *s
 	u32 hdr_len, sample_len, total_len, flags, *hdr;
 	u64 cons_pos, prod_pos;
 
+	/* Kernel is the consumer: the producer_pos and records are written
+	 * by the non-coherent producer, so drop stale lines before reading.
+	 */
+	if (rb->dmabuf_backed)
+		bpf_nc_cache_inval(&rb->producer_pos, sizeof(rb->producer_pos));
+
 	/* Synchronizes with smp_store_release() in user-space producer. */
 	prod_pos = smp_load_acquire(&rb->producer_pos);
 	if (prod_pos % 8)
@@ -690,6 +844,8 @@ static int __bpf_user_ringbuf_peek(struct bpf_ringbuf *rb, void **sample, u32 *s
 		return -ENODATA;
 
 	hdr = (u32 *)((uintptr_t)rb->data + (uintptr_t)(cons_pos & rb->mask));
+	if (rb->dmabuf_backed)
+		bpf_nc_cache_inval(hdr, BPF_RINGBUF_HDR_SZ);
 	/* Synchronizes with smp_store_release() in user-space producer. */
 	hdr_len = smp_load_acquire(hdr);
 	flags = hdr_len & (BPF_RINGBUF_BUSY_BIT | BPF_RINGBUF_DISCARD_BIT);
@@ -716,6 +872,9 @@ static int __bpf_user_ringbuf_peek(struct bpf_ringbuf *rb, void **sample, u32 *s
 		 * knows to skip this sample and try to read the next one.
 		 */
 		smp_store_release(&rb->consumer_pos, cons_pos + total_len);
+		if (rb->dmabuf_backed)
+			bpf_nc_cache_clean(&rb->consumer_pos,
+					   sizeof(rb->consumer_pos));
 		return -EAGAIN;
 	}
 
@@ -724,6 +883,9 @@ static int __bpf_user_ringbuf_peek(struct bpf_ringbuf *rb, void **sample, u32 *s
 
 	*sample = (void *)((uintptr_t)rb->data +
 			   (uintptr_t)((cons_pos + BPF_RINGBUF_HDR_SZ) & rb->mask));
+	/* Drop stale lines so the callback reads the producer's data. */
+	if (rb->dmabuf_backed)
+		bpf_nc_cache_inval(*sample, sample_len);
 	*size = sample_len;
 	return 0;
 }
@@ -740,6 +902,9 @@ static void __bpf_user_ringbuf_sample_release(struct bpf_ringbuf *rb, size_t siz
 	consumer_pos = rb->consumer_pos;
 	 /* Synchronizes with smp_load_acquire() in user-space producer. */
 	smp_store_release(&rb->consumer_pos, consumer_pos + rounded_size);
+	/* Publish our progress so the non-coherent producer sees free space. */
+	if (rb->dmabuf_backed)
+		bpf_nc_cache_clean(&rb->consumer_pos, sizeof(rb->consumer_pos));
 }
 
 BPF_CALL_4(bpf_user_ringbuf_drain, struct bpf_map *, map,
