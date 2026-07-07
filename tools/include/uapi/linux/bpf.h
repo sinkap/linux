@@ -1412,6 +1412,21 @@ enum {
 
 /* Do not translate kernel bpf_arena pointers to user pointers */
 	BPF_F_NO_USER_CONV	= (1U << 18),
+/* Place a map's backing inside an arena instead of allocating its own pages;
+ * map_extra is the arena fd. The kernel picks the offset within the arena and
+ * reports it via bpf_map_info.arena_off/arena_id. Supported by BPF_MAP_TYPE_
+ * RINGBUF / BPF_MAP_TYPE_USER_RINGBUF.
+ *
+ * Bit 19 (BPF_F_RB_OVERWRITE upstream) is intentionally left unused on this
+ * base so the flag values match the v6.19 integration.
+ */
+	BPF_F_ARENA_BACKED	= (1U << 20),
+
+/* Back a map by a dma-buf: map_extra is the dma-buf fd. For an arena, its
+ * pages are pre-populated from the dma-buf so the arena can be shared with
+ * a peer that addresses the same dma-buf.
+ */
+	BPF_F_DMABUF		= (1U << 21),
 };
 
 /* Flags for BPF_PROG_QUERY. */
