@@ -293,6 +293,15 @@
 /* DMB */
 #define A64_DMB_ISH aarch64_insn_gen_dmb(AARCH64_INSN_MB_ISH)
 
+/* DSB */
+#define A64_DSB_SY (aarch64_insn_get_dsb_base_value() | 0xf << 8)
+
+/* Data cache maintenance by VA: SYS #op1, C7, #Cm, #op2, Xt */
+#define A64_DC_OP(op1, Cm, op2, Rt) \
+	(0xd5080000 | (op1) << 16 | 0x7 << 12 | (Cm) << 8 | (op2) << 5 | (Rt))
+#define A64_DC_IVAC(Rt) A64_DC_OP(0, 0x6, 1, Rt)	/* invalidate to PoC */
+#define A64_DC_CVAC(Rt) A64_DC_OP(3, 0xa, 1, Rt)	/* clean to PoC */
+
 /* ADR */
 #define A64_ADR(Rd, offset) \
 	aarch64_insn_gen_adr(0, offset, Rd, AARCH64_INSN_ADR_TYPE_ADR)

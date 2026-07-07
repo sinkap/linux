@@ -1193,6 +1193,27 @@ static void emit_stx_r12(u8 **pprog, u32 size, u32 dst_reg, u32 src_reg, int off
 	emit_stx_index(pprog, size, dst_reg, src_reg, X86_REG_R12, off);
 }
 
+/*
+ * Emit clflush [dst_reg + r12 + off] (0F AE /7): write back and evict the
+ * arena cache line covering the accessed address. Used for JIT-inserted
+ * cache maintenance on arenas shared with a non-coherent peer
+ * (BPF_F_ARENA_CLEAN / BPF_F_ARENA_INVAL). clflush is baseline and
+ * strongly ordered, so no separate fence is needed for the maintenance
+ * itself; producer/consumer handoff ordering comes from store-release /
+ * load-acquire in the program.
+ */
+static void emit_arena_clflush(u8 **pprog, u32 dst_reg, int off)
+{
+	u8 *prog = *pprog;
+
+	/* REX.B from dst (SIB base), REX.X from r12 (SIB index), REX.R=0 */
+	EMIT2(add_3mod(0x40, dst_reg, BPF_REG_0, X86_REG_R12), 0x0f);
+	EMIT1(0xae);
+	/* ModRM.reg = /7 (encoded via BPF_REG_1 -> reg2hex 7), rm = SIB */
+	emit_insn_suffix_SIB(&prog, dst_reg, BPF_REG_1, X86_REG_R12, off);
+	*pprog = prog;
+}
+
 /* ST: *(u8*)(dst_reg + index_reg + off) = imm32 */
 static void emit_st_index(u8 **pprog, u32 size, u32 dst_reg, u32 index_reg, int off, int imm)
 {
@@ -1416,6 +1437,10 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 		  int oldproglen, struct jit_context *ctx, bool jmp_padding)
 {
 	bool tail_call_reachable = bpf_prog->aux->tail_call_reachable;
+	struct bpf_map *arena = bpf_prog_arena(bpf_prog);
+	/* JIT-inserted arena cache maintenance for a non-coherent peer */
+	bool arena_clean = arena && (arena->map_flags & BPF_F_ARENA_CLEAN);
+	bool arena_inval = arena && (arena->map_flags & BPF_F_ARENA_INVAL);
 	struct bpf_insn *insn = bpf_prog->insnsi;
 	bool callee_regs_used[4] = {};
 	int insn_cnt = bpf_prog->len;
@@ -1892,6 +1917,8 @@ st:			if (is_imm8(insn->off))
 		case BPF_ST | BPF_PROBE_MEM32 | BPF_DW:
 			start_of_ldx = prog;
 			emit_st_r12(&prog, BPF_SIZE(insn->code), dst_reg, insn->off, insn->imm);
+			if (arena_clean)
+				emit_arena_clflush(&prog, dst_reg, insn->off);
 			goto populate_extable;
 
 			/* LDX: dst_reg = *(u8*)(src_reg + r12 + off) */
@@ -1904,10 +1931,21 @@ st:			if (is_imm8(insn->off))
 		case BPF_STX | BPF_PROBE_MEM32 | BPF_W:
 		case BPF_STX | BPF_PROBE_MEM32 | BPF_DW:
 			start_of_ldx = prog;
-			if (BPF_CLASS(insn->code) == BPF_LDX)
+			if (BPF_CLASS(insn->code) == BPF_LDX) {
+				/* invalidate the line so the load observes the
+				 * non-coherent writer's update (before the load)
+				 */
+				if (arena_inval)
+					emit_arena_clflush(&prog, src_reg, insn->off);
 				emit_ldx_r12(&prog, BPF_SIZE(insn->code), dst_reg, src_reg, insn->off);
-			else
+			} else {
 				emit_stx_r12(&prog, BPF_SIZE(insn->code), dst_reg, src_reg, insn->off);
+				/* clean the line so the non-coherent reader sees
+				 * the store (after the store)
+				 */
+				if (arena_clean)
+					emit_arena_clflush(&prog, dst_reg, insn->off);
+			}
 populate_extable:
 			{
 				struct exception_table_entry *ex;
@@ -3625,6 +3663,12 @@ void bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
 bool bpf_jit_supports_arena(void)
 {
 	return true;
+}
+
+bool bpf_jit_supports_arena_cache_maint(void)
+{
+	/* do_jit() emits clflush for BPF_F_ARENA_CLEAN / BPF_F_ARENA_INVAL */
+	return boot_cpu_has(X86_FEATURE_CLFLUSH);
 }
 
 bool bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena)
