@@ -82,3 +82,71 @@ where ``ntohl()`` converts a 32-bit value from network byte order to host byte o
 ``BPF_IND | BPF_W | BPF_LD`` (0x40) means::
 
   R0 = ntohl(*(u32 *) ((struct sk_buff *) R6->data + src + imm))
+
+Cache maintenance instructions
+==============================
+
+Linux extends the ``ATOMIC`` mode modifier of the ``STX`` instruction
+class with a set of cache maintenance instructions. They allow BPF
+programs to keep memory coherent with agents that do not participate in
+the CPU cache coherency protocol, such as DMA engines on
+non-cache-coherent interconnects, accelerators and devices sharing
+memory with the CPU, or to control the point of persistence for
+persistent and CXL memory.
+
+Unlike the other atomic operations, cache maintenance instructions only
+use the ``BPF_B`` size modifier (``{ATOMIC, B, STX}``). The 'src_reg'
+field must be zero, no register is written, and the operation applies to
+the whole implementation-defined cache maintenance block that contains
+the byte addressed by ``dst_reg + offset``. Programs that need to
+operate on a larger region iterate over it in steps of the cache
+maintenance block size.
+
+.. table:: Cache maintenance operations
+
+  ===========  =====  =================================================
+  imm          value  description
+  ===========  =====  =================================================
+  CACHE_INVAL  0x120  invalidate cache block to the point of coherency
+  CACHE_CLEAN  0x130  write cache block back to the point of coherency
+  CACHE_FLUSH  0x140  write back and invalidate cache block
+  ===========  =====  =================================================
+
+``{ATOMIC, B, STX}`` with 'imm' = CACHE_INVAL means::
+
+  cache_inval(dst + offset)
+
+After the instruction completes, subsequent reads of the block observe
+the value in memory rather than a stale cached copy. An implementation
+may write dirty data back before invalidating (for example, x86
+``CLFLUSH`` implements ``CACHE_INVAL`` as write-back plus invalidate),
+so a program must not rely on ``CACHE_INVAL`` discarding unwritten data.
+
+``{ATOMIC, B, STX}`` with 'imm' = CACHE_CLEAN means::
+
+  cache_clean(dst + offset)
+
+Dirty data in the block is written back to the point of coherency. The
+block may stay resident in the cache.
+
+``{ATOMIC, B, STX}`` with 'imm' = CACHE_FLUSH means::
+
+  cache_flush(dst + offset)
+
+Dirty data in the block is written back to the point of coherency and
+the block is then invalidated.
+
+All three operations are self-ordering: the maintenance operation
+completes before any subsequent memory access of the program executes,
+so no separate memory barrier instruction is required.
+
+Cache maintenance instructions are only available to privileged programs
+(``CAP_PERFMON``), because the ability to evict specific cache lines is a
+building block for cache-timing side channels. The addressed memory must
+be writable; ``CACHE_INVAL`` may discard data that has not been written
+back, so all three operations are treated as memory writes for the
+purpose of verification.
+
+Support is optional and architecture dependent. On architectures that do
+not implement cache maintenance instructions the verifier rejects them
+at load time.
