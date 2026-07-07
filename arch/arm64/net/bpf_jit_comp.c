@@ -18,6 +18,7 @@
 
 #include <asm/asm-extable.h>
 #include <asm/byteorder.h>
+#include <asm/cacheflush.h>
 #include <asm/cpufeature.h>
 #include <asm/debug-monitors.h>
 #include <asm/insn.h>
@@ -785,6 +786,39 @@ static int emit_atomic_ld_st(const struct bpf_insn *insn, struct jit_ctx *ctx)
 			    imm);
 		return -EINVAL;
 	}
+
+	return 0;
+}
+
+static int emit_cache_op(const struct bpf_insn *insn, struct jit_ctx *ctx)
+{
+	const u8 dst = bpf2a64[insn->dst_reg];
+	const u8 tmp = bpf2a64[TMP_REG_1];
+	const s16 off = insn->off;
+	u8 reg = dst;
+
+	if (off) {
+		emit_a64_add_i(1, tmp, reg, tmp, off, ctx);
+		reg = tmp;
+	}
+
+	switch (insn->imm) {
+	case BPF_CACHE_INVAL:
+		emit(A64_DC_IVAC(reg), ctx);
+		break;
+	case BPF_CACHE_CLEAN:
+		emit(A64_DC_CVAC(reg), ctx);
+		break;
+	case BPF_CACHE_FLUSH:
+		emit(A64_DC_CIVAC(reg), ctx);
+		break;
+	default:
+		pr_err_once("unexpected cache maintenance op code %02x\n",
+			    insn->imm);
+		return -EINVAL;
+	}
+	/* Ensure completion before any subsequent memory access */
+	emit(A64_DSB_SY, ctx);
 
 	return 0;
 }
@@ -1951,7 +1985,9 @@ emit_cond_jmp:
 	case BPF_STX | BPF_PROBE_ATOMIC | BPF_H:
 	case BPF_STX | BPF_PROBE_ATOMIC | BPF_W:
 	case BPF_STX | BPF_PROBE_ATOMIC | BPF_DW:
-		if (bpf_atomic_is_load_store(insn))
+		if (bpf_atomic_is_cache_op(insn))
+			ret = emit_cache_op(insn, ctx);
+		else if (bpf_atomic_is_load_store(insn))
 			ret = emit_atomic_ld_st(insn, ctx);
 		else if (cpus_have_cap(ARM64_HAS_LSE_ATOMICS))
 			ret = emit_lse_atomic(insn, ctx);
@@ -3173,6 +3209,10 @@ bool bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena)
 	if (!in_arena)
 		return true;
 	switch (insn->code) {
+	case BPF_STX | BPF_ATOMIC | BPF_B:
+		if (bpf_atomic_is_cache_op(insn))
+			return false;
+		break;
 	case BPF_STX | BPF_ATOMIC | BPF_W:
 	case BPF_STX | BPF_ATOMIC | BPF_DW:
 		if (!bpf_atomic_is_load_store(insn) &&
@@ -3180,6 +3220,28 @@ bool bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena)
 			return false;
 	}
 	return true;
+}
+
+bool bpf_jit_supports_cache_ops(void)
+{
+	return true;
+}
+
+void bpf_arch_cache_op(s32 op, void *addr)
+{
+	unsigned long start = (unsigned long)addr;
+
+	switch (op) {
+	case BPF_CACHE_INVAL:
+		dcache_inval_poc(start, start + 1);
+		break;
+	case BPF_CACHE_CLEAN:
+		dcache_clean_poc(start, start + 1);
+		break;
+	case BPF_CACHE_FLUSH:
+		dcache_clean_inval_poc(start, start + 1);
+		break;
+	}
 }
 
 bool bpf_jit_supports_percpu_insn(void)
