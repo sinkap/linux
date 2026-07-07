@@ -1478,6 +1478,20 @@ enum {
 
 /* Map backed by a dma-buf (ringbuf, arena); map_extra is the dma-buf fd */
 	BPF_F_DMABUF	= (1U << 20),
+
+/* Arena shared with a non-coherent reader: the JIT emits a cache clean
+ * (write-back to the point of coherency) after each arena store, so
+ * writes become visible without an explicit maintenance call. The clean
+ * carries no ordering — use store-release at the producer/consumer
+ * handoff.
+ */
+	BPF_F_ARENA_CLEAN	= (1U << 21),
+
+/* Arena shared with a non-coherent writer: the JIT emits a cache
+ * invalidate before each arena load, so reads observe the writer's
+ * updates. Pair with load-acquire for ordering.
+ */
+	BPF_F_ARENA_INVAL	= (1U << 22),
 };
 
 /* Flags for BPF_PROG_QUERY. */
