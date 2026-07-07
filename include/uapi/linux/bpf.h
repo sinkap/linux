@@ -1476,6 +1476,9 @@ enum {
 
 /* Enable BPF ringbuf overwrite mode */
 	BPF_F_RB_OVERWRITE	= (1U << 19),
+
+/* Map backed by a dma-buf (ringbuf, arena); map_extra is the dma-buf fd */
+	BPF_F_DMABUF	= (1U << 20),
 };
 
 /* Flags for BPF_PROG_QUERY. */
