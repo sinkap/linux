@@ -1,0 +1,4 @@
+vmlinux.h
+*.bpf.o
+multinode_bpf
+inc/
