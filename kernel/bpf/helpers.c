@@ -29,6 +29,8 @@
 #include <linux/task_work.h>
 #include <linux/irq_work.h>
 #include <linux/buildid.h>
+#include <linux/io.h>
+#include <linux/bpf_mmio.h>
 
 #include "../../lib/kstrtox.h"
 
@@ -4768,6 +4770,244 @@ __bpf_kfunc int bpf_timer_cancel_async(struct bpf_timer *timer)
 	}
 }
 
+/*
+ * Allowlist of physical ranges a driver has blessed for bpf_mmio_map().
+ * Fail-closed: an empty list means bpf_mmio_map() maps nothing.
+ */
+struct bpf_mmio_allow {
+	struct list_head node;
+	phys_addr_t base;
+	size_t size;
+};
+
+static LIST_HEAD(bpf_mmio_allowlist);
+static DEFINE_SPINLOCK(bpf_mmio_allowlist_lock);
+
+int bpf_mmio_register_region(phys_addr_t base, size_t size)
+{
+	struct bpf_mmio_allow *a;
+
+	if (!size || (base + size) < base)
+		return -EINVAL;
+
+	a = kmalloc(sizeof(*a), GFP_KERNEL);
+	if (!a)
+		return -ENOMEM;
+	a->base = base;
+	a->size = size;
+
+	spin_lock(&bpf_mmio_allowlist_lock);
+	list_add(&a->node, &bpf_mmio_allowlist);
+	spin_unlock(&bpf_mmio_allowlist_lock);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(bpf_mmio_register_region);
+
+void bpf_mmio_unregister_region(phys_addr_t base, size_t size)
+{
+	struct bpf_mmio_allow *a, *tmp;
+
+	spin_lock(&bpf_mmio_allowlist_lock);
+	list_for_each_entry_safe(a, tmp, &bpf_mmio_allowlist, node) {
+		if (a->base == base && a->size == size) {
+			list_del(&a->node);
+			kfree(a);
+			break;
+		}
+	}
+	spin_unlock(&bpf_mmio_allowlist_lock);
+}
+EXPORT_SYMBOL_GPL(bpf_mmio_unregister_region);
+
+static bool bpf_mmio_allowed(phys_addr_t base, size_t size)
+{
+	phys_addr_t end = base + size;
+	struct bpf_mmio_allow *a;
+	bool ok = false;
+
+	spin_lock(&bpf_mmio_allowlist_lock);
+	list_for_each_entry(a, &bpf_mmio_allowlist, node) {
+		if (base >= a->base && end <= a->base + a->size) {
+			ok = true;
+			break;
+		}
+	}
+	spin_unlock(&bpf_mmio_allowlist_lock);
+	return ok;
+}
+
+struct bpf_mmio_region {
+	refcount_t usage;
+	void __iomem *addr;
+	u64 phys;
+	u32 size;
+	struct work_struct free_work;
+};
+
+static void bpf_mmio_region_free_work(struct work_struct *work)
+{
+	struct bpf_mmio_region *r =
+		container_of(work, struct bpf_mmio_region, free_work);
+
+	iounmap(r->addr);
+	kfree(r);
+}
+
+/* The final put can happen in any context (kptr dtor on map element
+ * delete, KF_RELEASE from a non-sleepable program), but iounmap() needs
+ * process context — defer to a workqueue.
+ */
+static void bpf_mmio_region_free(struct bpf_mmio_region *r)
+{
+	INIT_WORK(&r->free_work, bpf_mmio_region_free_work);
+	schedule_work(&r->free_work);
+}
+
+CFI_NOSEAL(bpf_mmio_region_dtor);
+void bpf_mmio_region_dtor(void *obj)
+{
+	struct bpf_mmio_region *r = obj;
+
+	if (refcount_dec_and_test(&r->usage))
+		bpf_mmio_region_free(r);
+}
+
+/**
+ * bpf_mmio_map - Map a physical MMIO region for BPF access.
+ * @phys: Page-aligned physical address.
+ * @size: Size in bytes (will be page-aligned).
+ *
+ * Sleepable (ioremap() takes sleeping locks), hence KF_SLEEPABLE.
+ *
+ * Returns an acquired reference to a bpf_mmio_region, or NULL on failure.
+ */
+__bpf_kfunc struct bpf_mmio_region *bpf_mmio_map(u64 phys, u32 size)
+{
+	struct bpf_mmio_region *r;
+
+	if (!size || !PAGE_ALIGNED(phys))
+		return NULL;
+
+	size = PAGE_ALIGN(size);
+
+	/* Only physical ranges a driver has explicitly registered may be
+	 * mapped; fail-closed otherwise.
+	 */
+	if (!bpf_mmio_allowed(phys, size))
+		return NULL;
+
+	r = kzalloc(sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return NULL;
+
+	r->addr = ioremap(phys, size);
+	if (!r->addr) {
+		kfree(r);
+		return NULL;
+	}
+
+	r->phys = phys;
+	r->size = size;
+	refcount_set(&r->usage, 1);
+	return r;
+}
+
+/**
+ * bpf_mmio_release - Release an MMIO region.
+ * @r: Region to release (must be an owned reference).
+ */
+__bpf_kfunc void bpf_mmio_release(struct bpf_mmio_region *r)
+{
+	if (refcount_dec_and_test(&r->usage))
+		bpf_mmio_region_free(r);
+}
+
+static inline int bpf_mmio_check(struct bpf_mmio_region *r, u32 offset,
+				 u32 width)
+{
+	if (offset & (width - 1))
+		return -EINVAL;
+	if ((u64)offset + width > r->size)
+		return -ERANGE;
+	return 0;
+}
+
+__bpf_kfunc int bpf_mmio_writeb(struct bpf_mmio_region *r, u32 offset, u8 val)
+{
+	int err;
+
+	err = bpf_mmio_check(r, offset, 1);
+	if (err)
+		return err;
+	writeb(val, r->addr + offset);
+	return 0;
+}
+
+__bpf_kfunc int bpf_mmio_writew(struct bpf_mmio_region *r, u32 offset, u16 val)
+{
+	int err;
+
+	err = bpf_mmio_check(r, offset, 2);
+	if (err)
+		return err;
+	writew(val, r->addr + offset);
+	return 0;
+}
+
+__bpf_kfunc int bpf_mmio_writel(struct bpf_mmio_region *r, u32 offset, u32 val)
+{
+	int err;
+
+	err = bpf_mmio_check(r, offset, 4);
+	if (err)
+		return err;
+	writel(val, r->addr + offset);
+	return 0;
+}
+
+#ifdef CONFIG_64BIT
+__bpf_kfunc int bpf_mmio_writeq(struct bpf_mmio_region *r, u32 offset, u64 val)
+{
+	int err;
+
+	err = bpf_mmio_check(r, offset, 8);
+	if (err)
+		return err;
+	writeq(val, r->addr + offset);
+	return 0;
+}
+#endif
+
+__bpf_kfunc u8 bpf_mmio_readb(struct bpf_mmio_region *r, u32 offset)
+{
+	if (bpf_mmio_check(r, offset, 1))
+		return 0;
+	return readb(r->addr + offset);
+}
+
+__bpf_kfunc u16 bpf_mmio_readw(struct bpf_mmio_region *r, u32 offset)
+{
+	if (bpf_mmio_check(r, offset, 2))
+		return 0;
+	return readw(r->addr + offset);
+}
+
+__bpf_kfunc u32 bpf_mmio_readl(struct bpf_mmio_region *r, u32 offset)
+{
+	if (bpf_mmio_check(r, offset, 4))
+		return 0;
+	return readl(r->addr + offset);
+}
+
+#ifdef CONFIG_64BIT
+__bpf_kfunc u64 bpf_mmio_readq(struct bpf_mmio_region *r, u32 offset)
+{
+	if (bpf_mmio_check(r, offset, 8))
+		return 0;
+	return readq(r->addr + offset);
+}
+#endif
+
 __bpf_kfunc_end_defs();
 
 static void bpf_task_work_cancel_scheduled(struct irq_work *irq_work)
@@ -4868,6 +5108,32 @@ static const struct btf_kfunc_id_set generic_kfunc_set = {
 	.set   = &generic_btf_ids,
 };
 
+/*
+ * MMIO accessors are kept in their own set so their exposure is
+ * explicit and separately controllable. Access is gated at runtime by
+ * the driver allowlist (bpf_mmio_register_region()); the set is
+ * registered for the same program types as the generic helpers.
+ */
+BTF_KFUNCS_START(mmio_btf_ids)
+BTF_ID_FLAGS(func, bpf_mmio_map, KF_ACQUIRE | KF_RET_NULL | KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_mmio_release, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_mmio_writeb, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_writew, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_writel, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_readb, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_readw, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_readl, KF_RCU)
+#ifdef CONFIG_64BIT
+BTF_ID_FLAGS(func, bpf_mmio_writeq, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_readq, KF_RCU)
+#endif
+BTF_KFUNCS_END(mmio_btf_ids)
+
+static const struct btf_kfunc_id_set mmio_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set   = &mmio_btf_ids,
+};
+
 
 BTF_ID_LIST(generic_dtor_ids)
 BTF_ID(struct, task_struct)
@@ -4876,6 +5142,8 @@ BTF_ID(func, bpf_task_release_dtor)
 BTF_ID(struct, cgroup)
 BTF_ID(func, bpf_cgroup_release_dtor)
 #endif
+BTF_ID(struct, bpf_mmio_region)
+BTF_ID(func, bpf_mmio_region_dtor)
 
 BTF_KFUNCS_START(common_btf_ids)
 BTF_ID_FLAGS(func, bpf_cast_to_kern_ctx, KF_FASTCALL)
@@ -4988,6 +5256,15 @@ static int __init kfunc_init(void)
 			.btf_id       = generic_dtor_ids[2],
 			.kfunc_btf_id = generic_dtor_ids[3]
 		},
+		{
+			.btf_id       = generic_dtor_ids[4],
+			.kfunc_btf_id = generic_dtor_ids[5]
+		},
+#else
+		{
+			.btf_id       = generic_dtor_ids[2],
+			.kfunc_btf_id = generic_dtor_ids[3]
+		},
 #endif
 	};
 
@@ -4997,6 +5274,15 @@ static int __init kfunc_init(void)
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &generic_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &generic_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_CGROUP_SKB, &generic_kfunc_set);
+	/* MMIO accessors: same reachable program types, but a separate set
+	 * so they can be trimmed independently. Runtime access is still
+	 * gated by the driver allowlist.
+	 */
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING, &mmio_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS, &mmio_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &mmio_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &mmio_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &mmio_kfunc_set);
 	ret = ret ?: register_btf_id_dtor_kfuncs(generic_dtors,
 						  ARRAY_SIZE(generic_dtors),
 						  THIS_MODULE);
