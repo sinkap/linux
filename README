@@ -1,168 +1,93 @@
-Linux kernel
-============
+bpf: Cache maintenance instructions
 
-The Linux kernel is the core of any Linux operating system. It manages hardware,
-system resources, and provides the fundamental services for all other software.
+More and more BPF deployments run on memory that is not fully coherent
+with respect to every agent that touches it:
 
-Quick Start
------------
+  - SoCs whose DMA-capable engines, NPUs or crypto/compression
+    accelerators sit behind a non-cache-coherent interconnect;
+  - descriptor rings and data buffers shared with SmartNICs, FPGAs and
+    other devices that read/write host memory directly;
+  - CXL-attached and persistent memory, where the point of coherency and
+    the point of persistence differ and software must control when data
+    becomes visible/durable.
 
-* Report a bug: See Documentation/admin-guide/reporting-issues.rst
-* Get the latest kernel: https://kernel.org
-* Build the kernel: See Documentation/admin-guide/quickly-build-trimmed-linux.rst
-* Join the community: https://lore.kernel.org/
+On such systems software has to perform explicit cache maintenance
+around the point where a non-coherent agent accesses the memory: clean
+(write back) before handing a buffer to the device, and invalidate
+before reading a buffer the device has written. Today a BPF program has
+no way to express this. The options are to route through a helper or a
+bespoke kfunc per platform, or to move the logic out of BPF entirely,
+both of which defeat the point of doing the work in BPF in the first
+place (XDP/AF_XDP fast paths, tracing on the DMA completion path,
+struct_ops data-plane callbacks, ...).
 
-Essential Documentation
------------------------
+This series extends the BPF instruction set with three cache maintenance
+instructions, so the coherency operations can be expressed directly and
+JITed to a single native instruction.
 
-All users should be familiar with:
+Encoding
+========
 
-* Building requirements: Documentation/process/changes.rst
-* Code of Conduct: Documentation/process/code-of-conduct.rst
-* License: See COPYING
+The instructions reuse the BPF_ATOMIC mode of the STX class, following
+the scheme established by load-acquire/store-release. The operation is
+encoded in the immediate field and only the BPF_B size modifier is used:
 
-Documentation can be built with make htmldocs or viewed online at:
-https://www.kernel.org/doc/html/latest/
+  {ATOMIC, B, STX}, imm = 0x120   BPF_CACHE_INVAL   invalidate block
+  {ATOMIC, B, STX}, imm = 0x130   BPF_CACHE_CLEAN   write back block
+  {ATOMIC, B, STX}, imm = 0x140   BPF_CACHE_FLUSH   write back + invalidate
 
+All three operate on the implementation-defined cache maintenance block
+containing dst_reg + off16. src_reg is reserved (must be 0) and no
+register is written. The operations are self-ordering: the maintenance
+completes before any subsequent memory access of the program, so no
+separate barrier instruction is needed. Programs walk larger regions by
+iterating in steps of the cache maintenance block size.
 
-Who Are You?
-============
+Semantics and safety
+====================
 
-Find your role below:
+  - INVAL makes memory visible to subsequent reads. Implementations that
+    can only clean+invalidate (e.g. x86 CLFLUSH) are allowed, so a
+    program must not rely on INVAL discarding un-written-back data.
+  - CLEAN writes dirty data back; the block may stay resident.
+  - FLUSH writes back and then invalidates.
 
-* New Kernel Developer - Getting started with kernel development
-* Academic Researcher - Studying kernel internals and architecture
-* Security Expert - Hardening and vulnerability analysis
-* Backport/Maintenance Engineer - Maintaining stable kernels
-* System Administrator - Configuring and troubleshooting
-* Maintainer - Leading subsystems and reviewing patches
-* Hardware Vendor - Writing drivers for new hardware
-* Distribution Maintainer - Packaging kernels for distros
-* AI Coding Assistant - LLMs and AI-powered development tools
+The verifier treats all three as writes to the addressed memory (INVAL
+can drop not-yet-written-back stores), and only accepts writable,
+non-stack pointers that are not ctx/packet/socket/flow-key/arena.
+Because selectively evicting cache lines is a building block for
+cache-timing side channels (flush+reload and friends), the instructions
+require a privileged program (CAP_PERFMON).
 
+Support is optional and architecture dependent; an architecture opts in
+with bpf_jit_supports_cache_ops() and bpf_arch_cache_op(). The verifier
+rejects the instructions at load time everywhere else.
 
-For Specific Users
-==================
+Backends
+========
 
-New Kernel Developer
---------------------
+  - x86-64: CLFLUSH + MFENCE. CLFLUSH is write-back+invalidate, a valid
+    (stronger) implementation of all three ops; MFENCE provides the
+    required ordering. The interpreter uses clflush_cache_range().
+  - arm64: DC IVAC / DC CVAC / DC CIVAC to the point of coherency, plus
+    DSB SY. The interpreter uses the dcache_*_poc() helpers.
 
-Welcome! Start your kernel development journey here:
+Arena pointers are not supported yet and are rejected by the verifier
+via bpf_jit_supports_insn(); this can be relaxed later.
 
-* Getting Started: Documentation/process/development-process.rst
-* Your First Patch: Documentation/process/submitting-patches.rst
-* Coding Style: Documentation/process/coding-style.rst
-* Build System: Documentation/kbuild/index.rst
-* Development Tools: Documentation/dev-tools/index.rst
-* Kernel Hacking Guide: Documentation/kernel-hacking/hacking.rst
-* Core APIs: Documentation/core-api/index.rst
+Open questions / future work
+============================
 
-Academic Researcher
--------------------
+  - libbpf/LLVM assembler mnemonics (cache_inval/clean/flush) so the
+    instructions are directly writable from C; this series only wires up
+    the kernel side and __imm_insn()-based selftests.
+  - Batched/weaker variants (x86 CLFLUSHOPT/CLWB, arm64 without the
+    trailing DSB) for programs that flush a range and issue one barrier
+    at the end.
+  - Point-of-persistence variants for pmem/CXL use cases.
+  - A kfunc wrapper for a range-based operation may complement the
+    per-block instruction for large buffers.
 
-Explore the kernel's architecture and internals:
+Feedback on the encoding, the privilege model and the ordering guarantee
+is very welcome before this grows a stable UAPI.
 
-* Researcher Guidelines: Documentation/process/researcher-guidelines.rst
-* Memory Management: Documentation/mm/index.rst
-* Scheduler: Documentation/scheduler/index.rst
-* Networking Stack: Documentation/networking/index.rst
-* Filesystems: Documentation/filesystems/index.rst
-* RCU (Read-Copy Update): Documentation/RCU/index.rst
-* Locking Primitives: Documentation/locking/index.rst
-* Power Management: Documentation/power/index.rst
-
-Security Expert
----------------
-
-Security documentation and hardening guides:
-
-* Security Documentation: Documentation/security/index.rst
-* LSM Development: Documentation/security/lsm-development.rst
-* Self Protection: Documentation/security/self-protection.rst
-* Reporting Vulnerabilities: Documentation/process/security-bugs.rst
-* CVE Procedures: Documentation/process/cve.rst
-* Embargoed Hardware Issues: Documentation/process/embargoed-hardware-issues.rst
-* Security Features: Documentation/userspace-api/seccomp_filter.rst
-
-Backport/Maintenance Engineer
------------------------------
-
-Maintain and stabilize kernel versions:
-
-* Stable Kernel Rules: Documentation/process/stable-kernel-rules.rst
-* Backporting Guide: Documentation/process/backporting.rst
-* Applying Patches: Documentation/process/applying-patches.rst
-* Subsystem Profile: Documentation/maintainer/maintainer-entry-profile.rst
-* Git for Maintainers: Documentation/maintainer/configure-git.rst
-
-System Administrator
---------------------
-
-Configure, tune, and troubleshoot Linux systems:
-
-* Admin Guide: Documentation/admin-guide/index.rst
-* Kernel Parameters: Documentation/admin-guide/kernel-parameters.rst
-* Sysctl Tuning: Documentation/admin-guide/sysctl/index.rst
-* Tracing/Debugging: Documentation/trace/index.rst
-* Performance Security: Documentation/admin-guide/perf-security.rst
-* Hardware Monitoring: Documentation/hwmon/index.rst
-
-Maintainer
-----------
-
-Lead kernel subsystems and manage contributions:
-
-* Maintainer Handbook: Documentation/maintainer/index.rst
-* Pull Requests: Documentation/maintainer/pull-requests.rst
-* Managing Patches: Documentation/maintainer/modifying-patches.rst
-* Rebasing and Merging: Documentation/maintainer/rebasing-and-merging.rst
-* Development Process: Documentation/process/maintainer-handbooks.rst
-* Maintainer Entry Profile: Documentation/maintainer/maintainer-entry-profile.rst
-* Git Configuration: Documentation/maintainer/configure-git.rst
-
-Hardware Vendor
----------------
-
-Write drivers and support new hardware:
-
-* Driver API Guide: Documentation/driver-api/index.rst
-* Driver Model: Documentation/driver-api/driver-model/driver.rst
-* Device Drivers: Documentation/driver-api/infrastructure.rst
-* Bus Types: Documentation/driver-api/driver-model/bus.rst
-* Device Tree Bindings: Documentation/devicetree/bindings/
-* Power Management: Documentation/driver-api/pm/index.rst
-* DMA API: Documentation/core-api/dma-api.rst
-
-Distribution Maintainer
------------------------
-
-Package and distribute the kernel:
-
-* Stable Kernel Rules: Documentation/process/stable-kernel-rules.rst
-* ABI Documentation: Documentation/ABI/README
-* Kernel Configuration: Documentation/kbuild/kconfig.rst
-* Module Signing: Documentation/admin-guide/module-signing.rst
-* Kernel Parameters: Documentation/admin-guide/kernel-parameters.rst
-* Tainted Kernels: Documentation/admin-guide/tainted-kernels.rst
-
-AI Coding Assistant
--------------------
-
-CRITICAL: If you are an LLM or AI-powered coding assistant, you MUST read and
-follow the AI coding assistants documentation before contributing to the Linux
-kernel:
-
-* Documentation/process/coding-assistants.rst
-
-This documentation contains essential requirements about licensing, attribution,
-and the Developer Certificate of Origin that all AI tools must comply with.
-
-
-Communication and Support
-=========================
-
-* Mailing Lists: https://lore.kernel.org/
-* IRC: #kernelnewbies on irc.oftc.net
-* Bugzilla: https://bugzilla.kernel.org/
-* MAINTAINERS file: Lists subsystem maintainers and mailing lists
-* Email Clients: Documentation/process/email-clients.rst
