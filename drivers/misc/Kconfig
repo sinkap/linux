@@ -651,4 +651,16 @@ source "drivers/misc/mchp_pci1xxxx/Kconfig"
 source "drivers/misc/keba/Kconfig"
 source "drivers/misc/amd-sbi/Kconfig"
 source "drivers/misc/rp1/Kconfig"
+config XNODE_SHMEM
+	tristate "Cross-node shared memory window"
+	help
+	  Expose a reserved physical memory window shared with another,
+	  non-cache-coherent node to userspace with write-combine
+	  mappings and BPF-ringbuf permission discipline (only the
+	  consumer position page is writable). Used by consumers of
+	  dma-buf backed BPF ringbufs/arenas produced on the other node;
+	  see Documentation/bpf/multi-node-bpf.md.
+
+	  If unsure, say N.
+
 endmenu
