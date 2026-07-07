@@ -1421,6 +1421,9 @@ enum {
 
 /* Do not translate kernel bpf_arena pointers to user pointers */
 	BPF_F_NO_USER_CONV	= (1U << 18),
+
+/* Map backed by a dma-buf (ringbuf, arena); map_extra is the dma-buf fd */
+	BPF_F_DMABUF	= (1U << 20),
 };
 
 /* Flags for BPF_PROG_QUERY. */
