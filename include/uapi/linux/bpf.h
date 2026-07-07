@@ -1471,6 +1471,9 @@ enum {
 
 /* Ringbuf backed by reserved memory; map_extra is physical base address */
 	BPF_F_RINGBUF_RESERVED	= (1U << 20),
+
+/* Arena backed by reserved memory; map_extra is physical base address */
+	BPF_F_ARENA_RESERVED	= (1U << 21),
 };
 
 /* Flags for BPF_PROG_QUERY. */

@@ -60,6 +60,8 @@ struct bpf_arena {
 	struct list_head vma_list;
 	/* protects vma_list */
 	struct mutex lock;
+	bool reserved;
+	phys_addr_t phys_addr;
 	u64 zap_gen;
 	struct mutex zap_mutex;
 	struct irq_work     free_irq;
@@ -274,18 +276,25 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 	    /* BPF_F_MMAPABLE must be set */
 	    !(attr->map_flags & BPF_F_MMAPABLE) ||
 	    /* No unsupported flags present */
-	    (attr->map_flags & ~(BPF_F_SEGV_ON_FAULT | BPF_F_MMAPABLE | BPF_F_NO_USER_CONV)))
+	    (attr->map_flags & ~(BPF_F_SEGV_ON_FAULT | BPF_F_MMAPABLE | BPF_F_NO_USER_CONV | BPF_F_ARENA_RESERVED)))
 		return ERR_PTR(-EINVAL);
 
-	if (attr->map_extra & ~PAGE_MASK)
-		/* If non-zero the map_extra is an expected user VMA start address */
-		return ERR_PTR(-EINVAL);
+	if (attr->map_flags & BPF_F_ARENA_RESERVED) {
+		/* map_extra is physical base address, must be page-aligned */
+		if (attr->map_extra & ~PAGE_MASK)
+			return ERR_PTR(-EINVAL);
+	} else {
+		if (attr->map_extra & ~PAGE_MASK)
+			/* If non-zero the map_extra is an expected user VMA start address */
+			return ERR_PTR(-EINVAL);
+	}
 
 	vm_range = (u64)attr->max_entries * PAGE_SIZE;
 	if (vm_range > SZ_4G)
 		return ERR_PTR(-E2BIG);
 
-	if ((attr->map_extra >> 32) != ((attr->map_extra + vm_range - 1) >> 32))
+	if (!(attr->map_flags & BPF_F_ARENA_RESERVED) &&
+	    (attr->map_extra >> 32) != ((attr->map_extra + vm_range - 1) >> 32))
 		/* user vma must not cross 32-bit boundary */
 		return ERR_PTR(-ERANGE);
 
@@ -298,9 +307,15 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 		goto err;
 
 	arena->kern_vm = kern_vm;
-	arena->user_vm_start = attr->map_extra;
-	if (arena->user_vm_start)
-		arena->user_vm_end = arena->user_vm_start + vm_range;
+	if (attr->map_flags & BPF_F_ARENA_RESERVED) {
+		arena->reserved = true;
+		arena->phys_addr = attr->map_extra;
+		arena->user_vm_start = 0;
+	} else {
+		arena->user_vm_start = attr->map_extra;
+		if (arena->user_vm_start)
+			arena->user_vm_end = arena->user_vm_start + vm_range;
+	}
 
 	INIT_LIST_HEAD(&arena->vma_list);
 	init_llist_head(&arena->free_spans);
@@ -322,6 +337,41 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 	err = populate_pgtable_except_pte(arena);
 	if (err)
 		goto err_destroy_rt;
+
+	/* Pre-populate reserved arena with pages at known physical address */
+	if (arena->reserved) {
+		u64 kstart = bpf_arena_get_kern_vm_start(arena);
+		unsigned long nr_pages = attr->max_entries;
+		unsigned long pfn = arena->phys_addr >> PAGE_SHIFT;
+		struct page **pages;
+		int i, ret;
+
+		pages = kvcalloc(nr_pages, sizeof(*pages), GFP_KERNEL);
+		if (!pages) {
+			err = -ENOMEM;
+			goto err_destroy_rt;
+		}
+		for (i = 0; i < nr_pages; i++) {
+			pages[i] = pfn_to_page(pfn + i);
+			get_page(pages[i]);
+		}
+		ret = vm_area_map_pages(arena->kern_vm, kstart,
+					kstart + nr_pages * PAGE_SIZE, pages);
+		if (ret) {
+			for (i = 0; i < nr_pages; i++)
+				put_page(pages[i]);
+			kvfree(pages);
+			err = ret;
+			goto err_destroy_rt;
+		}
+		kvfree(pages);
+		/* Mark all pages as allocated in the range tree */
+		ret = range_tree_clear(&arena->rt, 0, nr_pages);
+		if (ret) {
+			err = ret;
+			goto err_destroy_rt;
+		}
+	}
 
 	return &arena->map;
 
@@ -359,7 +409,10 @@ static int existing_page_cb(pte_t *ptep, unsigned long addr, void *data)
 	 * the TLB entries can stick around and continue to permit access to
 	 * the freed page. So it all relies on 1.
 	 */
-	__free_page(page);
+	if (arena->reserved)
+		put_page(page);
+	else
+		__free_page(page);
 	return 0;
 }
 
@@ -672,6 +725,10 @@ static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt
 	u32 uaddr32;
 	int ret, i;
 
+	/* Reserved arenas have all pages pre-populated */
+	if (arena->reserved)
+		return 0;
+
 	if (node_id != NUMA_NO_NODE &&
 	    ((unsigned int)node_id >= nr_node_ids || !node_online(node_id)))
 		return 0;
@@ -847,6 +904,10 @@ static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt,
 	struct clear_range_data cdata;
 	unsigned long flags;
 	int ret = 0;
+
+	/* Reserved arenas cannot free individual pages */
+	if (arena->reserved)
+		return;
 
 	/* only aligned lower 32-bit are relevant */
 	uaddr = (u32)uaddr;
