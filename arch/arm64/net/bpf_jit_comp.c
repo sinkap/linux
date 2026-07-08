@@ -85,6 +85,9 @@ struct jit_ctx {
 	u64 arena_vm_start;
 	bool fp_used;
 	bool write;
+	/* JIT-inserted arena cache maintenance for a non-coherent peer */
+	bool arena_clean;
+	bool arena_inval;
 };
 
 struct bpf_plt {
@@ -979,6 +982,25 @@ static int add_exception_handler(const struct bpf_insn *insn,
  * >0 - successfully JITed a 16-byte eBPF instruction.
  * <0 - failed to JIT.
  */
+/*
+ * Emit inline data-cache maintenance for a dma-buf backed arena shared with
+ * a non-coherent peer (BPF_F_ARENA_CLEAN / BPF_F_ARENA_INVAL). @base holds
+ * the arena kernel VA (arena_vm_base + reg); apply the maintenance to
+ * base + off to the point of coherency. The trailing dsb sy makes it
+ * complete before the surrounding access, matching dcache_{clean,inval}_poc.
+ * Uses TMP_REG_1 as scratch, free at every call site.
+ */
+static void emit_arena_cache_maint(u8 base, s16 off, bool clean,
+				   struct jit_ctx *ctx)
+{
+	const u8 tmp = bpf2a64[TMP_REG_1];
+
+	emit_a64_mov_i(1, tmp, off, ctx);
+	emit(A64_ADD(1, tmp, base, tmp), ctx);
+	emit(clean ? A64_DC_CVAC(tmp) : A64_DC_IVAC(tmp), ctx);
+	emit(A64_DSB_SY, ctx);
+}
+
 static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
 		      bool extra_pass)
 {
@@ -1438,6 +1460,13 @@ emit_cond_jmp:
 		if (BPF_MODE(insn->code) == BPF_PROBE_MEM32) {
 			emit(A64_ADD(1, tmp2, src, arena_vm_base), ctx);
 			src = tmp2;
+			/* Invalidate before the load so it observes the
+			 * non-coherent writer's update. Emitted before the
+			 * load, so the load stays the last insn and the
+			 * exception fixup still points at it.
+			 */
+			if (ctx->arena_inval)
+				emit_arena_cache_maint(tmp2, off, false, ctx);
 		}
 		if (src == fp) {
 			src_adj = A64_SP;
@@ -1579,6 +1608,12 @@ emit_cond_jmp:
 		ret = add_exception_handler(insn, ctx, dst);
 		if (ret)
 			return ret;
+		/* Clean after the store so the non-coherent reader sees it;
+		 * emitted after add_exception_handler() so the fault fixup
+		 * keeps pointing at the store. dst holds the arena VA base.
+		 */
+		if (ctx->arena_clean && BPF_MODE(insn->code) == BPF_PROBE_MEM32)
+			emit_arena_cache_maint(dst, off, true, ctx);
 		break;
 
 	/* STX: *(size *)(dst + off) = src */
@@ -1639,6 +1674,12 @@ emit_cond_jmp:
 		ret = add_exception_handler(insn, ctx, dst);
 		if (ret)
 			return ret;
+		/* Clean after the store so the non-coherent reader sees it;
+		 * emitted after add_exception_handler() so the fault fixup
+		 * keeps pointing at the store. dst holds the arena VA base.
+		 */
+		if (ctx->arena_clean && BPF_MODE(insn->code) == BPF_PROBE_MEM32)
+			emit_arena_cache_maint(dst, off, true, ctx);
 		break;
 
 	case BPF_STX | BPF_ATOMIC | BPF_W:
@@ -1750,6 +1791,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	bool tmp_blinded = false;
 	bool extra_pass = false;
 	struct jit_ctx ctx;
+	struct bpf_map *arena_map;
 	u8 *image_ptr;
 	u8 *ro_image_ptr;
 	int body_idx;
@@ -1800,6 +1842,9 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 
 	ctx.user_vm_start = bpf_arena_get_user_vm_start(prog->aux->arena);
 	ctx.arena_vm_start = bpf_arena_get_kern_vm_start(prog->aux->arena);
+	arena_map = bpf_prog_arena(prog);
+	ctx.arena_clean = arena_map && (arena_map->map_flags & BPF_F_ARENA_CLEAN);
+	ctx.arena_inval = arena_map && (arena_map->map_flags & BPF_F_ARENA_INVAL);
 
 	/* Pass 1: Estimate the maximum image size.
 	 *
@@ -2644,6 +2689,14 @@ bool bpf_jit_supports_exceptions(void)
 
 bool bpf_jit_supports_arena(void)
 {
+	return true;
+}
+
+bool bpf_jit_supports_arena_cache_maint(void)
+{
+	/* build_insn() emits dc cvac/ivac + dsb for BPF_F_ARENA_CLEAN /
+	 * BPF_F_ARENA_INVAL arena accesses.
+	 */
 	return true;
 }
 
