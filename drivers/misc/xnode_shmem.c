@@ -377,6 +377,9 @@ static long xnode_shmem_ioctl(struct file *file, unsigned int cmd,
 
 		if (copy_from_user(&s, uarg, sizeof(s)))
 			return -EFAULT;
+		/* Reject non-zero reserved field so it stays available. */
+		if (s.pad)
+			return -EINVAL;
 		return xnode_do_sync(xs, &s);
 	}
 	case XNODE_SHMEM_EXPORT_DMABUF: {
@@ -387,6 +390,8 @@ static long xnode_shmem_ioctl(struct file *file, unsigned int cmd,
 			return -EOPNOTSUPP;
 		if (copy_from_user(&dbuf, uarg, sizeof(dbuf)))
 			return -EFAULT;
+		if (dbuf.pad)
+			return -EINVAL;
 		err = xnode_export_dmabuf(xs, &dbuf);
 		if (err)
 			return err;
@@ -440,6 +445,10 @@ static const struct file_operations xnode_shmem_fops = {
 	.release	= xnode_shmem_release,
 	.mmap		= xnode_shmem_mmap,
 	.unlocked_ioctl	= xnode_shmem_ioctl,
+	/* All ioctl args are pointer-free and identically laid out on 32/64
+	 * bit, so the generic pointer conversion is sufficient.
+	 */
+	.compat_ioctl	= compat_ptr_ioctl,
 };
 
 static int xnode_shmem_register(struct device *parent, phys_addr_t base,

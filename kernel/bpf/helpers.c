@@ -3095,6 +3095,12 @@ static bool bpf_mmio_allowed(phys_addr_t base, size_t size)
 	struct bpf_mmio_allow *a;
 	bool ok = false;
 
+	/* Reject empty or wrapping ranges before comparing against the
+	 * allowlist, otherwise a wrapped end could spuriously match.
+	 */
+	if (!size || end < base)
+		return false;
+
 	spin_lock(&bpf_mmio_allowlist_lock);
 	list_for_each_entry(a, &bpf_mmio_allowlist, node) {
 		if (base >= a->base && end <= a->base + a->size) {
@@ -3158,6 +3164,9 @@ __bpf_kfunc struct bpf_mmio_region *bpf_mmio_map(u64 phys, u32 size)
 	if (!size || !PAGE_ALIGNED(phys))
 		return NULL;
 
+	/* PAGE_ALIGN() on a u32 within a page of U32_MAX wraps to 0. */
+	if (size > U32_MAX - (PAGE_SIZE - 1))
+		return NULL;
 	size = PAGE_ALIGN(size);
 
 	/* Only physical ranges a driver has explicitly registered may be
@@ -3248,6 +3257,13 @@ __bpf_kfunc int bpf_mmio_writeq(struct bpf_mmio_region *r, u32 offset, u64 val)
 }
 #endif
 
+/*
+ * The read accessors return 0 on an invalid (misaligned or out-of-range)
+ * access, which is indistinguishable from a register that genuinely reads
+ * 0. A value-returning kfunc has no error channel; keep @offset within
+ * [0, size) and naturally aligned. The write accessors do return -EINVAL /
+ * -ERANGE, so validate there if a register value must be checked.
+ */
 __bpf_kfunc u8 bpf_mmio_readb(struct bpf_mmio_region *r, u32 offset)
 {
 	if (bpf_mmio_check(r, offset, 1))
