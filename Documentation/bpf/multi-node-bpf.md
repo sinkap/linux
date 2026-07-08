@@ -8,7 +8,7 @@ same DRAM window through the fabric but do not snoop each other's
 caches.
 
 Porting code from the earlier raw-physical-address prototype? See
-`multi-node-bpf-migration.md`.
+`multi-node-bpf-migration.md` in the repository root.
 
 ## Architecture
 
