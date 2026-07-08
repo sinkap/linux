@@ -35,6 +35,13 @@ struct bpf_ringbuf {
 	struct page **pages;
 	int nr_pages;
 	bool overwrite_mode;
+	/*
+	 * Kernel-private copy of pending_pos for dma-buf backed ringbufs. The
+	 * shared pending_pos below lives in the producer page, which for a
+	 * dma-buf is writable by the remote node; keep the authoritative copy
+	 * here in the non-shared part of the struct. See ringbuf_pending_pos().
+	 */
+	unsigned long pending_pos_priv;
 	rqspinlock_t spinlock ____cacheline_aligned_in_smp;
 	/* For user-space producer ring buffers, an atomic_t busy bit is used
 	 * to synchronize access to the ring buffers in the kernel, rather than
@@ -79,10 +86,26 @@ struct bpf_ringbuf {
 
 	unsigned long consumer_pos __aligned(PAGE_SIZE);
 	unsigned long producer_pos __aligned(PAGE_SIZE);
+	/*
+	 * pending_pos is kernel-private working state, not part of the wire
+	 * protocol (the remote node only reads producer_pos and the record
+	 * headers). It sits in the producer page to share its cache line for
+	 * the local mmap case; for dma-buf backed ringbufs the kernel uses
+	 * pending_pos_priv instead so it never trusts remote-writable memory.
+	 */
 	unsigned long pending_pos;
 	unsigned long overwrite_pos; /* position after the last overwritten record */
 	char data[] __aligned(PAGE_SIZE);
 };
+
+/* Where the kernel keeps the authoritative pending_pos: the shared producer
+ * page normally, but a private field for dma-buf backed ringbufs whose
+ * producer page is writable by the non-coherent remote node.
+ */
+static inline unsigned long *ringbuf_pending_pos(struct bpf_ringbuf *rb)
+{
+	return rb->dmabuf_backed ? &rb->pending_pos_priv : &rb->pending_pos;
+}
 
 struct bpf_ringbuf_map {
 	struct bpf_map map;
@@ -229,7 +252,7 @@ static struct bpf_ringbuf *bpf_ringbuf_alloc(size_t data_sz, int numa_node,
 	rb->mask = data_sz - 1;
 	rb->consumer_pos = 0;
 	rb->producer_pos = 0;
-	rb->pending_pos = 0;
+	*ringbuf_pending_pos(rb) = 0;
 	rb->overwrite_mode = overwrite_mode;
 
 	/* Push the zeroed positions and data out to DRAM. Without this the
@@ -587,7 +610,7 @@ static void *__bpf_ringbuf_reserve(struct bpf_ringbuf *rb, u64 size)
 	if (raw_res_spin_lock_irqsave(&rb->spinlock, flags))
 		return NULL;
 
-	pend_pos = rb->pending_pos;
+	pend_pos = *ringbuf_pending_pos(rb);
 	prod_pos = rb->producer_pos;
 	new_prod_pos = prod_pos + len;
 
@@ -598,7 +621,7 @@ static void *__bpf_ringbuf_reserve(struct bpf_ringbuf *rb, u64 size)
 			break;
 		pend_pos += bpf_ringbuf_round_up_hdr_len(hdr_len);
 	}
-	rb->pending_pos = pend_pos;
+	*ringbuf_pending_pos(rb) = pend_pos;
 
 	if (!bpf_ringbuf_has_space(rb, new_prod_pos, cons_pos, pend_pos)) {
 		raw_res_spin_unlock_irqrestore(&rb->spinlock, flags);
