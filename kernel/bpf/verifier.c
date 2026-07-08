@@ -7130,6 +7130,25 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 		if (!err && value_regno >= 0 && (rdonly_mem || t == BPF_READ))
 			mark_reg_unknown(env, regs, value_regno);
 	} else if (reg->type == PTR_TO_ARENA) {
+		if (t == BPF_WRITE) {
+			struct bpf_map *arena = bpf_prog_arena(env->prog);
+
+			/*
+			 * BPF_F_ARENA_INVAL makes the JIT invalidate the line
+			 * before every arena load. Invalidate is clflush
+			 * (clean+invalidate) on x86 but dc ivac (pure
+			 * invalidate) on arm64, so invalidating a line the
+			 * program itself dirtied would diverge: x86 writes the
+			 * dirty line back to the shared window, arm64 discards
+			 * it. Keep the two arches in agreement by restricting
+			 * BPF_F_ARENA_INVAL to programs that only read the
+			 * arena.
+			 */
+			if (arena && (arena->map_flags & BPF_F_ARENA_INVAL)) {
+				verbose(env, "write to a BPF_F_ARENA_INVAL arena is not allowed\n");
+				return -EACCES;
+			}
+		}
 		if (t == BPF_READ && value_regno >= 0)
 			mark_reg_unknown(env, regs, value_regno);
 	} else {
