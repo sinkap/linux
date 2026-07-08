@@ -59,8 +59,10 @@ static int reuse_dmabuf(struct bpf_map *m, enum bpf_map_type type,
 		close(dmabuf);
 		return -1;
 	}
+	/* reuse_fd dup'd it into the map; drop our copy. */
+	close(fd);
 	*dmabuf_out = dmabuf;
-	return fd;
+	return 0;
 }
 
 static int run(struct bpf_program *p)
