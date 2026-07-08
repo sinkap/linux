@@ -46,6 +46,7 @@
 #include <linux/io.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
+#include <linux/kref.h>
 #include <linux/of.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/uaccess.h>
@@ -97,6 +98,14 @@ struct xnode_shmem {
 	struct miscdevice misc;
 	struct mutex kmap_lock;
 	void *kva;		/* lazy WB kernel mapping for maintenance */
+	/*
+	 * Open files cache a pointer to this struct, but the platform device
+	 * can be unbound (which does not wait for open fds and, unlike rmmod,
+	 * is not blocked by the THIS_MODULE open reference) while fds are
+	 * still open. Refcount so the struct outlives both the device and any
+	 * open file, whichever goes away last.
+	 */
+	struct kref ref;
 };
 
 /* per-open state */
@@ -388,6 +397,16 @@ static long xnode_shmem_ioctl(struct file *file, unsigned int cmd,
 	}
 }
 
+static void xnode_shmem_free(struct kref *ref)
+{
+	struct xnode_shmem *xs = container_of(ref, struct xnode_shmem, ref);
+
+	if (xs->kva)
+		memunmap(xs->kva);
+	mutex_destroy(&xs->kmap_lock);
+	kfree(xs);
+}
+
 static int xnode_shmem_open(struct inode *inode, struct file *file)
 {
 	struct miscdevice *misc = file->private_data;
@@ -397,6 +416,10 @@ static int xnode_shmem_open(struct inode *inode, struct file *file)
 	f = kzalloc(sizeof(*f), GFP_KERNEL);
 	if (!f)
 		return -ENOMEM;
+	/* Keep xs alive for as long as this fd is open, even across an
+	 * unbind of the underlying device.
+	 */
+	kref_get(&xs->ref);
 	f->xs = xs;
 	file->private_data = f;
 	return 0;
@@ -404,7 +427,10 @@ static int xnode_shmem_open(struct inode *inode, struct file *file)
 
 static int xnode_shmem_release(struct inode *inode, struct file *file)
 {
-	kfree(file->private_data);
+	struct xnode_shmem_file *f = file->private_data;
+
+	kref_put(&f->xs->ref, xnode_shmem_free);
+	kfree(f);
 	return 0;
 }
 
@@ -432,6 +458,7 @@ static int xnode_shmem_register(struct device *parent, phys_addr_t base,
 	xs->base = base;
 	xs->size = size;
 	mutex_init(&xs->kmap_lock);
+	kref_init(&xs->ref);		/* the "registered" reference */
 	xs->misc.minor = MISC_DYNAMIC_MINOR;
 	xs->misc.name = "xnode_shmem";
 	xs->misc.fops = &xnode_shmem_fops;
@@ -439,7 +466,7 @@ static int xnode_shmem_register(struct device *parent, phys_addr_t base,
 
 	err = misc_register(&xs->misc);
 	if (err) {
-		kfree(xs);
+		kref_put(&xs->ref, xnode_shmem_free);
 		return err;
 	}
 
@@ -454,10 +481,12 @@ static void xnode_shmem_unregister(struct xnode_shmem *xs)
 {
 	if (expose_mmio)
 		bpf_mmio_unregister_region(xs->base, xs->size);
+	/* After this returns no new open can find xs; open fds keep their
+	 * own reference. Drop the registered reference — xnode_shmem_free()
+	 * runs (memunmap + free) once the last open fd is also gone.
+	 */
 	misc_deregister(&xs->misc);
-	if (xs->kva)
-		memunmap(xs->kva);
-	kfree(xs);
+	kref_put(&xs->ref, xnode_shmem_free);
 }
 
 static int xnode_shmem_probe(struct platform_device *pdev)
