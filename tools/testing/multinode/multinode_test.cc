@@ -678,17 +678,9 @@ static void test_negative(void)
 	if (m >= 0)
 		close(m);
 
-	/* overwrite_pos is not part of the clean protocol; rejected. */
-	union bpf_attr b = {};
-	b.map_type = BPF_MAP_TYPE_RINGBUF;
-	b.max_entries = PAGE;
-	b.map_flags = BPF_F_DMABUF | BPF_F_RB_OVERWRITE;
-	b.map_extra = (uint32_t)db;
-	m = sys_bpf(BPF_MAP_CREATE, &b);
-	CHECK(m < 0 && errno == EINVAL,
-	      "RINGBUF + DMABUF + RB_OVERWRITE rejected (EINVAL)");
-	if (m >= 0)
-		close(m);
+	/* Note: the BPF_F_RB_OVERWRITE rejection check is omitted on this
+	 * 6.12 backport, which does not carry the ringbuf overwrite feature.
+	 */
 
 	close(db);
 }
