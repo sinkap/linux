@@ -5177,14 +5177,19 @@ err_put:
 /* ---- FD link: pin external fds via bpf_link/bpffs ---- */
 
 /*
- * Classify the target fd. Only leaf file types that cannot themselves
- * hold references to other files are allowed; returns the kind, or
- * -EPERM for anything else.
+ * Classify @file, the already-pinned target. Only leaf file types that
+ * cannot themselves hold references to other files are allowed; returns
+ * the kind, or -EPERM for anything else.
+ *
+ * Classification is done on the pinned @file, not on @fd, so an fd that is
+ * dup2()'d to a different (e.g. ref-holding) file after being classified
+ * cannot slip through: the eventfd probe is file-based, and the dma-buf
+ * probe requires @fd to still resolve to the very same @file.
  */
-static int bpf_fd_link_classify(int fd)
+static int bpf_fd_link_classify(struct file *file, int fd)
 {
 	if (IS_ENABLED(CONFIG_EVENTFD)) {
-		struct eventfd_ctx *ev = eventfd_ctx_fdget(fd);
+		struct eventfd_ctx *ev = eventfd_ctx_fileget(file);
 
 		if (!IS_ERR(ev)) {
 			eventfd_ctx_put(ev);
@@ -5195,8 +5200,11 @@ static int bpf_fd_link_classify(int fd)
 		struct dma_buf *dmabuf = dma_buf_get(fd);
 
 		if (!IS_ERR(dmabuf)) {
+			bool same = dmabuf->file == file;
+
 			dma_buf_put(dmabuf);
-			return BPF_FD_LINK_KIND_DMABUF;
+			if (same)
+				return BPF_FD_LINK_KIND_DMABUF;
 		}
 	}
 	return -EPERM;
@@ -5278,7 +5286,11 @@ static int bpf_fd_link_create(union bpf_attr *attr)
 	struct file *external_file;
 	int err;
 
-	/* Only leaf file types that cannot themselves hold references to
+	/* Pin the file first, then classify the pinned file: classifying the
+	 * fd and fget()'ing it separately would let a dup2() swap in a
+	 * different file in between.
+	 *
+	 * Only leaf file types that cannot themselves hold references to
 	 * other files may be pinned. A pinned link holding e.g. an io_uring
 	 * file whose fixed-file table holds this link's fd would form a
 	 * reference cycle no one can ever reclaim; the kernel has no generic
@@ -5286,13 +5298,15 @@ static int bpf_fd_link_create(union bpf_attr *attr)
 	 * Extend the whitelist as new leaf types are needed. BPF fds are
 	 * excluded by construction — they have native bpffs pinning anyway.
 	 */
-	err = bpf_fd_link_classify(attr->link_create.target_fd);
-	if (err < 0)
-		return err;
-
 	external_file = fget(attr->link_create.target_fd);
 	if (!external_file)
 		return -EBADF;
+
+	err = bpf_fd_link_classify(external_file, attr->link_create.target_fd);
+	if (err < 0) {
+		fput(external_file);
+		return err;
+	}
 
 	efl = kzalloc(sizeof(*efl), GFP_KERNEL);
 	if (!efl) {
