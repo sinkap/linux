@@ -23,6 +23,9 @@
 #ifndef BPF_F_ARENA_CLEAN
 #define BPF_F_ARENA_CLEAN	(1U << 21)
 #endif
+#ifndef BPF_F_ARENA_INVAL
+#define BPF_F_ARENA_INVAL	(1U << 22)
+#endif
 
 #define HDR_SZ 8u
 
@@ -205,6 +208,49 @@ void test_multinode_dmabuf(void)
 			ASSERT_EQ(val, 0xBEEFULL, "callback saw payload");
 			munmap(m, 3 * page);
 		}
+	}
+
+	/* A BPF_F_ARENA_INVAL arena is read-only to the program: writing to
+	 * it must be rejected at load (see the JIT invalidate divergence).
+	 */
+	if (test__start_subtest("arena_inval_write_rejected")) {
+		struct multinode_dmabuf *s2 = multinode_dmabuf__open();
+		int db = -1;
+
+		if (ASSERT_OK_PTR(s2, "skel open")) {
+			static char log[8192];
+
+			/* Only arena_writer, which stores to the arena, matters. */
+			bpf_program__set_autoload(s2->progs.rb_producer, false);
+			bpf_program__set_autoload(s2->progs.urb_drain, false);
+			bpf_program__set_log_buf(s2->progs.arena_writer, log,
+						 sizeof(log));
+			bpf_program__set_log_level(s2->progs.arena_writer, 1);
+
+			if (ASSERT_GE(reuse_dmabuf(s2->maps.arena,
+						   BPF_MAP_TYPE_ARENA, 4,
+						   BPF_F_MMAPABLE | BPF_F_ARENA_INVAL,
+						   4, &db),
+				      0, "arena INVAL dma-buf map")) {
+				/* Set the arena user address so verification
+				 * reaches the store (and thus the INVAL write
+				 * check) instead of bailing earlier.
+				 */
+				mmap((void *)0x4100000000ULL, 4 * page,
+				     PROT_READ | PROT_WRITE,
+				     MAP_SHARED | MAP_FIXED,
+				     bpf_map__fd(s2->maps.arena), 0);
+
+				ASSERT_ERR(multinode_dmabuf__load(s2),
+					   "load rejected");
+				ASSERT_HAS_SUBSTR(log,
+					"write to a BPF_F_ARENA_INVAL arena is not allowed",
+					"verifier message");
+			}
+			if (db >= 0)
+				close(db);
+		}
+		multinode_dmabuf__destroy(s2);
 	}
 
 cleanup:
