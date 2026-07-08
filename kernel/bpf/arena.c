@@ -6,6 +6,7 @@
 #include <linux/btf_ids.h>
 #include <linux/vmalloc.h>
 #include <linux/pagemap.h>
+#include <linux/filter.h>
 #include "range_tree.h"
 #include "cache_maint.h"
 #include "dmabuf_backing.h"
@@ -128,7 +129,12 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 	if (attr->map_flags & (BPF_F_ARENA_CLEAN | BPF_F_ARENA_INVAL)) {
 		if (!(attr->map_flags & BPF_F_DMABUF))
 			return ERR_PTR(-EINVAL);
-		if (!bpf_nc_cache_maint_available())
+		/* The maintenance is emitted inline by the JIT; refuse the
+		 * flags unless the JIT for this arch actually emits it, so a
+		 * program never silently runs without the clean/invalidate it
+		 * asked for.
+		 */
+		if (!bpf_jit_supports_arena_cache_maint())
 			return ERR_PTR(-EOPNOTSUPP);
 	}
 
