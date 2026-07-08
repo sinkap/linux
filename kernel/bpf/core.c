@@ -3309,6 +3309,16 @@ bool __weak bpf_jit_supports_arena(void)
 	return false;
 }
 
+/* Whether the JIT emits cache maintenance for a dma-buf backed arena
+ * shared with a non-coherent peer (BPF_F_ARENA_CLEAN / BPF_F_ARENA_INVAL).
+ * Gates acceptance of those flags: an arch that returns false rejects them
+ * at map creation rather than silently running without maintenance.
+ */
+bool __weak bpf_jit_supports_arena_cache_maint(void)
+{
+	return false;
+}
+
 bool __weak bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena)
 {
 	return false;

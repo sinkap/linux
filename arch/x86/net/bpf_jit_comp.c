@@ -4223,6 +4223,12 @@ bool bpf_jit_supports_arena(void)
 	return true;
 }
 
+bool bpf_jit_supports_arena_cache_maint(void)
+{
+	/* do_jit() emits clflush for BPF_F_ARENA_CLEAN / BPF_F_ARENA_INVAL */
+	return boot_cpu_has(X86_FEATURE_CLFLUSH);
+}
+
 bool bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena)
 {
 	if (!in_arena)
