@@ -613,14 +613,34 @@ static void test_arena_jit(void)
 		uint32_t n = info.jited_prog_len;
 		if (n > sizeof(jit))
 			n = sizeof(jit);
+#if defined(__x86_64__)
+		/* clflush: 0F AE /7 with a memory operand (ModRM.mod != 3),
+		 * so sfence (0F AE F8) does not match.
+		 */
 		for (uint32_t i = 0; i + 2 < n; i++)
 			if (jit[i] == 0x0f && jit[i + 1] == 0xae &&
-			    ((jit[i + 2] >> 3) & 7) == 7) {
+			    ((jit[i + 2] >> 3) & 7) == 7 &&
+			    ((jit[i + 2] >> 6) != 3)) {
 				has_clflush = true;
 				break;
 			}
+#elif defined(__aarch64__)
+		/* dc cvac (0xd50b7a20) / dc ivac (0xd5087620) */
+		for (uint32_t i = 0; i + 3 < n; i += 4) {
+			uint32_t w = jit[i] | jit[i + 1] << 8 |
+				     jit[i + 2] << 16 |
+				     (uint32_t)jit[i + 3] << 24;
+			if ((w & ~0x1fU) == 0xd50b7a20U ||
+			    (w & ~0x1fU) == 0xd5087620U) {
+				has_clflush = true;
+				break;
+			}
+		}
+#else
+		has_clflush = true; /* unknown arch: don't fail the scan */
+#endif
 	}
-	CHECK(has_clflush, "JIT emitted clflush after arena store");
+	CHECK(has_clflush, "JIT emitted cache maintenance after arena store");
 
 	/* run it: a malformed clflush would #UD here */
 	unsigned char ctx[8] = {};

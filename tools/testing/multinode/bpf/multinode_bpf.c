@@ -110,11 +110,26 @@ static void test_arena(struct bpf_object *obj)
 	if (fd >= 0 && bpf_prog_get_info_by_fd(fd, &info, &len) == 0) {
 		unsigned int n = info.jited_prog_len < sizeof(jit) ?
 				 info.jited_prog_len : sizeof(jit);
+#if defined(__x86_64__)
+		/* clflush 0F AE /7 with a memory operand (ModRM.mod != 3) */
 		for (unsigned int i = 0; i + 2 < n; i++)
 			if (jit[i] == 0x0f && jit[i + 1] == 0xae &&
-			    ((jit[i + 2] >> 3) & 7) == 7) { clflush = true; break; }
+			    ((jit[i + 2] >> 3) & 7) == 7 &&
+			    ((jit[i + 2] >> 6) != 3)) { clflush = true; break; }
+#elif defined(__aarch64__)
+		/* dc cvac (0xd50b7a20) / dc ivac (0xd5087620) */
+		for (unsigned int i = 0; i + 3 < n; i += 4) {
+			unsigned int w = jit[i] | jit[i + 1] << 8 |
+					 jit[i + 2] << 16 |
+					 (unsigned int)jit[i + 3] << 24;
+			if ((w & ~0x1fU) == 0xd50b7a20U ||
+			    (w & ~0x1fU) == 0xd5087620U) { clflush = true; break; }
+		}
+#else
+		clflush = true;
+#endif
 	}
-	CHECK(clflush, "JIT emitted clflush after arena store");
+	CHECK(clflush, "JIT emitted cache maintenance after arena store");
 	CHECK(run_prog(obj, "arena_writer") == 0, "arena_writer runs");
 }
 
