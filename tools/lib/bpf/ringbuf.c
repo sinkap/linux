@@ -169,6 +169,112 @@ err_out:
 	return libbpf_err(err);
 }
 
+int ring_buffer__add_dmabuf(struct ring_buffer *rb, int dmabuf_fd,
+			    size_t data_size, int notify_fd,
+			    ring_buffer_sample_fn sample_cb, void *ctx)
+{
+	size_t ps = rb->page_size;
+	size_t region_sz;
+	struct epoll_event *e;
+	struct ring *r;
+	void *tmp, *region;
+	int err;
+
+	/* @data_size is the ring buffer's data area size (its max_entries):
+	 * a power of two and a multiple of the page size. The dma-buf must be
+	 * laid out like a dma-buf backed BPF_MAP_TYPE_RINGBUF: page 0 is
+	 * consumer_pos, page 1 is producer_pos, pages 2+ are the data area.
+	 */
+	if (!data_size || (data_size & (data_size - 1)) || (data_size & (ps - 1))) {
+		pr_warn("ringbuf: dmabuf data_size %zu must be a power-of-two multiple of the page size\n",
+			data_size);
+		return libbpf_err(-EINVAL);
+	}
+
+	tmp = libbpf_reallocarray(rb->rings, rb->ring_cnt + 1, sizeof(*rb->rings));
+	if (!tmp)
+		return libbpf_err(-ENOMEM);
+	rb->rings = tmp;
+
+	tmp = libbpf_reallocarray(rb->events, rb->ring_cnt + 1, sizeof(*rb->events));
+	if (!tmp)
+		return libbpf_err(-ENOMEM);
+	rb->events = tmp;
+
+	r = calloc(1, sizeof(*r));
+	if (!r)
+		return libbpf_err(-ENOMEM);
+	rb->rings[rb->ring_cnt] = r;
+
+	r->map_fd = -1;
+	r->sample_cb = sample_cb;
+	r->ctx = ctx;
+	r->mask = data_size - 1;
+
+	/* Writable consumer page (dma-buf page 0). */
+	tmp = mmap(NULL, ps, PROT_READ | PROT_WRITE, MAP_SHARED, dmabuf_fd, 0);
+	if (tmp == MAP_FAILED) {
+		err = -errno;
+		pr_warn("ringbuf: failed to mmap dmabuf consumer page: %d\n", err);
+		goto err_out;
+	}
+	r->consumer_pos = tmp;
+
+	/* Producer page + data area, with the data mapped twice so samples
+	 * that wrap the end read contiguously. A dma-buf is single-mapped
+	 * (unlike a ringbuf map, which the kernel double-maps), so reserve a
+	 * VA window and MAP_FIXED the producer+data and then the data again.
+	 * The layout and size match the ring_buffer__add() case, so
+	 * ringbuf_free_ring() unmaps it correctly.
+	 */
+	region_sz = ps + 2 * data_size;
+	region = mmap(NULL, region_sz, PROT_NONE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+	if (region == MAP_FAILED) {
+		err = -errno;
+		goto err_out;
+	}
+	/* producer page + first data copy, from dma-buf page 1 */
+	if (mmap(region, ps + data_size, PROT_READ, MAP_SHARED | MAP_FIXED,
+		 dmabuf_fd, ps) == MAP_FAILED) {
+		err = -errno;
+		munmap(region, region_sz);
+		goto err_out;
+	}
+	/* second data copy, from dma-buf page 2 (start of the data area) */
+	if (mmap((char *)region + ps + data_size, data_size, PROT_READ,
+		 MAP_SHARED | MAP_FIXED, dmabuf_fd, 2 * ps) == MAP_FAILED) {
+		err = -errno;
+		munmap(region, region_sz);
+		goto err_out;
+	}
+	r->producer_pos = region;
+	r->data = (char *)region + ps;
+
+	e = &rb->events[rb->ring_cnt];
+	memset(e, 0, sizeof(*e));
+	e->events = EPOLLIN;
+	e->data.fd = rb->ring_cnt;
+
+	/* No map fd to poll on; the caller's out-of-band doorbell (eventfd)
+	 * drives ring_buffer__poll(). If none is given, the ring is drained
+	 * only via ring_buffer__consume().
+	 */
+	if (notify_fd >= 0 &&
+	    epoll_ctl(rb->epoll_fd, EPOLL_CTL_ADD, notify_fd, e) < 0) {
+		err = -errno;
+		pr_warn("ringbuf: failed to epoll add notify_fd=%d: %d\n",
+			notify_fd, err);
+		goto err_out;
+	}
+
+	rb->ring_cnt++;
+	return 0;
+
+err_out:
+	ringbuf_free_ring(rb, r);
+	return libbpf_err(err);
+}
+
 void ring_buffer__free(struct ring_buffer *rb)
 {
 	int i;
@@ -209,9 +315,15 @@ ring_buffer__new(int map_fd, ring_buffer_sample_fn sample_cb, void *ctx,
 		goto err_out;
 	}
 
-	err = ring_buffer__add(rb, map_fd, sample_cb, ctx);
-	if (err)
-		goto err_out;
+	/* map_fd < 0 creates an empty manager to be populated with
+	 * ring_buffer__add() / ring_buffer__add_dmabuf() -- e.g. on a peer
+	 * that has a shared dma-buf but no ring buffer map fd.
+	 */
+	if (map_fd >= 0) {
+		err = ring_buffer__add(rb, map_fd, sample_cb, ctx);
+		if (err)
+			goto err_out;
+	}
 
 	return rb;
 
