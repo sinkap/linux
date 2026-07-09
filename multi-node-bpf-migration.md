@@ -257,28 +257,87 @@ Two behaviours to be aware of:
        MAP_SHARED | MAP_FIXED, arena_fd, 0);   /* then load */
   ```
 
-## 5. MMIO kfuncs: now fd-scoped via a provider
+## 5. MMIO kfuncs: two ways to name an aperture
 
-`bpf_mmio_map()` takes `(fd, offset, size)`, not a physical address. The fd
-is handed out by a **provider** — the subsystem that owns the aperture,
-which registers its fd's `file_operations` + a resolver via
-`bpf_mmio_register_provider()`. (The prototype mapped any physical address;
-an earlier revision of this branch used a global
-`bpf_mmio_register_region(phys, size)` allowlist, now removed.)
+There are two ways to obtain a `struct bpf_mmio_region *`; pick per aperture.
+Everything downstream — the `bpf_mmio_readl`/`writel`/… accessors,
+`bpf_mmio_release`, and the kptr/destructor — is identical, and both map
+kfuncs are `KF_ACQUIRE | KF_RET_NULL | KF_SLEEPABLE`.
+
+**(a) `bpf_mmio_map_region(phys, size)` — driver-allowlisted physical range.**
+For a *fixed* aperture owned by a trusted in-kernel driver (a doorbell /
+mailbox). The driver blesses the range; access is gated by that registration
+plus `CAP_BPF`. Takes **no fd**, so it can be mapped from any process context.
 
 ```c
-/* before (this branch, earlier) */
-r = bpf_mmio_map(bar_phys, size);
-/* after */
-r = bpf_mmio_map(fd, offset, size);   /* fd from the provider */
+/* driver that owns the aperture */
+bpf_mmio_register_region(doorbell_phys, size);   /* ... unregister at exit */
+
+/* BPF: map once (any context — no fget) and stash the kptr */
+r = bpf_mmio_map_region(DOORBELL_PHYS, size);
+```
+Fail-closed: with nothing registered, `bpf_mmio_map_region()` returns NULL.
+
+**(b) `bpf_mmio_map(fd, offset, size)` — fd-scoped via a provider.** For an
+aperture whose access should follow *fd/process ownership* (e.g. a vfio-pci
+BAR handed to a specific process). A provider registers its fd's
+`file_operations` + a resolver via `bpf_mmio_register_provider()`;
+`bpf_mmio_map()` `fget()`s the fd, so the map call **must run in the process
+holding the fd**. With no provider registered it fails for every fd.
+
+```c
+r = bpf_mmio_map(bar_fd, offset, size);   /* fd from the provider */
 ```
 
-- `xnode_shmem` registers as a provider when loaded with `expose_mmio=1`,
-  resolving an open `/dev/xnode_shmem` fd to the window's physical range.
-  With no provider registered, `bpf_mmio_map()` fails for every fd.
-- Access is scoped to *holding the fd*, not to a global allowlist.
-- `bpf_mmio_map()` is `KF_SLEEPABLE`; `bpf_mmio_readq`/`writeq` are 64-bit
-  only. The accessor calls (`bpf_mmio_readl`/`writel`/…) are unchanged.
+Which to use: a fixed doorbell your own driver owns → (a); a per-process
+device handoff → (b).
+
+### Usage pattern (both): map once, stash a kptr, use later
+
+`ioremap()` is sleepable, so you don't map per event — map once in a
+sleepable context, stash the acquired region as a
+`struct bpf_mmio_region __kptr *`, and read it from the fast path (e.g. an
+LSM hook). For path (b) the setup program must run in the fd holder's
+process; for path (a) any context works.
+
+```c
+struct { struct bpf_mmio_region __kptr *region; } val;   /* in a map / global */
+
+SEC("syscall")                           /* run once via bpf_prog_test_run */
+int setup(void *ctx)
+{
+	struct bpf_mmio_region *r = bpf_mmio_map_region(DOORBELL_PHYS, 0x1000);
+	if (!r)
+		return 1;
+	r = bpf_kptr_xchg(&val.region, r);   /* stash; returns previous (NULL) */
+	if (r)
+		bpf_mmio_release(r);
+	return 0;
+}
+
+SEC("lsm/bprm_committed_creds")
+int BPF_PROG(on_exec, struct linux_binprm *bprm)
+{
+	struct bpf_mmio_region *r = val.region;   /* load kptr */
+	if (!r)                                    /* setup hasn't run yet */
+		return 0;
+	bpf_mmio_writel(r, DOORBELL_OFF, value);
+	return 0;
+}
+```
+
+The kptr's destructor `iounmap()`s (and `fput()`s the fd, for path (b)) when
+it is replaced or the map is freed.
+
+Notes:
+
+- The mmio kfunc set is registered for tracing, sched_cls, xdp, struct_ops,
+  **syscall**, and **lsm** program types — so both the `SEC("syscall")` setup
+  and the `SEC("lsm/…")` hook above can call it.
+- `bpf_mmio_writel` is `KF_RCU`: a kptr read is RCU-protected and a
+  non-sleepable LSM hook runs under RCU, so just NULL-check it (in a
+  *sleepable* hook, wrap the load/use in `bpf_rcu_read_lock()/unlock()`).
+- `bpf_mmio_readq`/`writeq` are 64-bit only.
 
 ## 6. Consumer node: prefer a driverless in-BPF consumer
 
@@ -416,8 +475,10 @@ longer works. Link info now reports the kind/inode
       `consumer_pos`).
 - [ ] Add `BPF_F_ARENA_CLEAN`/`INVAL` to arena maps; drop any
       `bpf_arena_cache_clean()` calls; `mmap()` the arena before load.
-- [ ] Port `bpf_mmio_map(phys,size)` → `bpf_mmio_map(fd,offset,size)`;
-      register the aperture with `bpf_mmio_register_provider()`.
+- [ ] MMIO: for a driver-owned fixed aperture, `bpf_mmio_register_region()`
+      + `bpf_mmio_map_region(phys,size)`; for a per-process aperture,
+      `bpf_mmio_register_provider()` + `bpf_mmio_map(fd,offset,size)`. Map
+      once, stash a `bpf_mmio_region __kptr`, use from the hook (§5).
 - [ ] Consumer node: move off `/dev/mem` to a driverless in-BPF consumer
       (`USER_RINGBUF`/arena `INVAL`); keep `xnode_shmem` only for a
       userspace/cached consumer.
