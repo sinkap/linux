@@ -640,4 +640,16 @@ config XNODE_SHMEM
 
 	  If unsure, say N.
 
+config IPU_DMA
+	tristate "IPU DMA dma-buf binding (skeleton)"
+	depends on DMA_SHARED_BUFFER
+	help
+	  Import a dma-buf for DMA by an IPU offload engine and keep the
+	  resulting IOVA mapping alive via a refcounted anon-inode fd, so the
+	  mapping survives the process that created it. Skeleton driver: the
+	  descriptor-ring programming is stubbed and the DMA device is
+	  synthetic.
+
+	  If unsure, say N.
+
 endmenu
