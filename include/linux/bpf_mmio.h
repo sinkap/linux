@@ -34,15 +34,30 @@ struct bpf_mmio_provider {
 		       phys_addr_t *phys);
 };
 
+/*
+ * Physical-range allowlist for the bpf_mmio_map_region() kfunc -- the second
+ * way to name an aperture, for a *fixed* region owned by a trusted in-kernel
+ * driver (e.g. a doorbell/mailbox) rather than a per-fd grant. The driver
+ * registers the range; bpf_mmio_map_region() refuses anything not fully inside
+ * a registered range, and takes no fd so it can be mapped from any context.
+ * Fail-closed: with nothing registered, it maps nothing.
+ */
 #ifdef CONFIG_BPF_SYSCALL
 int bpf_mmio_register_provider(const struct bpf_mmio_provider *prov);
 void bpf_mmio_unregister_provider(const struct bpf_mmio_provider *prov);
+int bpf_mmio_register_region(phys_addr_t base, size_t size);
+void bpf_mmio_unregister_region(phys_addr_t base, size_t size);
 #else
 static inline int bpf_mmio_register_provider(const struct bpf_mmio_provider *prov)
 {
 	return -EOPNOTSUPP;
 }
 static inline void bpf_mmio_unregister_provider(const struct bpf_mmio_provider *prov) {}
+static inline int bpf_mmio_register_region(phys_addr_t base, size_t size)
+{
+	return -EOPNOTSUPP;
+}
+static inline void bpf_mmio_unregister_region(phys_addr_t base, size_t size) {}
 #endif
 
 #endif /* _LINUX_BPF_MMIO_H */

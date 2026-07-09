@@ -4859,6 +4859,85 @@ static int bpf_mmio_resolve(struct file *file, u64 offset, size_t size,
 	return err;
 }
 
+/*
+ * Physical-range allowlist -- the second way to name an aperture, for a
+ * *fixed* region owned by a trusted in-kernel driver (a doorbell/mailbox)
+ * rather than a per-fd grant. The driver registers the range and
+ * bpf_mmio_map_region() refuses anything not fully inside a registered range;
+ * fail-closed, so nothing registered maps nothing. Unlike the fd path it takes
+ * no fd, so it can be mapped from any process context (there is no fget()).
+ * Access is gated by the driver's registration plus CAP_BPF, not by fd
+ * ownership -- use it when that is the right model, and the provider/fd path
+ * when access should follow whoever holds the fd.
+ */
+struct bpf_mmio_allow {
+	struct list_head node;
+	phys_addr_t base;
+	size_t size;
+};
+
+static LIST_HEAD(bpf_mmio_allowlist);
+static DEFINE_SPINLOCK(bpf_mmio_allowlist_lock);
+
+int bpf_mmio_register_region(phys_addr_t base, size_t size)
+{
+	struct bpf_mmio_allow *a;
+
+	if (!size || (base + size) < base)
+		return -EINVAL;
+
+	a = kmalloc(sizeof(*a), GFP_KERNEL);
+	if (!a)
+		return -ENOMEM;
+	a->base = base;
+	a->size = size;
+
+	spin_lock(&bpf_mmio_allowlist_lock);
+	list_add(&a->node, &bpf_mmio_allowlist);
+	spin_unlock(&bpf_mmio_allowlist_lock);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(bpf_mmio_register_region);
+
+void bpf_mmio_unregister_region(phys_addr_t base, size_t size)
+{
+	struct bpf_mmio_allow *a, *tmp;
+
+	spin_lock(&bpf_mmio_allowlist_lock);
+	list_for_each_entry_safe(a, tmp, &bpf_mmio_allowlist, node) {
+		if (a->base == base && a->size == size) {
+			list_del(&a->node);
+			kfree(a);
+			break;
+		}
+	}
+	spin_unlock(&bpf_mmio_allowlist_lock);
+}
+EXPORT_SYMBOL_GPL(bpf_mmio_unregister_region);
+
+static bool bpf_mmio_allowed(phys_addr_t base, size_t size)
+{
+	phys_addr_t end = base + size;
+	struct bpf_mmio_allow *a;
+	bool ok = false;
+
+	/* Reject empty/wrapping ranges before comparing, so a wrapped end
+	 * cannot spuriously match a registered range.
+	 */
+	if (!size || end < base)
+		return false;
+
+	spin_lock(&bpf_mmio_allowlist_lock);
+	list_for_each_entry(a, &bpf_mmio_allowlist, node) {
+		if (base >= a->base && end <= a->base + a->size) {
+			ok = true;
+			break;
+		}
+	}
+	spin_unlock(&bpf_mmio_allowlist_lock);
+	return ok;
+}
+
 struct bpf_mmio_region {
 	refcount_t usage;
 	void __iomem *addr;
@@ -4955,6 +5034,49 @@ err_free:
 err_fput:
 	fput(file);
 	return NULL;
+}
+
+/**
+ * bpf_mmio_map_region - Map a driver-allowlisted physical MMIO range.
+ * @phys: Page-aligned physical base.
+ * @size: Size in bytes (will be page-aligned).
+ *
+ * For a fixed aperture a trusted driver has registered with
+ * bpf_mmio_register_region(). Takes no fd, so unlike bpf_mmio_map() it can be
+ * called from any process context. Sleepable (ioremap()), hence KF_SLEEPABLE.
+ *
+ * Returns an acquired reference to a bpf_mmio_region, or NULL on failure.
+ */
+__bpf_kfunc struct bpf_mmio_region *bpf_mmio_map_region(u64 phys, u32 size)
+{
+	struct bpf_mmio_region *r;
+
+	if (!size || !PAGE_ALIGNED(phys))
+		return NULL;
+
+	/* PAGE_ALIGN() on a u32 within a page of U32_MAX wraps to 0. */
+	if (size > U32_MAX - (PAGE_SIZE - 1))
+		return NULL;
+	size = PAGE_ALIGN(size);
+
+	/* Only ranges a driver has registered may be mapped; fail-closed. */
+	if (!bpf_mmio_allowed(phys, size))
+		return NULL;
+
+	r = kzalloc(sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return NULL;
+
+	r->addr = ioremap(phys, size);
+	if (!r->addr) {
+		kfree(r);
+		return NULL;
+	}
+	/* No fd: r->file stays NULL and the dtor just iounmap()s. */
+	r->phys = phys;
+	r->size = size;
+	refcount_set(&r->usage, 1);
+	return r;
 }
 
 /**
@@ -5168,6 +5290,7 @@ static const struct btf_kfunc_id_set generic_kfunc_set = {
  */
 BTF_KFUNCS_START(mmio_btf_ids)
 BTF_ID_FLAGS(func, bpf_mmio_map, KF_ACQUIRE | KF_RET_NULL | KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_mmio_map_region, KF_ACQUIRE | KF_RET_NULL | KF_SLEEPABLE)
 BTF_ID_FLAGS(func, bpf_mmio_release, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_mmio_writeb, KF_RCU)
 BTF_ID_FLAGS(func, bpf_mmio_writew, KF_RCU)
@@ -5335,6 +5458,7 @@ static int __init kfunc_init(void)
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &mmio_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &mmio_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &mmio_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_LSM, &mmio_kfunc_set);
 	ret = ret ?: register_btf_id_dtor_kfuncs(generic_dtors,
 						  ARRAY_SIZE(generic_dtors),
 						  THIS_MODULE);
