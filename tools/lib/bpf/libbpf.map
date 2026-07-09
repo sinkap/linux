@@ -461,4 +461,5 @@ LIBBPF_1.8.0 {
 		bpf_program__attach_tracing_multi;
 		bpf_program__clone;
 		btf__new_empty_opts;
+		ring_buffer__add_dmabuf;
 } LIBBPF_1.7.0;

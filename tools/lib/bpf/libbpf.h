@@ -1468,6 +1468,36 @@ ring_buffer__new(int map_fd, ring_buffer_sample_fn sample_cb, void *ctx,
 LIBBPF_API void ring_buffer__free(struct ring_buffer *rb);
 LIBBPF_API int ring_buffer__add(struct ring_buffer *rb, int map_fd,
 				ring_buffer_sample_fn sample_cb, void *ctx);
+
+/**
+ * @brief **ring_buffer__add_dmabuf()** adds a ring buffer that lives in a
+ * dma-buf (rather than a BPF ring buffer map fd) to a ring buffer manager.
+ *
+ * For consuming a dma-buf backed BPF_MAP_TYPE_RINGBUF whose map fd is not
+ * available -- e.g. on a peer node that maps the same shared dma-buf but did
+ * not create the map. The dma-buf must be laid out like a dma-buf backed ring
+ * buffer: page 0 consumer_pos, page 1 producer_pos, pages 2+ the data area.
+ *
+ * @param rb the ring buffer manager
+ * @param dmabuf_fd fd of the dma-buf backing the ring buffer
+ * @param offset byte offset of the ring buffer within the dma-buf: 0 for a
+ *        bare dma-buf ring buffer, bpf_map_info.arena_off for a ring buffer
+ *        placed in a dma-buf backed arena; page-aligned
+ * @param data_size the ring buffer data area size (its max_entries): a power
+ *        of two and a multiple of the page size
+ * @param notify_fd an fd (e.g. an eventfd doorbell) to poll for readiness, or
+ *        -1 to drain only via ring_buffer__consume()
+ * @param sample_cb function called per record
+ * @param ctx passed to @sample_cb
+ * @return 0 on success, negative error code on failure
+ *
+ * The caller owns the coherency of the mapping (cache attributes, and any
+ * maintenance on non-coherent shared memory); libbpf only walks the records.
+ */
+LIBBPF_API int ring_buffer__add_dmabuf(struct ring_buffer *rb, int dmabuf_fd,
+				       size_t offset, size_t data_size,
+				       int notify_fd,
+				       ring_buffer_sample_fn sample_cb, void *ctx);
 LIBBPF_API int ring_buffer__poll(struct ring_buffer *rb, int timeout_ms);
 LIBBPF_API int ring_buffer__consume(struct ring_buffer *rb);
 LIBBPF_API int ring_buffer__consume_n(struct ring_buffer *rb, size_t n);
