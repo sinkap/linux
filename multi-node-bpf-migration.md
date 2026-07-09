@@ -363,6 +363,39 @@ Notes:
   (cases 3–4), it cannot run in userspace on arm64 — use the in-BPF drain
   (§6).
 
+### Using libbpf instead of hand-rolling it
+
+libbpf can do the walk above for you — including the wrap-around
+double-mapping and the poll integration — via **`ring_buffer__add_dmabuf()`**
+(added alongside this series). It consumes a dma-buf backed ring buffer
+whose *map fd is not available* (the peer maps the shared dma-buf but did
+not create the map), so you don't reimplement the record loop:
+
+```c
+/* empty manager: pass map_fd < 0 (there is no ring buffer map here) */
+struct ring_buffer *rb = ring_buffer__new(-1, NULL, NULL, NULL);
+
+/* dmabuf_fd: the shared window's dma-buf; data_size: the ring's max_entries
+ * (power of two, page-aligned); notify_fd: your doorbell eventfd or -1.
+ */
+ring_buffer__add_dmabuf(rb, dmabuf_fd, data_size, notify_fd, on_sample, ctx);
+
+ring_buffer__poll(rb, -1);      /* waits on notify_fd, then drains  */
+/* or ring_buffer__consume(rb) after your own doorbell wakeup       */
+```
+
+`ring_buffer__add_dmabuf()` mmaps the dma-buf (consumer page + a
+double-mapped producer/data region) and reuses libbpf's record walk;
+`on_sample(ctx, data, size)` is called per record.
+
+**Coherency stays yours.** libbpf only walks the records — it issues no
+cache maintenance. That is correct for §3a case 2 (producer coherent with
+the consumer: cacheable reads are fresh, and you map `consumer_pos`
+write-combine so its store reaches DRAM). It is *not* sufficient for cases
+3–4, which need an invalidate the library does not (and, being EL1-only,
+cannot) do — use the in-BPF drain (§6) there. See
+`ring_buffer__add_dmabuf()` in `tools/lib/bpf/libbpf.h` for the contract.
+
 ## 7. fd links: only leaf file types
 
 `BPF_LINK_TYPE_FD` (`attach_type BPF_DEPENDENT_FD`) now accepts only
