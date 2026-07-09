@@ -29,6 +29,7 @@
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/scatterlist.h>
+#include <linux/bpf.h>
 
 #include <uapi/linux/ipu_dma.h>
 
@@ -147,17 +148,18 @@ static long ipu_binding_ioctl(struct file *file, unsigned int cmd,
 }
 
 /*
- * These fops identify the binding fd. A real deployment can make this fd
- * pinnable in bpffs by registering it with the fd-link mechanism (see the
- * bpf_fd_link_register_kind() follow-up); nothing here depends on bpf.
+ * These fops identify the binding fd. It is made pinnable in bpffs by
+ * registering it with bpf_fd_link_register_kind() at init: bpf compares an
+ * fd's f_op against the registry, so it never references this driver. The
+ * binding's only outward reference is to a dma-buf (a sink), so it cannot
+ * form a reference cycle and is safe to pin.
  */
-const struct file_operations ipu_dma_binding_fops = {
+static const struct file_operations ipu_dma_binding_fops = {
 	.owner		= THIS_MODULE,
 	.release	= ipu_binding_release,
 	.unlocked_ioctl	= ipu_binding_ioctl,
 	.compat_ioctl	= compat_ptr_ioctl,
 };
-EXPORT_SYMBOL_GPL(ipu_dma_binding_fops);
 
 static enum dma_data_direction ipu_dir(u32 flags)
 {
@@ -313,6 +315,11 @@ static int __init ipu_dma_init(void)
 	if (err)
 		goto err_free;
 
+	/* Make the binding fd pinnable in bpffs (best-effort: harmless if bpf
+	 * is not built in).
+	 */
+	bpf_fd_link_register_kind(&ipu_dma_binding_fops, "ipu-dma");
+
 	ipu_singleton = ipu;
 	return 0;
 
@@ -328,6 +335,7 @@ static void __exit ipu_dma_exit(void)
 	/* Open binding fds hold a module reference, so no bindings can be
 	 * outstanding here.
 	 */
+	bpf_fd_link_unregister_kind(&ipu_dma_binding_fops);
 	misc_deregister(&ipu_singleton->misc);
 	kfree(ipu_singleton);
 	platform_device_unregister(ipu_pdev);
