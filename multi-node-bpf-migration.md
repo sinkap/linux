@@ -137,8 +137,89 @@ Other ringbuf changes:
   had no such path.
 - `BPF_F_RB_OVERWRITE + BPF_F_DMABUF` is **rejected** (`-EINVAL`) — the
   overwrite position is not part of the maintenance protocol.
-- Cache maintenance is automatic in the kernel producer/consumer helpers;
-  no caller change.
+- Cache maintenance on the kernel producer path is automatic; the consumer
+  side depends on your interconnect's coherency — see §3a.
+
+## 3a. Cache maintenance by interconnect coherency
+
+The ring buffer crosses the boundary in two directions:
+
+- **producer → consumer**: the producer writes records and `producer_pos`,
+  the consumer reads them.
+- **consumer → producer**: the consumer writes `consumer_pos`, the producer
+  reads it.
+
+For a write to cross a **non-coherent** direction it needs *two* things:
+the **writer** pushes the value to the shared DRAM — a **clean** (`DC CVAC`)
+or a write-combine/uncached mapping — and the **reader** drops any stale
+copy — an **invalidate** (`DC IVAC`) — before reading. A **coherent**
+direction removes the reader's invalidate; if it is *fully* cache-coherent
+(reader snoops the writer's cache) it removes the writer's clean too, but a
+common weaker form — "writes are pushed to the peer once they reach DRAM"
+(the usual IPU guarantee) — still requires the writer's clean.
+
+Which op runs where matters for *where the code can live*: **`DC CVAC`
+(clean) is EL0-legal**, so a cleaning side can be plain userspace;
+**`DC IVAC` (invalidate) is EL1-only**, so an invalidating side must run in
+the kernel (JIT / `bpf_user_ringbuf_drain`) or behind a driver.
+
+The four configurations (`clean` = writer→DRAM, `inval` = reader drops
+stale; `—` = nothing):
+
+### 1. Fully coherent both ways
+
+| path | producer | consumer |
+|------|----------|----------|
+| data / `producer_pos` | — | — |
+| `consumer_pos`        | — | — |
+
+No cache maintenance at all — just `acquire`/`release` ordering, like a
+same-machine ring buffer.
+
+### 2. Producer coherent with consumer (P→C only)
+
+| path | producer | consumer |
+|------|----------|----------|
+| data / `producer_pos` | clean\* | **—** |
+| `consumer_pos`        | inval  | clean (or WC page 0) |
+
+\* Still required under the "pushed-from-DRAM" form; a *fully* cache-coherent
+P→C would drop it too. The consumer needs **no invalidate**, so it can be
+**plain userspace**: read cacheable (fresh via the push) and publish
+`consumer_pos` with a `DC CVAC` or a write-combine page-0 mapping. This is
+the typical IPU case.
+
+### 3. Consumer coherent with producer (C→P only)
+
+| path | producer | consumer |
+|------|----------|----------|
+| data / `producer_pos` | clean | inval |
+| `consumer_pos`        | —     | clean\* |
+
+The consumer must **invalidate** to see producer data → it must run **in
+the kernel** (`USER_RINGBUF` drain / arena `INVAL`); a userspace reader
+can't (`DC IVAC` is privileged).
+
+### 4. No coherency either way
+
+| path | producer | consumer |
+|------|----------|----------|
+| data / `producer_pos` | clean | inval |
+| `consumer_pos`        | inval | clean |
+
+Full maintenance on both paths; the consumer invalidates, so again it runs
+in the kernel.
+
+### What the code already does
+
+The kernel producer path (`bpf_ringbuf_reserve`/`commit`) **cleans**
+records/header/`producer_pos` and **invalidates** `consumer_pos` before
+reading it — the correct, safe superset for cases 2–4 (a redundant clean in
+a coherent direction is harmless). Pick the consumer accordingly: a
+**userspace** reader is valid only when the consumer needs no invalidate
+(case 2 — see §6), otherwise use the in-kernel `bpf_user_ringbuf_drain`
+(cases 3–4), which invalidates `producer_pos`/header/record and cleans
+`consumer_pos` and so is safe for cases 2–4 as well.
 
 ## 4. Arena: no maintenance was done; now use the flags
 
