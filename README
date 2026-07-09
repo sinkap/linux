@@ -1,168 +1,118 @@
-Linux kernel
-============
+BPF over non-coherent shared memory
+===================================
 
-The Linux kernel is the core of any Linux operating system. It manages hardware,
-system resources, and provides the fundamental services for all other software.
+This series lets a BPF program produce data -- ring buffer records or
+arena contents -- into memory that is physically shared with a peer that
+does *not* participate in hardware cache coherency with the producer. The
+motivating hardware is a multi-node accelerator/IPU: two processors that
+can each address the same DRAM window through the fabric, but do not snoop
+each other's caches. One node runs BPF and produces telemetry; the other
+consumes it.
 
-Quick Start
------------
+Such memory forces two questions that ordinary BPF maps never have to ask,
+and this series answers both explicitly:
 
-* Report a bug: See Documentation/admin-guide/reporting-issues.rst
-* Get the latest kernel: https://kernel.org
-* Build the kernel: See Documentation/admin-guide/quickly-build-trimmed-linux.rst
-* Join the community: https://lore.kernel.org/
+  1. Authorization -- which physical memory may a map use? A raw physical
+     address handed in from userspace would be /dev/mem-grade power.
+  2. Coherency -- when do the producer's writes actually become visible to
+     a peer that does not snoop its cache?
 
-Essential Documentation
------------------------
+Authorization: dma-buf backed maps
+-----------------------------------
+Instead of a physical address, a RINGBUF or ARENA map created with
+BPF_F_DMABUF takes a dma-buf fd in map_extra. The kernel imports and pins
+the buffer and uses its pages to back the map. The exporter -- a carveout
+dma-heap or the driver that owns the window -- decides who may obtain the
+fd (its own file permissions) and owns the physically contiguous,
+peer-addressable placement. No physical address ever crosses the API.
 
-All users should be familiar with:
+Because the fd and any notification eventfd live outside bpffs, they would
+die when a restartable agent re-execs, even though the pinned maps survive.
+Patch 1 adds BPF_LINK_TYPE_FD, a link that pins a foreign fd so it can be
+kept alive in bpffs across the agent gap. Pinning an arbitrary file is
+unsafe -- a file that can hold a reference back to the link's own fd forms
+an unreclaimable cycle (there is no general file-graph GC) -- so only
+"leaf" file types are allowed. Rather than hard-code that whitelist, the
+pinned file is classified against a small in-kernel registry of permitted
+kinds. eventfd and dma-buf are built in; a driver opts its own file type in
+with bpf_fd_link_register_kind(&fops, "name"). Classification runs on the
+held file (never a re-resolved fd), which makes it free of dup2() races.
 
-* Building requirements: Documentation/process/changes.rst
-* Code of Conduct: Documentation/process/code-of-conduct.rst
-* License: See COPYING
+Coherency: two mechanisms for two access patterns
+--------------------------------------------------
+Ring buffer (patch 2): the record layout is fixed and kernel-owned, so the
+producer path maintains caches at defined points -- clean the record and
+header before publishing producer_pos, invalidate consumer_pos before
+reading it. A peer that maps the window write-combine needs no maintenance
+of its own. BPF_F_RB_OVERWRITE is rejected in this mode.
 
-Documentation can be built with make htmldocs or viewed online at:
-https://www.kernel.org/doc/html/latest/
+Arena (patches 3-4): an arena is free-form and only the program knows its
+record boundaries, so maintenance is per-access and program-directed via
+two map flags the JIT honours when it emits arena load/stores:
+BPF_F_ARENA_CLEAN (write back after a store) and BPF_F_ARENA_INVAL
+(invalidate before a load). Emitting it inline in the JIT keeps the
+maintenance on the exact addresses touched, with no map-wide barriers and
+no helper call. Since it must be JIT-emitted, arena creation returns
+-EOPNOTSUPP unless bpf_jit_supports_arena_cache_maint() (weak, default
+false) is overridden by the arch; x86_64 (patch 3) and arm64 (patch 4)
+opt in. A BPF_F_ARENA_INVAL arena is a read-only consumer window, so the
+verifier rejects stores to it.
 
+MMIO doorbells (patch 5): signalling a peer usually means poking a device
+register (a doorbell/mailbox) straight from the datapath. bpf_mmio_map()
+and the read/write kfuncs provide that. Consistent with the dma-buf maps,
+it is fd-scoped: bpf_mmio_map(fd, offset, size) takes no physical address,
+but an fd that a provider -- the subsystem owning the aperture, e.g.
+vfio-pci for a device BAR -- handed to an authorized caller. The provider
+registers its fd's file_operations and a resolver that translates
+(file, offset, size) to a physical range, enforcing its own per-fd
+ownership and sub-range rules (e.g. hiding a BAR's MSI-X table). Access is
+scoped to holding the fd, not to a global grant. With no provider
+registered, bpf_mmio_map() fails for every fd, so the patch is safe to ship
+before vfio-pci (or another provider) wires itself in.
 
-Who Are You?
-============
+Design choices worth calling out
+--------------------------------
+  - Authorize by fd, never by physical address -- for both shared memory
+    (dma-buf) and MMIO (a provider fd). The subsystem that owns the
+    resource keeps the /dev/mem-grade decision, and access is scoped to
+    holding the fd rather than to a process-wide or global grant.
+  - JIT-emitted per-access maintenance, not a flush helper or a map-wide
+    barrier, so cost is proportional to what the program actually touches.
+  - Gating the arena flags on real JIT support keeps the feature honest and
+    bisectable: unsupported arches fail at map creation, never silently
+    skip maintenance.
+  - Registries with inverted dependencies (fd-link kinds, MMIO providers):
+    bpf core owns the gated mechanism and the exported opt-in API, and
+    never references a driver. Both are fail-closed and safe to ship with
+    only their built-in users.
 
-Find your role below:
-
-* New Kernel Developer - Getting started with kernel development
-* Academic Researcher - Studying kernel internals and architecture
-* Security Expert - Hardening and vulnerability analysis
-* Backport/Maintenance Engineer - Maintaining stable kernels
-* System Administrator - Configuring and troubleshooting
-* Maintainer - Leading subsystems and reviewing patches
-* Hardware Vendor - Writing drivers for new hardware
-* Distribution Maintainer - Packaging kernels for distros
-* AI Coding Assistant - LLMs and AI-powered development tools
-
-
-For Specific Users
-==================
-
-New Kernel Developer
---------------------
-
-Welcome! Start your kernel development journey here:
-
-* Getting Started: Documentation/process/development-process.rst
-* Your First Patch: Documentation/process/submitting-patches.rst
-* Coding Style: Documentation/process/coding-style.rst
-* Build System: Documentation/kbuild/index.rst
-* Development Tools: Documentation/dev-tools/index.rst
-* Kernel Hacking Guide: Documentation/kernel-hacking/hacking.rst
-* Core APIs: Documentation/core-api/index.rst
-
-Academic Researcher
+Not in this posting
 -------------------
+The vfio-pci MMIO provider is a separate, cross-subsystem change and will
+be posted on its own; the kfuncs here are inert until it (or another
+provider) registers. Also kept back as device/platform-specific glue: the
+consumer-node window driver and its userspace consumer. Running the ring
+buffer consumer inside BPF (USER_RINGBUF + dma-buf) needs the symmetric
+consumer-side maintenance and is noted as a gap in the docs.
 
-Explore the kernel's architecture and internals:
+Testing
+-------
+Builds on x86_64 and arm64 (cross), and each patch builds standalone. The
+selftest in patch 6 allocates from the system dma-heap, drives dma-buf
+backed ring buffer / arena / user ring buffer, checks the JITed
+clean/invalidate produce coherent results, checks the verifier rejects a
+store to a BPF_F_ARENA_INVAL arena, and cleanly skips the coherence
+assertions (rather than failing) on a JIT without cache-maintenance
+support. It has been run under vmtest and in an end-to-end QEMU boot.
 
-* Researcher Guidelines: Documentation/process/researcher-guidelines.rst
-* Memory Management: Documentation/mm/index.rst
-* Scheduler: Documentation/scheduler/index.rst
-* Networking Stack: Documentation/networking/index.rst
-* Filesystems: Documentation/filesystems/index.rst
-* RCU (Read-Copy Update): Documentation/RCU/index.rst
-* Locking Primitives: Documentation/locking/index.rst
-* Power Management: Documentation/power/index.rst
+Patches
+-------
 
-Security Expert
----------------
-
-Security documentation and hardening guides:
-
-* Security Documentation: Documentation/security/index.rst
-* LSM Development: Documentation/security/lsm-development.rst
-* Self Protection: Documentation/security/self-protection.rst
-* Reporting Vulnerabilities: Documentation/process/security-bugs.rst
-* CVE Procedures: Documentation/process/cve.rst
-* Embargoed Hardware Issues: Documentation/process/embargoed-hardware-issues.rst
-* Security Features: Documentation/userspace-api/seccomp_filter.rst
-
-Backport/Maintenance Engineer
------------------------------
-
-Maintain and stabilize kernel versions:
-
-* Stable Kernel Rules: Documentation/process/stable-kernel-rules.rst
-* Backporting Guide: Documentation/process/backporting.rst
-* Applying Patches: Documentation/process/applying-patches.rst
-* Subsystem Profile: Documentation/maintainer/maintainer-entry-profile.rst
-* Git for Maintainers: Documentation/maintainer/configure-git.rst
-
-System Administrator
---------------------
-
-Configure, tune, and troubleshoot Linux systems:
-
-* Admin Guide: Documentation/admin-guide/index.rst
-* Kernel Parameters: Documentation/admin-guide/kernel-parameters.rst
-* Sysctl Tuning: Documentation/admin-guide/sysctl/index.rst
-* Tracing/Debugging: Documentation/trace/index.rst
-* Performance Security: Documentation/admin-guide/perf-security.rst
-* Hardware Monitoring: Documentation/hwmon/index.rst
-
-Maintainer
-----------
-
-Lead kernel subsystems and manage contributions:
-
-* Maintainer Handbook: Documentation/maintainer/index.rst
-* Pull Requests: Documentation/maintainer/pull-requests.rst
-* Managing Patches: Documentation/maintainer/modifying-patches.rst
-* Rebasing and Merging: Documentation/maintainer/rebasing-and-merging.rst
-* Development Process: Documentation/process/maintainer-handbooks.rst
-* Maintainer Entry Profile: Documentation/maintainer/maintainer-entry-profile.rst
-* Git Configuration: Documentation/maintainer/configure-git.rst
-
-Hardware Vendor
----------------
-
-Write drivers and support new hardware:
-
-* Driver API Guide: Documentation/driver-api/index.rst
-* Driver Model: Documentation/driver-api/driver-model/driver.rst
-* Device Drivers: Documentation/driver-api/infrastructure.rst
-* Bus Types: Documentation/driver-api/driver-model/bus.rst
-* Device Tree Bindings: Documentation/devicetree/bindings/
-* Power Management: Documentation/driver-api/pm/index.rst
-* DMA API: Documentation/core-api/dma-api.rst
-
-Distribution Maintainer
------------------------
-
-Package and distribute the kernel:
-
-* Stable Kernel Rules: Documentation/process/stable-kernel-rules.rst
-* ABI Documentation: Documentation/ABI/README
-* Kernel Configuration: Documentation/kbuild/kconfig.rst
-* Module Signing: Documentation/admin-guide/module-signing.rst
-* Kernel Parameters: Documentation/admin-guide/kernel-parameters.rst
-* Tainted Kernels: Documentation/admin-guide/tainted-kernels.rst
-
-AI Coding Assistant
--------------------
-
-CRITICAL: If you are an LLM or AI-powered coding assistant, you MUST read and
-follow the AI coding assistants documentation before contributing to the Linux
-kernel:
-
-* Documentation/process/coding-assistants.rst
-
-This documentation contains essential requirements about licensing, attribution,
-and the Developer Certificate of Origin that all AI tools must comply with.
-
-
-Communication and Support
-=========================
-
-* Mailing Lists: https://lore.kernel.org/
-* IRC: #kernelnewbies on irc.oftc.net
-* Bugzilla: https://bugzilla.kernel.org/
-* MAINTAINERS file: Lists subsystem maintainers and mailing lists
-* Email Clients: Documentation/process/email-clients.rst
+    bpf: add BPF_LINK_TYPE_FD to pin external fds in bpffs
+    bpf: ringbuf: back by a dma-buf and do cross-node cache maintenance
+    bpf: arena: back by a dma-buf with flag-driven cache maintenance
+    bpf, arm64: emit arena cache maintenance
+    bpf: add fd-scoped MMIO access kfuncs
+    selftests/bpf: test dma-buf backed maps and arena cache maintenance
+    Documentation/bpf: describe BPF over non-coherent shared memory
