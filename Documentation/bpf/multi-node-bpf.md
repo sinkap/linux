@@ -3,9 +3,9 @@
 This document describes the design on this branch for producing BPF
 telemetry (ringbuf records, arena data) on one node and consuming it on
 another node that shares physical memory with the producer **without
-cache coherency** — e.g. two processors on an IPU that can address the
-same DRAM window through the fabric but do not snoop each other's
-caches.
+cache coherency** — e.g. two processors on a multi-node accelerator that
+can address the same DRAM window through the fabric but do not snoop each
+other's caches.
 
 Porting code from the earlier raw-physical-address prototype? See
 `multi-node-bpf-migration.md` in the repository root.

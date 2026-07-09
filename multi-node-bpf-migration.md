@@ -156,7 +156,7 @@ copy — an **invalidate** (`DC IVAC`) — before reading. A **coherent**
 direction removes the reader's invalidate; if it is *fully* cache-coherent
 (reader snoops the writer's cache) it removes the writer's clean too, but a
 common weaker form — "writes are pushed to the peer once they reach DRAM"
-(the usual IPU guarantee) — still requires the writer's clean.
+(a common hardware guarantee) — still requires the writer's clean.
 
 Which op runs where matters for *where the code can live*: **`DC CVAC`
 (clean) is EL0-legal**, so a cleaning side can be plain userspace;
@@ -187,7 +187,7 @@ same-machine ring buffer.
 P→C would drop it too. The consumer needs **no invalidate**, so it can be
 **plain userspace**: read cacheable (fresh via the push) and publish
 `consumer_pos` with a `DC CVAC` or a write-combine page-0 mapping. This is
-the typical IPU case.
+the typical asymmetric-coherency case.
 
 ### 3. Consumer coherent with producer (C→P only)
 
@@ -300,8 +300,68 @@ The reading node must stop mapping the window through raw `/dev/mem`. The
 range-sync ioctl, plus the page-0-only-writable discipline.
 `drivers/misc/xnode_shmem.c` provides that, **but it is a reference driver,
 not for upstream as-is** — fold its interface (`GET_INFO`, mmap discipline,
-`SET_MODE`/`SYNC`) into the device driver that owns the window. Prefer the
-driverless path above unless you specifically need a userspace consumer.
+`SET_MODE`/`SYNC`) into the device driver that owns the window. When the
+producer is coherent with the consumer (§3a case 2), a driverless
+*userspace* consumer — no BPF map, no `xnode_shmem` — is also possible; see
+§6a.
+
+## 6a. Userspace consumer when the producer is coherent with the consumer
+
+When the interconnect keeps the consumer coherent for producer writes
+(§3a case 2), the consumer needs **no invalidate** — only a way to publish
+`consumer_pos` back to DRAM. That removes the EL1-only `DC IVAC`, so the
+consumer can be **plain userspace**, with no BPF map and no driver:
+
+- **Do not create a BPF ring buffer map on the consumer.** Both `RINGBUF`
+  and `USER_RINGBUF` creation re-initialize `producer_pos`/`consumer_pos`
+  to zero, which would stomp the producer's shared state. The consumer just
+  maps the raw window and reads/writes the bytes.
+- Map the data/`producer_pos` pages **cacheable** (reads are fresh via the
+  producer→consumer push) and page 0 (`consumer_pos`) **write-combine**, so
+  the `consumer_pos` store reaches DRAM with only a `DSB` — no `DC CVAC`.
+  (Alternatively map everything cacheable and `DC CVAC` `consumer_pos` after
+  each update; `DC CVAC` is EL0-legal.)
+
+```c
+/* window mapped from the consumer's own CMA dma-heap region (§2a);
+ * page 0 write-combine, the rest cacheable.
+ */
+volatile __u64 *cons = win;                 /* consumer_pos (WC)   */
+volatile __u64 *prod = win + PAGE;          /* producer_pos (cach) */
+__u8           *data = win + 2 * PAGE;
+__u64 mask = DATA_SIZE - 1;                 /* DATA_SIZE = pow2     */
+
+for (;;) {
+	__u64 cp = *cons;
+	__u64 pp = __atomic_load_n(prod, __ATOMIC_ACQUIRE);  /* fresh: pushed */
+	while (cp < pp) {
+		__u32 *hdr = (void *)(data + (cp & mask));
+		__u32 len  = __atomic_load_n(hdr, __ATOMIC_ACQUIRE);
+		if (len & (1u << 31))              /* BUSY: still being written */
+			break;
+		__u32 sz    = len & ~(3u << 30);   /* strip BUSY|DISCARD        */
+		__u32 total = (sz + 8 + 7) & ~7u;
+		if (!(len & (1u << 30)))           /* not DISCARD               */
+			handle(hdr + 2, sz);       /* payload; cacheable = fresh */
+		cp += total;
+		*cons = cp;                        /* WC store -> DRAM          */
+		asm volatile("dsb sy" ::: "memory");
+	}
+	wait_doorbell();                           /* eventfd / mailbox       */
+}
+```
+
+Notes:
+
+- A record can wrap the end of the data region. Either double-map the data
+  pages (`mmap` the dma-buf's data range twice, contiguous, so a wrapped
+  record reads linearly — what the kernel side does) or handle the split in
+  `handle()`.
+- The `DSB` after the `consumer_pos` store ensures it has drained to DRAM
+  before you block/return, so the producer's invalidate-then-read sees it.
+- This is only valid for §3a case 2. If the consumer must invalidate
+  (cases 3–4), it cannot run in userspace on arm64 — use the in-BPF drain
+  (§6).
 
 ## 7. fd links: only leaf file types
 
