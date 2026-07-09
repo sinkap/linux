@@ -29,6 +29,8 @@
 #include <linux/task_work.h>
 #include <linux/irq_work.h>
 #include <linux/buildid.h>
+#include <linux/io.h>
+#include <linux/bpf_mmio.h>
 
 #include "../../lib/kstrtox.h"
 
@@ -4360,6 +4362,296 @@ __bpf_kfunc int bpf_dynptr_file_discard(struct bpf_dynptr *dynptr)
 	return 0;
 }
 
+/*
+ * fd-scoped MMIO access.
+ *
+ * A raw physical address from a BPF program is /dev/mem-grade power, so
+ * bpf_mmio_map() never takes one. It takes an fd that a provider -- the
+ * subsystem that owns the aperture, e.g. vfio-pci for a device BAR -- has
+ * handed to an authorized caller. The provider registers the
+ * file_operations of those fds together with a resolver that maps
+ * (file, offset, size) to a CPU-physical MMIO range, after enforcing its own
+ * access control (the caller must hold the fd, which is the provider's grant).
+ *
+ * BPF core thus never trusts a physical address a provider did not vouch for,
+ * and access is scoped to holding the fd rather than to a global allowlist:
+ * a provider's per-fd ownership model (and any sub-range restrictions it
+ * applies, e.g. hiding a BAR's MSI-X table) is preserved end to end.
+ */
+struct bpf_mmio_provider_node {
+	struct list_head node;
+	const struct bpf_mmio_provider *prov;
+};
+
+static LIST_HEAD(bpf_mmio_providers);
+static DEFINE_MUTEX(bpf_mmio_providers_lock);
+
+int bpf_mmio_register_provider(const struct bpf_mmio_provider *prov)
+{
+	struct bpf_mmio_provider_node *n, *new;
+
+	if (!prov || !prov->fops || !prov->resolve)
+		return -EINVAL;
+
+	new = kzalloc(sizeof(*new), GFP_KERNEL);
+	if (!new)
+		return -ENOMEM;
+	new->prov = prov;
+
+	mutex_lock(&bpf_mmio_providers_lock);
+	list_for_each_entry(n, &bpf_mmio_providers, node) {
+		if (n->prov->fops == prov->fops) {
+			mutex_unlock(&bpf_mmio_providers_lock);
+			kfree(new);
+			return -EEXIST;
+		}
+	}
+	list_add_tail(&new->node, &bpf_mmio_providers);
+	mutex_unlock(&bpf_mmio_providers_lock);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(bpf_mmio_register_provider);
+
+void bpf_mmio_unregister_provider(const struct bpf_mmio_provider *prov)
+{
+	struct bpf_mmio_provider_node *n;
+
+	mutex_lock(&bpf_mmio_providers_lock);
+	list_for_each_entry(n, &bpf_mmio_providers, node) {
+		if (n->prov == prov) {
+			list_del(&n->node);
+			kfree(n);
+			break;
+		}
+	}
+	mutex_unlock(&bpf_mmio_providers_lock);
+}
+EXPORT_SYMBOL_GPL(bpf_mmio_unregister_provider);
+
+/*
+ * Resolve @file through its provider to the CPU-physical base of
+ * [offset, offset+size). The provider enforces access control and its own
+ * range restrictions. Returns 0 and *@phys on success, or a negative errno
+ * (-EACCES if no provider claims this fd's file type).
+ */
+static int bpf_mmio_resolve(struct file *file, u64 offset, size_t size,
+			    phys_addr_t *phys)
+{
+	struct bpf_mmio_provider_node *n;
+	int err = -EACCES;
+
+	mutex_lock(&bpf_mmio_providers_lock);
+	list_for_each_entry(n, &bpf_mmio_providers, node) {
+		if (file->f_op == n->prov->fops) {
+			err = n->prov->resolve(file, offset, size, phys);
+			break;
+		}
+	}
+	mutex_unlock(&bpf_mmio_providers_lock);
+	return err;
+}
+
+struct bpf_mmio_region {
+	refcount_t usage;
+	void __iomem *addr;
+	struct file *file;	/* the provider fd; held for the region's life */
+	u64 phys;
+	u32 size;
+	struct work_struct free_work;
+};
+
+static void bpf_mmio_region_free_work(struct work_struct *work)
+{
+	struct bpf_mmio_region *r =
+		container_of(work, struct bpf_mmio_region, free_work);
+
+	iounmap(r->addr);
+	if (r->file)
+		fput(r->file);
+	kfree(r);
+}
+
+/* The final put can happen in any context (kptr dtor on map element
+ * delete, KF_RELEASE from a non-sleepable program), but iounmap() needs
+ * process context — defer to a workqueue.
+ */
+static void bpf_mmio_region_free(struct bpf_mmio_region *r)
+{
+	INIT_WORK(&r->free_work, bpf_mmio_region_free_work);
+	schedule_work(&r->free_work);
+}
+
+CFI_NOSEAL(bpf_mmio_region_dtor);
+void bpf_mmio_region_dtor(void *obj)
+{
+	struct bpf_mmio_region *r = obj;
+
+	if (refcount_dec_and_test(&r->usage))
+		bpf_mmio_region_free(r);
+}
+
+/**
+ * bpf_mmio_map - Map an MMIO region named by a provider fd for BPF access.
+ * @fd: An fd handed out by an MMIO provider (e.g. a vfio-pci device fd) that
+ *      authorizes access to the aperture; the provider enforces access
+ *      control and translates @offset into a physical address.
+ * @offset: Page-aligned offset within the provider's region.
+ * @size: Size in bytes (will be page-aligned).
+ *
+ * No physical address crosses this interface: the caller proves authorization
+ * by holding @fd, and the fd is held for the mapping's lifetime. Sleepable
+ * (fget()/ioremap()), hence KF_SLEEPABLE.
+ *
+ * Returns an acquired reference to a bpf_mmio_region, or NULL on failure.
+ */
+__bpf_kfunc struct bpf_mmio_region *bpf_mmio_map(int fd, u64 offset, u32 size)
+{
+	struct bpf_mmio_region *r;
+	phys_addr_t phys = 0;
+	struct file *file;
+
+	if (!size || !PAGE_ALIGNED(offset))
+		return NULL;
+
+	/* PAGE_ALIGN() on a u32 within a page of U32_MAX wraps to 0. */
+	if (size > U32_MAX - (PAGE_SIZE - 1))
+		return NULL;
+	size = PAGE_ALIGN(size);
+
+	file = fget(fd);
+	if (!file)
+		return NULL;
+
+	/* The provider validates [offset, offset+size) against its region and
+	 * its own access rules, and returns the CPU-physical base.
+	 */
+	if (bpf_mmio_resolve(file, offset, size, &phys) || !PAGE_ALIGNED(phys))
+		goto err_fput;
+
+	r = kzalloc(sizeof(*r), GFP_KERNEL);
+	if (!r)
+		goto err_fput;
+
+	r->addr = ioremap(phys, size);
+	if (!r->addr)
+		goto err_free;
+
+	r->file = file;
+	r->phys = phys;
+	r->size = size;
+	refcount_set(&r->usage, 1);
+	return r;
+
+err_free:
+	kfree(r);
+err_fput:
+	fput(file);
+	return NULL;
+}
+
+/**
+ * bpf_mmio_release - Release an MMIO region.
+ * @r: Region to release (must be an owned reference).
+ */
+__bpf_kfunc void bpf_mmio_release(struct bpf_mmio_region *r)
+{
+	if (refcount_dec_and_test(&r->usage))
+		bpf_mmio_region_free(r);
+}
+
+static inline int bpf_mmio_check(struct bpf_mmio_region *r, u32 offset,
+				 u32 width)
+{
+	if (offset & (width - 1))
+		return -EINVAL;
+	if ((u64)offset + width > r->size)
+		return -ERANGE;
+	return 0;
+}
+
+__bpf_kfunc int bpf_mmio_writeb(struct bpf_mmio_region *r, u32 offset, u8 val)
+{
+	int err;
+
+	err = bpf_mmio_check(r, offset, 1);
+	if (err)
+		return err;
+	writeb(val, r->addr + offset);
+	return 0;
+}
+
+__bpf_kfunc int bpf_mmio_writew(struct bpf_mmio_region *r, u32 offset, u16 val)
+{
+	int err;
+
+	err = bpf_mmio_check(r, offset, 2);
+	if (err)
+		return err;
+	writew(val, r->addr + offset);
+	return 0;
+}
+
+__bpf_kfunc int bpf_mmio_writel(struct bpf_mmio_region *r, u32 offset, u32 val)
+{
+	int err;
+
+	err = bpf_mmio_check(r, offset, 4);
+	if (err)
+		return err;
+	writel(val, r->addr + offset);
+	return 0;
+}
+
+#ifdef CONFIG_64BIT
+__bpf_kfunc int bpf_mmio_writeq(struct bpf_mmio_region *r, u32 offset, u64 val)
+{
+	int err;
+
+	err = bpf_mmio_check(r, offset, 8);
+	if (err)
+		return err;
+	writeq(val, r->addr + offset);
+	return 0;
+}
+#endif
+
+/*
+ * The read accessors return 0 on an invalid (misaligned or out-of-range)
+ * access, which is indistinguishable from a register that genuinely reads
+ * 0. A value-returning kfunc has no error channel; keep @offset within
+ * [0, size) and naturally aligned. The write accessors do return -EINVAL /
+ * -ERANGE, so validate there if a register value must be checked.
+ */
+__bpf_kfunc u8 bpf_mmio_readb(struct bpf_mmio_region *r, u32 offset)
+{
+	if (bpf_mmio_check(r, offset, 1))
+		return 0;
+	return readb(r->addr + offset);
+}
+
+__bpf_kfunc u16 bpf_mmio_readw(struct bpf_mmio_region *r, u32 offset)
+{
+	if (bpf_mmio_check(r, offset, 2))
+		return 0;
+	return readw(r->addr + offset);
+}
+
+__bpf_kfunc u32 bpf_mmio_readl(struct bpf_mmio_region *r, u32 offset)
+{
+	if (bpf_mmio_check(r, offset, 4))
+		return 0;
+	return readl(r->addr + offset);
+}
+
+#ifdef CONFIG_64BIT
+__bpf_kfunc u64 bpf_mmio_readq(struct bpf_mmio_region *r, u32 offset)
+{
+	if (bpf_mmio_check(r, offset, 8))
+		return 0;
+	return readq(r->addr + offset);
+}
+#endif
+
 __bpf_kfunc_end_defs();
 
 static void bpf_task_work_cancel_scheduled(struct irq_work *irq_work)
@@ -4444,6 +4736,32 @@ static const struct btf_kfunc_id_set generic_kfunc_set = {
 	.set   = &generic_btf_ids,
 };
 
+/*
+ * MMIO accessors are kept in their own set so their exposure is
+ * explicit and separately controllable. Access is scoped to a provider fd
+ * (bpf_mmio_map() resolves it via bpf_mmio_register_provider()); the set is
+ * registered for the same program types as the generic helpers.
+ */
+BTF_KFUNCS_START(mmio_btf_ids)
+BTF_ID_FLAGS(func, bpf_mmio_map, KF_ACQUIRE | KF_RET_NULL | KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_mmio_release, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_mmio_writeb, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_writew, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_writel, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_readb, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_readw, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_readl, KF_RCU)
+#ifdef CONFIG_64BIT
+BTF_ID_FLAGS(func, bpf_mmio_writeq, KF_RCU)
+BTF_ID_FLAGS(func, bpf_mmio_readq, KF_RCU)
+#endif
+BTF_KFUNCS_END(mmio_btf_ids)
+
+static const struct btf_kfunc_id_set mmio_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set   = &mmio_btf_ids,
+};
+
 
 BTF_ID_LIST(generic_dtor_ids)
 BTF_ID(struct, task_struct)
@@ -4452,6 +4770,8 @@ BTF_ID(func, bpf_task_release_dtor)
 BTF_ID(struct, cgroup)
 BTF_ID(func, bpf_cgroup_release_dtor)
 #endif
+BTF_ID(struct, bpf_mmio_region)
+BTF_ID(func, bpf_mmio_region_dtor)
 
 BTF_KFUNCS_START(common_btf_ids)
 BTF_ID_FLAGS(func, bpf_cast_to_kern_ctx, KF_FASTCALL)
@@ -4561,6 +4881,15 @@ static int __init kfunc_init(void)
 			.btf_id       = generic_dtor_ids[2],
 			.kfunc_btf_id = generic_dtor_ids[3]
 		},
+		{
+			.btf_id       = generic_dtor_ids[4],
+			.kfunc_btf_id = generic_dtor_ids[5]
+		},
+#else
+		{
+			.btf_id       = generic_dtor_ids[2],
+			.kfunc_btf_id = generic_dtor_ids[3]
+		},
 #endif
 	};
 
@@ -4570,6 +4899,15 @@ static int __init kfunc_init(void)
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &generic_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &generic_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_CGROUP_SKB, &generic_kfunc_set);
+	/* MMIO accessors: same reachable program types, but a separate set
+	 * so they can be trimmed independently. Runtime access is still
+	 * gated by the driver allowlist.
+	 */
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING, &mmio_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS, &mmio_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &mmio_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &mmio_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &mmio_kfunc_set);
 	ret = ret ?: register_btf_id_dtor_kfuncs(generic_dtors,
 						  ARRAY_SIZE(generic_dtors),
 						  THIS_MODULE);
