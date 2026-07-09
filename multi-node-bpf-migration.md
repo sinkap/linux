@@ -28,15 +28,15 @@ New arena-only flags occupy bits 21/22 (`BPF_F_ARENA_CLEAN`,
 ## 2. `map_extra`: physical address → dma-buf fd
 
 `map_extra` no longer carries a physical base address. It carries a
-**dma-buf fd**. Allocate the buffer from an exporter that owns the shared
-window (a carveout dma-heap or your device driver) and pass its fd.
+**dma-buf fd**. Allocate the buffer from a dma-heap that owns the shared
+window (see §2a) and pass its fd.
 
 ```c
 /* before */
 attr.map_extra = 0x8f000000;                  /* physical base */
 
 /* after */
-int dmabuf = /* allocate from /dev/dma_heap/<carveout> */;
+int dmabuf = /* allocate from /dev/dma_heap/<region-node-name> */;
 attr.map_extra = dmabuf;                       /* the fd */
 ```
 
@@ -49,10 +49,60 @@ Requirements now enforced at map creation:
   controlled by the exporter's file permissions on the fd. Physically
   contiguous placement is the exporter's responsibility.
 
-The exporter must be **page-backed** for a BPF map to import it (a
-carveout dma-heap or system heap; a `no-map` region has no `struct
-page`s and cannot back a map — it is only for the consumer-side
-`xnode_shmem` driver, §6).
+The exporter must be **page-backed** for a BPF map to import it: a CMA
+dma-heap (§2a) or the system heap. A `no-map` region has no `struct page`s
+and cannot back a map.
+
+## 2a. Memory source: per-region CMA dma-heap
+
+Back the window with a **CMA region declared in the device tree**, exposed
+as its own dma-heap by the "CMA heap per reserved region" support
+(`drivers/dma-buf/heaps/cma_heap.c`; upstream in v6.19, cherry-picked onto
+this branch). A `shared-dma-pool reusable` reserved-memory node becomes
+`/dev/dma_heap/<node-full-name>`, page-backed:
+
+```dts
+reserved-memory {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	ranges;
+
+	agent_win: agent_win@4013000000 {
+		compatible = "shared-dma-pool";
+		reusable;                             /* -> CMA area -> its own heap */
+		reg = <0x40 0x13000000 0x0 0x200000>; /* node-local base, 2 MiB */
+	};
+};
+```
+→ `/dev/dma_heap/agent_win@4013000000`, bound to *this* region's CMA area
+(named `cma_get_name(cma)` = the node name), **not** the default `reserved`
+area. If you see allocations landing on `reserved`, a second heap creator
+(e.g. a downstream `dynamic_cma_heap.c`) is fighting this one for the name —
+remove it; this series is its replacement.
+
+**Cross-node addressing.** The two nodes see the same RAM at *different*
+physical bases (the daemon's interconnect translation), so never share an
+absolute address — share the **offset within the region**, and each side
+computes `node_base + offset`. Because a dynamic `cma_alloc()` placement is
+*unobservable* from userspace, do not sub-allocate a slice and expect the
+peer to find it. Instead:
+
+- **one region per buffer** (declare each shared buffer as its own
+  reserved-memory node → its own heap; each side knows the base from its
+  DT, allocate the whole region on both sides — deterministic, no
+  discovery); or
+- **allocate the whole region once** and partition it by agreed offsets in
+  software on both sides.
+
+**`reusable` caveat.** A CMA region is used by the page allocator as
+movable fallback, so on a memory-constrained node its pages get pinned and
+`cma_alloc()` can fail with `-EBUSY` even with free bytes left (migration
+of a pinned page fails — it is not an out-of-memory error). Mitigate by
+sizing the region to exactly the window and allocating it **once, as early
+in boot as possible**, before pressure fills the pool, then holding it for
+the deployment lifetime. This is a mitigation, not a guarantee; the only
+way to remove the failure mode entirely is an exclusive (non-`reusable`)
+reservation, which mainline has no dma-heap for.
 
 ## 3. Ringbuf: window layout changed
 
@@ -126,40 +176,51 @@ Two behaviours to be aware of:
        MAP_SHARED | MAP_FIXED, arena_fd, 0);   /* then load */
   ```
 
-## 5. MMIO kfuncs: now gated by a driver allowlist
+## 5. MMIO kfuncs: now fd-scoped via a provider
 
-`bpf_mmio_map(phys, size)` is **fail-closed**: it refuses any range not
-registered by a driver via `bpf_mmio_register_region()`. The prototype
-mapped any physical address.
+`bpf_mmio_map()` takes `(fd, offset, size)`, not a physical address. The fd
+is handed out by a **provider** — the subsystem that owns the aperture,
+which registers its fd's `file_operations` + a resolver via
+`bpf_mmio_register_provider()`. (The prototype mapped any physical address;
+an earlier revision of this branch used a global
+`bpf_mmio_register_region(phys, size)` allowlist, now removed.)
 
-- A driver that owns the aperture must register it (the `xnode_shmem`
-  driver does this when loaded with `expose_mmio=1`).
-- `bpf_mmio_map()` is now `KF_SLEEPABLE` — call it from a sleepable
-  program.
-- `bpf_mmio_readq`/`writeq` exist only on 64-bit arches.
+```c
+/* before (this branch, earlier) */
+r = bpf_mmio_map(bar_phys, size);
+/* after */
+r = bpf_mmio_map(fd, offset, size);   /* fd from the provider */
+```
 
-The accessor calls (`bpf_mmio_readl`/`writel`/…) are otherwise unchanged.
+- `xnode_shmem` registers as a provider when loaded with `expose_mmio=1`,
+  resolving an open `/dev/xnode_shmem` fd to the window's physical range.
+  With no provider registered, `bpf_mmio_map()` fails for every fd.
+- Access is scoped to *holding the fd*, not to a global allowlist.
+- `bpf_mmio_map()` is `KF_SLEEPABLE`; `bpf_mmio_readq`/`writeq` are 64-bit
+  only. The accessor calls (`bpf_mmio_readl`/`writel`/…) are unchanged.
 
-## 6. Consumer node: use `xnode_shmem`, not `/dev/mem`
+## 6. Consumer node: prefer a driverless in-BPF consumer
 
-The reading node should stop mapping the window through raw `/dev/mem`
-and go through a driver that owns the window and hands out controlled
-mappings: write-combine (or cached + a range-sync ioctl), the
-page-0-only-writable ringbuf discipline, and access control by device
-permissions rather than raw physical access.
+The reading node must stop mapping the window through raw `/dev/mem`. The
+**recommended** consumer is driverless and needs no `xnode_shmem`:
 
-`drivers/misc/xnode_shmem.c` (`/dev/xnode_shmem`) provides exactly that,
-**but it is a reference/example driver and is not expected to be
-upstreamed as-is.** In a real deployment the device that owns the shared
-window — the IPU/NIC driver — is the natural home for this: it is
-already the dma-buf *exporter* on the producer side (§2), so it should
-also expose the consumer-side mapping + sync interface and, if needed,
-register the window with the `bpf_mmio` allowlist (§5). `xnode_shmem`
-exists to make the mechanism testable and to document the required
-interface (`GET_INFO`, the mmap discipline, `SET_MODE`/`SYNC`,
-`EXPORT_DMABUF`); port that interface into your device driver rather
-than shipping `xnode_shmem`. See the driver section in
-`multi-node-bpf.md`.
+- Declare the same window on the consumer as its own CMA region (§2a) at
+  the consumer node's physical base (daemon-injected) and allocate a
+  page-backed dma-buf from `/dev/dma_heap/<node-name>`.
+- Run the consumer **in BPF**: a `BPF_MAP_TYPE_USER_RINGBUF + BPF_F_DMABUF`
+  map drained with `bpf_user_ringbuf_drain()` (§3), or a `BPF_F_ARENA_INVAL`
+  arena for free-form data. The drain/arena path issues the invalidate
+  (`DC IVAC`) in **kernel context**, so it works on arm64 where EL0 cannot
+  — which is why no driver is needed.
+
+`xnode_shmem` is only for cases the in-BPF consumer doesn't cover: a
+**userspace** consumer that must `mmap` the window write-combine, or a
+**cached** userspace consumer that needs the privileged `DC IVAC` via a
+range-sync ioctl, plus the page-0-only-writable discipline.
+`drivers/misc/xnode_shmem.c` provides that, **but it is a reference driver,
+not for upstream as-is** — fold its interface (`GET_INFO`, mmap discipline,
+`SET_MODE`/`SYNC`) into the device driver that owns the window. Prefer the
+driverless path above unless you specifically need a userspace consumer.
 
 ## 7. fd links: only leaf file types
 
@@ -172,12 +233,18 @@ longer works. Link info now reports the kind/inode
 ## Quick checklist
 
 - [ ] Replace `BPF_F_{RINGBUF,ARENA}_RESERVED` with `BPF_F_DMABUF`.
-- [ ] Allocate a page-backed dma-buf; put its fd in `map_extra`.
+- [ ] Declare the window as a `shared-dma-pool reusable` region → allocate
+      its page-backed dma-buf from `/dev/dma_heap/<node-name>` (§2a); put
+      the fd in `map_extra`. One region per shared buffer; allocate early
+      and hold to dodge `-EBUSY`.
+- [ ] Share **offsets**, not physical addresses, between nodes (§2a).
 - [ ] Recompute the remote ringbuf consumer's offsets (page 0 =
       `consumer_pos`).
 - [ ] Add `BPF_F_ARENA_CLEAN`/`INVAL` to arena maps; drop any
       `bpf_arena_cache_clean()` calls; `mmap()` the arena before load.
-- [ ] Register MMIO windows with `bpf_mmio_register_region()` before
-      using `bpf_mmio_map()`.
-- [ ] Switch the consumer node from `/dev/mem` to `/dev/xnode_shmem`.
+- [ ] Port `bpf_mmio_map(phys,size)` → `bpf_mmio_map(fd,offset,size)`;
+      register the aperture with `bpf_mmio_register_provider()`.
+- [ ] Consumer node: move off `/dev/mem` to a driverless in-BPF consumer
+      (`USER_RINGBUF`/arena `INVAL`); keep `xnode_shmem` only for a
+      userspace/cached consumer.
 - [ ] Ensure any pinned fd links are eventfd or dma-buf only.
