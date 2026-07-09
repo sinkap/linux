@@ -5845,9 +5845,90 @@ err_put:
 /* ---- FD link: pin external fds via bpf_link/bpffs ---- */
 
 /*
+ * Registry of driver-provided file types that may be pinned via an fd-link.
+ *
+ * A subsystem opts its own file_operations in with
+ * bpf_fd_link_register_kind(); bpf core never references any specific driver,
+ * so there is no build/symbol dependency on optional modules. Only register a
+ * file type that cannot participate in a reference cycle back to this link's
+ * fd -- the built-in eventfd/dma-buf are such leaves, and so is e.g. a
+ * device fd whose only outward reference is to a dma-buf (itself a sink).
+ */
+struct bpf_fd_link_reg {
+	const struct file_operations *fops;
+	const char *name;
+	struct list_head node;
+};
+
+static LIST_HEAD(bpf_fd_link_kinds);
+static DEFINE_MUTEX(bpf_fd_link_kinds_lock);
+
+int bpf_fd_link_register_kind(const struct file_operations *fops,
+			      const char *name)
+{
+	struct bpf_fd_link_reg *k, *new;
+
+	if (!fops || !name)
+		return -EINVAL;
+	new = kzalloc(sizeof(*new), GFP_KERNEL);
+	if (!new)
+		return -ENOMEM;
+	new->fops = fops;
+	new->name = name;
+
+	mutex_lock(&bpf_fd_link_kinds_lock);
+	list_for_each_entry(k, &bpf_fd_link_kinds, node) {
+		if (k->fops == fops) {
+			mutex_unlock(&bpf_fd_link_kinds_lock);
+			kfree(new);
+			return -EEXIST;
+		}
+	}
+	list_add(&new->node, &bpf_fd_link_kinds);
+	mutex_unlock(&bpf_fd_link_kinds_lock);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(bpf_fd_link_register_kind);
+
+void bpf_fd_link_unregister_kind(const struct file_operations *fops)
+{
+	struct bpf_fd_link_reg *k, *tmp;
+
+	mutex_lock(&bpf_fd_link_kinds_lock);
+	list_for_each_entry_safe(k, tmp, &bpf_fd_link_kinds, node) {
+		if (k->fops == fops) {
+			list_del(&k->node);
+			kfree(k);
+			break;
+		}
+	}
+	mutex_unlock(&bpf_fd_link_kinds_lock);
+}
+EXPORT_SYMBOL_GPL(bpf_fd_link_unregister_kind);
+
+/* True if @file is a registered pinnable kind; optionally copies its name. */
+static bool bpf_fd_link_registered(struct file *file, char *name, size_t len)
+{
+	struct bpf_fd_link_reg *k;
+	bool found = false;
+
+	mutex_lock(&bpf_fd_link_kinds_lock);
+	list_for_each_entry(k, &bpf_fd_link_kinds, node) {
+		if (k->fops == file->f_op) {
+			if (name)
+				strscpy(name, k->name, len);
+			found = true;
+			break;
+		}
+	}
+	mutex_unlock(&bpf_fd_link_kinds_lock);
+	return found;
+}
+
+/*
  * Classify @file, the already-pinned target. Only leaf file types that
- * cannot themselves hold references to other files are allowed; returns
- * the kind, or -EPERM for anything else.
+ * cannot participate in a reference cycle are allowed; returns the kind, or
+ * -EPERM for anything else.
  *
  * Classification is done on the pinned @file, not on @fd, so an fd that is
  * dup2()'d to a different (e.g. ref-holding) file after being classified
@@ -5875,6 +5956,9 @@ static int bpf_fd_link_classify(struct file *file, int fd)
 				return BPF_FD_LINK_KIND_DMABUF;
 		}
 	}
+	/* driver-registered file types (opt-in, no bpf->driver dependency) */
+	if (bpf_fd_link_registered(file, NULL, 0))
+		return BPF_FD_LINK_KIND_EXTERNAL;
 	return -EPERM;
 }
 
@@ -5934,7 +6018,14 @@ static void bpf_fd_link_show_fdinfo(const struct bpf_link *link,
 		container_of(link, struct bpf_fd_link, link);
 
 	seq_puts(seq, "link_type:\tfd\n");
-	seq_printf(seq, "fd_kind:\t%s\n", bpf_fd_link_kind_str(efl->kind));
+	if (efl->kind == BPF_FD_LINK_KIND_EXTERNAL && efl->external_file) {
+		char name[24] = "external";
+
+		bpf_fd_link_registered(efl->external_file, name, sizeof(name));
+		seq_printf(seq, "fd_kind:\t%s\n", name);
+	} else {
+		seq_printf(seq, "fd_kind:\t%s\n", bpf_fd_link_kind_str(efl->kind));
+	}
 	if (efl->external_file)
 		seq_printf(seq, "fd_ino:\t%llu\n",
 			   (unsigned long long)file_inode(efl->external_file)->i_ino);
