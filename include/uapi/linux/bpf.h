@@ -1141,7 +1141,6 @@ enum bpf_link_type {
 	BPF_LINK_TYPE_UPROBE_MULTI = 12,
 	BPF_LINK_TYPE_NETKIT = 13,
 	BPF_LINK_TYPE_SOCKMAP = 14,
-
 	BPF_LINK_TYPE_FD = 15,
 	__MAX_BPF_LINK_TYPE,
 };
@@ -1153,6 +1152,7 @@ enum bpf_fd_link_kind {
 	BPF_FD_LINK_KIND_UNKNOWN = 0,
 	BPF_FD_LINK_KIND_EVENTFD,
 	BPF_FD_LINK_KIND_DMABUF,
+	BPF_FD_LINK_KIND_EXTERNAL,	/* driver-registered pinnable fd */
 };
 
 enum bpf_perf_event_type {

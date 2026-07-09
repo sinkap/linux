@@ -2396,6 +2396,10 @@ int bpf_prog_new_fd(struct bpf_prog *prog);
 
 void bpf_link_init(struct bpf_link *link, enum bpf_link_type type,
 		   const struct bpf_link_ops *ops, struct bpf_prog *prog);
+/* Opt a driver file type in/out of being pinnable via BPF_LINK_TYPE_FD. */
+int bpf_fd_link_register_kind(const struct file_operations *fops,
+			      const char *name);
+void bpf_fd_link_unregister_kind(const struct file_operations *fops);
 int bpf_link_prime(struct bpf_link *link, struct bpf_link_primer *primer);
 int bpf_link_settle(struct bpf_link_primer *primer);
 void bpf_link_cleanup(struct bpf_link_primer *primer);
@@ -2748,6 +2752,16 @@ bpf_prog_inc_not_zero(struct bpf_prog *prog)
 static inline void bpf_link_init(struct bpf_link *link, enum bpf_link_type type,
 				 const struct bpf_link_ops *ops,
 				 struct bpf_prog *prog)
+{
+}
+
+static inline int bpf_fd_link_register_kind(const struct file_operations *fops,
+					    const char *name)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void bpf_fd_link_unregister_kind(const struct file_operations *fops)
 {
 }
 
