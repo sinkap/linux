@@ -12,3 +12,15 @@ config DMABUF_HEAPS_CMA
 	  Choose this option to enable dma-buf CMA heap. This heap is backed
 	  by the Contiguous Memory Allocator (CMA). If your system has these
 	  regions, you should say Y here.
+
+config DMABUF_HEAPS_CARVEOUT
+	bool "DMA-BUF Carveout Heap"
+	depends on DMABUF_HEAPS && OF_RESERVED_MEM
+	select GENERIC_ALLOCATOR
+	help
+	  Choose this option to enable the dma-buf carveout heap. It exposes an
+	  exclusively reserved memory region (a /reserved-memory node marked
+	  with an "export" property, neither reusable nor no-map) as its own
+	  dma-heap. Unlike CMA, the region is kept out of the page allocator,
+	  so allocations do not fail with -EBUSY under memory pressure. If in
+	  doubt, say N.
