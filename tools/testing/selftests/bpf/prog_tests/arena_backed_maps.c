@@ -452,16 +452,200 @@ out:
 		close(dmabuf);
 }
 
+static bool overlaps(__u64 o1, __u64 s1, __u64 o2, __u64 s2)
+{
+	return o1 < o2 + s2 && o2 < o1 + s1;
+}
+
+/* One arena hosting a mix of maps at distinct, non-overlapping offsets —
+ * the shape of a real shared window (ring buffers + shared state together).
+ */
+static void subtest_mixed(void)
+{
+	struct arena_backed_maps *skel = NULL;
+	LIBBPF_OPTS(bpf_test_run_opts, topts);
+	struct bpf_map_info rbi = {}, a1i = {}, a2i = {};
+	const __u32 nr = 64, vsz = sizeof(__u64);
+	int arena_fd = -1, rb_fd = -1, a1 = -1, a2 = -1, page_size = getpagesize();
+	__u64 rb_sz, a_sz, *a1v, *a2v;
+	void *base = MAP_FAILED, *v1 = MAP_FAILED, *v2 = MAP_FAILED;
+	volatile __u32 *rec;
+	__u32 len;
+
+	arena_fd = create_arena();
+	if (!ASSERT_OK_FD(arena_fd, "arena create"))
+		return;
+
+	rb_fd = create_arena_backed_rb(arena_fd);
+	a1 = create_arena_backed_array(arena_fd, vsz, nr, true);
+	a2 = create_arena_backed_array(arena_fd, vsz, nr, true);
+	if (!ASSERT_OK_FD(rb_fd, "ringbuf") || !ASSERT_OK_FD(a1, "array1") ||
+	    !ASSERT_OK_FD(a2, "array2"))
+		goto out;
+
+	len = sizeof(rbi);
+	if (!ASSERT_OK(bpf_map_get_info_by_fd(rb_fd, &rbi, &len), "rb info"))
+		goto out;
+	len = sizeof(a1i);
+	ASSERT_OK(bpf_map_get_info_by_fd(a1, &a1i, &len), "a1 info");
+	len = sizeof(a2i);
+	ASSERT_OK(bpf_map_get_info_by_fd(a2, &a2i, &len), "a2 info");
+
+	/* all three placed in the one arena */
+	ASSERT_EQ(rbi.arena_id, a1i.arena_id, "same arena rb/a1");
+	ASSERT_EQ(a1i.arena_id, a2i.arena_id, "same arena a1/a2");
+
+	/* their reserved regions must not overlap */
+	rb_sz = ((__u64)RB_POS_PAGES + RB_SIZE / page_size) * page_size;
+	a_sz = ((__u64)nr * vsz + page_size - 1) & ~((__u64)page_size - 1);
+	ASSERT_FALSE(overlaps(rbi.arena_off, rb_sz, a1i.arena_off, a_sz),
+		     "rb/a1 disjoint");
+	ASSERT_FALSE(overlaps(rbi.arena_off, rb_sz, a2i.arena_off, a_sz),
+		     "rb/a2 disjoint");
+	ASSERT_FALSE(overlaps(a1i.arena_off, a_sz, a2i.arena_off, a_sz),
+		     "a1/a2 disjoint");
+
+	/* and every map works, all read through the one arena window */
+	skel = arena_backed_maps__open();
+	if (!ASSERT_OK_PTR(skel, "skel open"))
+		goto out;
+	if (!ASSERT_OK(bpf_map__reuse_fd(skel->maps.ringbuf, rb_fd), "reuse fd") ||
+	    !ASSERT_OK(arena_backed_maps__load(skel), "skel load"))
+		goto out;
+	skel->bss->payload = TEST_PAYLOAD;
+	if (!ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(skel->progs.produce),
+					      &topts), "produce"))
+		goto out;
+
+	v1 = mmap(NULL, (size_t)nr * vsz, PROT_READ | PROT_WRITE, MAP_SHARED, a1, 0);
+	v2 = mmap(NULL, (size_t)nr * vsz, PROT_READ | PROT_WRITE, MAP_SHARED, a2, 0);
+	base = mmap((void *)ARENA_ADDR, (size_t)ARENA_PAGES * page_size,
+		    PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, arena_fd, 0);
+	if (!ASSERT_NEQ(v1, MAP_FAILED, "mmap a1") ||
+	    !ASSERT_NEQ(v2, MAP_FAILED, "mmap a2") ||
+	    !ASSERT_NEQ(base, MAP_FAILED, "mmap arena"))
+		goto out;
+	a1v = v1;
+	a2v = v2;
+	a1v[7] = 0x1111;
+	a2v[7] = 0x2222;
+
+	rec = (volatile __u32 *)((char *)base + rbi.arena_off +
+				 RB_POS_PAGES * page_size);
+	ASSERT_EQ(rec[2], TEST_PAYLOAD, "ringbuf record at its arena_off");
+	ASSERT_EQ(*(volatile __u64 *)((char *)base + a1i.arena_off + 7 * vsz),
+		  0x1111, "array1 value at its arena_off");
+	ASSERT_EQ(*(volatile __u64 *)((char *)base + a2i.arena_off + 7 * vsz),
+		  0x2222, "array2 value at its arena_off");
+out:
+	if (v1 != MAP_FAILED)
+		munmap(v1, (size_t)nr * vsz);
+	if (v2 != MAP_FAILED)
+		munmap(v2, (size_t)nr * vsz);
+	if (base != MAP_FAILED)
+		munmap(base, (size_t)ARENA_PAGES * page_size);
+	arena_backed_maps__destroy(skel);
+	if (rb_fd >= 0)
+		close(rb_fd);
+	if (a1 >= 0)
+		close(a1);
+	if (a2 >= 0)
+		close(a2);
+	if (arena_fd >= 0)
+		close(arena_fd);
+}
+
+/* The deployment shape: one dma-buf window holding a ring buffer and an
+ * array at once, both consumed by a peer through the dma-buf alone.
+ */
+static void subtest_mixed_dmabuf(void)
+{
+	struct arena_backed_maps *skel = NULL;
+	LIBBPF_OPTS(bpf_test_run_opts, topts);
+	struct bpf_map_info rbi = {}, ai = {};
+	const __u32 nr = 64, vsz = sizeof(__u64);
+	int dmabuf = -1, arena_fd = -1, rb_fd = -1, arr = -1, page_size = getpagesize();
+	unsigned char *dbuf = MAP_FAILED, *data;
+	void *vals = MAP_FAILED;
+	__u64 *fd_vals, *peer_vals;
+	__u32 len;
+	int i;
+
+	dmabuf = create_udmabuf();
+	if (dmabuf < 0)
+		return;
+	arena_fd = create_dmabuf_arena(dmabuf);
+	if (!ASSERT_OK_FD(arena_fd, "dmabuf arena"))
+		goto out;
+
+	rb_fd = create_arena_backed_rb(arena_fd);
+	arr = create_arena_backed_array(arena_fd, vsz, nr, true);
+	if (!ASSERT_OK_FD(rb_fd, "ringbuf") || !ASSERT_OK_FD(arr, "array"))
+		goto out;
+	len = sizeof(rbi);
+	ASSERT_OK(bpf_map_get_info_by_fd(rb_fd, &rbi, &len), "rb info");
+	len = sizeof(ai);
+	ASSERT_OK(bpf_map_get_info_by_fd(arr, &ai, &len), "array info");
+	ASSERT_NEQ(rbi.arena_off, ai.arena_off, "distinct offsets in one window");
+
+	skel = arena_backed_maps__open();
+	if (!ASSERT_OK_PTR(skel, "skel open"))
+		goto out;
+	if (!ASSERT_OK(bpf_map__reuse_fd(skel->maps.ringbuf, rb_fd), "reuse fd") ||
+	    !ASSERT_OK(arena_backed_maps__load(skel), "skel load"))
+		goto out;
+	skel->bss->payload = TEST_PAYLOAD;
+	if (!ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(skel->progs.produce),
+					      &topts), "produce"))
+		goto out;
+	vals = mmap(NULL, (size_t)nr * vsz, PROT_READ | PROT_WRITE, MAP_SHARED, arr, 0);
+	if (!ASSERT_NEQ(vals, MAP_FAILED, "mmap array"))
+		goto out;
+	fd_vals = vals;
+	for (i = 0; i < nr; i++)
+		fd_vals[i] = 0xb000 + i;
+
+	/* peer: read both maps from the one dma-buf, each at its arena_off */
+	dbuf = mmap(NULL, win_bytes(), PROT_READ, MAP_SHARED, dmabuf, 0);
+	if (!ASSERT_NEQ(dbuf, MAP_FAILED, "mmap dmabuf"))
+		goto out;
+	data = dbuf + rbi.arena_off + RB_POS_PAGES * page_size;
+	ASSERT_EQ(*(volatile __u32 *)(data + 8), TEST_PAYLOAD,
+		  "ringbuf record via dmabuf");
+	peer_vals = (void *)(dbuf + ai.arena_off);
+	for (i = 0; i < nr; i++)
+		if (!ASSERT_EQ(peer_vals[i], 0xb000 + i, "array value via dmabuf"))
+			break;
+out:
+	if (vals != MAP_FAILED)
+		munmap(vals, (size_t)nr * vsz);
+	if (dbuf != MAP_FAILED)
+		munmap(dbuf, win_bytes());
+	arena_backed_maps__destroy(skel);
+	if (rb_fd >= 0)
+		close(rb_fd);
+	if (arr >= 0)
+		close(arr);
+	if (arena_fd >= 0)
+		close(arena_fd);
+	if (dmabuf >= 0)
+		close(dmabuf);
+}
+
 void test_arena_backed_maps(void)
 {
 	if (test__start_subtest("ringbuf"))
 		subtest_placement_and_data();
 	if (test__start_subtest("array"))
 		subtest_array();
+	if (test__start_subtest("mixed"))
+		subtest_mixed();
 	if (test__start_subtest("bad_flags"))
 		subtest_bad_flags();
 	if (test__start_subtest("ringbuf_dmabuf"))
 		subtest_ringbuf_dmabuf();
 	if (test__start_subtest("array_dmabuf"))
 		subtest_array_dmabuf();
+	if (test__start_subtest("mixed_dmabuf"))
+		subtest_mixed_dmabuf();
 }

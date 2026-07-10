@@ -386,6 +386,69 @@ static void test_array(void)
 	close(dmabuf);
 }
 
+/* One dma-buf arena holding a ring buffer and an array at once — the
+ * deployment shape. Both are produced/written locally and read back by the
+ * "peer" through the dma-buf alone, each at its own arena_off.
+ */
+static void test_mixed(void)
+{
+	printf("== mixed (ringbuf + array in one dma-buf arena) ==\n");
+	const uint32_t win_pages = 32, rb_data = PAGE, nr = 64, vsz = 8;
+
+	int dmabuf = dmabuf_alloc(win_pages);
+	if (dmabuf < 0) {
+		printf("skip: dma-heap unavailable\n");
+		return;
+	}
+	int arena = create_arena(win_pages, dmabuf);
+	int rb = create_ringbuf(rb_data, arena);
+	int arr = create_array(vsz, nr, arena);
+	CHECK(arena >= 0 && rb >= 0 && arr >= 0, "create arena + ringbuf + array");
+	if (arena < 0 || rb < 0 || arr < 0)
+		goto out;
+
+	{
+		int64_t rb_off = get_arena_off(rb);
+		int64_t arr_off = get_arena_off(arr);
+		CHECK(rb_off >= 0 && arr_off >= 0 && rb_off != arr_off,
+		      "distinct offsets in one window (rb=0x%llx arr=0x%llx)",
+		      (unsigned long long)rb_off, (unsigned long long)arr_off);
+
+		int prog = load_producer(rb);
+		if (prog >= 0)
+			produce_one(prog, 0xdead);
+
+		uint64_t *av = (uint64_t *)mmap(NULL, (size_t)nr * vsz,
+				PROT_READ | PROT_WRITE, MAP_SHARED, arr, 0);
+		if (av != MAP_FAILED)
+			av[3] = 0xC0FFEE;
+
+		unsigned char *dm = (unsigned char *)mmap(NULL, win_pages * PAGE,
+				PROT_READ, MAP_SHARED, dmabuf, 0);
+		if (dm != MAP_FAILED && rb_off >= 0 && arr_off >= 0) {
+			volatile uint64_t *prod =
+				(volatile uint64_t *)(dm + rb_off + PAGE);
+			uint64_t aval =
+				*(volatile uint64_t *)(dm + arr_off + 3 * vsz);
+			CHECK(*prod == 16, "ringbuf produced, seen via dma-buf");
+			CHECK(aval == 0xC0FFEE, "array value seen via dma-buf");
+			munmap(dm, win_pages * PAGE);
+		}
+		if (av != MAP_FAILED)
+			munmap(av, (size_t)nr * vsz);
+		if (prog >= 0)
+			close(prog);
+	}
+out:
+	if (arr >= 0)
+		close(arr);
+	if (rb >= 0)
+		close(rb);
+	if (arena >= 0)
+		close(arena);
+	close(dmabuf);
+}
+
 /* ---- MMIO: needs kfunc calls, so resolve kfunc BTF ids first ---- */
 
 struct btf_hdr {
@@ -731,6 +794,7 @@ int main(void)
 	test_ringbuf();
 	test_arena();
 	test_array();
+	test_mixed();
 	test_arena_jit();
 	test_negative();
 	test_fdlink();
