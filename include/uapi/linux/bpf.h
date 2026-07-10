@@ -1466,6 +1466,13 @@ enum {
 
 /* Enable BPF ringbuf overwrite mode */
 	BPF_F_RB_OVERWRITE	= (1U << 19),
+
+/* Place a map's backing inside an arena instead of allocating its own pages;
+ * map_extra is the arena fd. The kernel picks the offset within the arena and
+ * reports it via bpf_map_info.arena_off/arena_id. Supported by BPF_MAP_TYPE_
+ * RINGBUF / BPF_MAP_TYPE_USER_RINGBUF.
+ */
+	BPF_F_ARENA_BACKED	= (1U << 20),
 };
 
 /* Flags for BPF_PROG_QUERY. */
@@ -6751,7 +6758,8 @@ struct bpf_map_info {
 	__u64 map_extra;
 	__aligned_u64 hash;
 	__u32 hash_size;
-	__u32 :32;
+	__u32 arena_id;		/* arena map id for a BPF_F_ARENA_BACKED map, else 0 */
+	__u64 arena_off;	/* byte offset of the backing within the arena */
 } __attribute__((aligned(8)));
 
 struct bpf_btf_info {

@@ -1408,6 +1408,8 @@ static int map_create_alloc(union bpf_attr *attr, bpfptr_t uattr, struct bpf_ver
 	if (attr->map_type != BPF_MAP_TYPE_BLOOM_FILTER &&
 	    attr->map_type != BPF_MAP_TYPE_ARENA &&
 	    attr->map_type != BPF_MAP_TYPE_RHASH &&
+	    attr->map_type != BPF_MAP_TYPE_RINGBUF &&
+	    attr->map_type != BPF_MAP_TYPE_USER_RINGBUF &&
 	    attr->map_extra != 0) {
 		bpf_log(log, "Invalid map_extra.\n");
 		return -EINVAL;
@@ -5469,6 +5471,15 @@ static int bpf_map_get_info_by_fd(struct file *file,
 	info.map_flags = map->map_flags;
 	info.map_extra = map->map_extra;
 	memcpy(info.name, map->name, sizeof(map->name));
+
+	/* For a BPF_F_ARENA_BACKED map report where the kernel placed its
+	 * backing within the arena, so a peer that maps the same arena can
+	 * locate the same bytes.
+	 */
+	if (map->arena_backing) {
+		info.arena_off = (__u64)map->arena_backing->pgoff << PAGE_SHIFT;
+		info.arena_id = map->arena_backing->arena_id;
+	}
 
 	if (map->btf) {
 		info.btf_id = btf_obj_id(map->btf);
