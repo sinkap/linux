@@ -12,13 +12,14 @@
 #include <uapi/linux/btf.h>
 #include <linux/rcupdate_trace.h>
 #include <linux/btf_ids.h>
+#include <linux/vmalloc.h>
 #include <crypto/sha2.h>
 
 #include "map_in_map.h"
 
 #define ARRAY_CREATE_FLAG_MASK \
 	(BPF_F_NUMA_NODE | BPF_F_MMAPABLE | BPF_F_ACCESS_MASK | \
-	 BPF_F_PRESERVE_ELEMS | BPF_F_INNER_MAP)
+	 BPF_F_PRESERVE_ELEMS | BPF_F_INNER_MAP | BPF_F_ARENA_BACKED)
 
 static void bpf_array_free_percpu(struct bpf_array *array)
 {
@@ -64,8 +65,22 @@ int array_map_alloc_check(union bpf_attr *attr)
 		return -EINVAL;
 
 	if (attr->map_type != BPF_MAP_TYPE_ARRAY &&
-	    attr->map_flags & (BPF_F_MMAPABLE | BPF_F_INNER_MAP))
+	    attr->map_flags & (BPF_F_MMAPABLE | BPF_F_INNER_MAP | BPF_F_ARENA_BACKED))
 		return -EINVAL;
+
+	if (attr->map_flags & BPF_F_ARENA_BACKED) {
+		/* The value storage comes from a sub-region of the arena in
+		 * map_extra. It may also be BPF_F_MMAPABLE so local user space
+		 * can mmap the very pages the peer reads through the arena; an
+		 * inner map cannot itself be arena-backed.
+		 */
+		if (attr->map_flags & BPF_F_INNER_MAP)
+			return -EINVAL;
+		if (attr->map_extra > INT_MAX)	/* map_extra is the arena fd */
+			return -EINVAL;
+	} else if (attr->map_extra) {
+		return -EINVAL;
+	}
 
 	if (attr->map_type != BPF_MAP_TYPE_PERF_EVENT_ARRAY &&
 	    attr->map_flags & BPF_F_PRESERVE_ELEMS)
@@ -79,6 +94,75 @@ int array_map_alloc_check(union bpf_attr *attr)
 		return -E2BIG;
 
 	return 0;
+}
+
+/* Private struct pages that precede the arena value pages in the vmap. The
+ * kernel-owned struct bpf_array must never live in the arena's remote-visible
+ * pages, so it gets its own pages up front (struct bpf_array is far smaller
+ * than a page, so this is 1 in practice).
+ */
+#define ARRAY_ARENA_META_PAGES (PAGE_ALIGN(sizeof(struct bpf_array)) >> PAGE_SHIFT)
+
+/* Build a BPF_F_ARENA_BACKED array: the kernel-owned struct lives in private
+ * pages, the value region in a reserved sub-region of the arena. They are
+ * vmap()ed together (VM_USERMAP so the array stays mmap()able) with the struct
+ * at the front, exactly like a BPF_F_MMAPABLE array, so array->value ends up
+ * page-aligned on the arena pages and every existing value accessor and the
+ * mmap path keep working unchanged. A process that mmap()s the array fd reads
+ * value[0] at offset 0; a peer that only maps the shared arena/dma-buf reads
+ * the same bytes at bpf_map_info.arena_off.
+ */
+static struct bpf_array *array_map_arena_alloc(union bpf_attr *attr,
+					       u32 max_entries, u32 elem_size,
+					       int numa_node)
+{
+	u32 nr_meta_pages = ARRAY_ARENA_META_PAGES;
+	u64 value_bytes = (u64)max_entries * elem_size;
+	u32 nr_value_pages = PAGE_ALIGN(value_bytes) >> PAGE_SHIFT;
+	u32 nr_pages = nr_meta_pages + nr_value_pages;
+	struct bpf_map_arena_backing *ab;
+	struct bpf_array *array;
+	struct page **pages;
+	u32 i, allocated = 0;
+	void *base;
+
+	ab = bpf_map_arena_backing_get((int)attr->map_extra, nr_value_pages);
+	if (IS_ERR(ab))
+		return ERR_CAST(ab);
+
+	pages = kvcalloc(nr_pages, sizeof(*pages), GFP_KERNEL);
+	if (!pages)
+		goto err_put;
+
+	for (i = 0; i < nr_meta_pages; i++) {
+		pages[i] = alloc_pages_node(numa_node,
+					    GFP_KERNEL_ACCOUNT | __GFP_ZERO, 0);
+		if (!pages[i])
+			goto err_free_pages;
+		allocated++;
+	}
+	for (i = 0; i < nr_value_pages; i++)
+		pages[nr_meta_pages + i] = ab->pages[i];
+
+	base = vmap(pages, nr_pages, VM_MAP | VM_USERMAP, PAGE_KERNEL);
+	if (!base)
+		goto err_free_pages;
+	kvfree(pages);
+
+	array = base + PAGE_ALIGN(sizeof(struct bpf_array))
+		- offsetof(struct bpf_array, value);
+	/* arena pages are not guaranteed zeroed (e.g. dma-buf/carveout) */
+	memset(array->value, 0, value_bytes);
+	array->map.arena_backing = ab;
+	return array;
+
+err_free_pages:
+	for (i = 0; i < allocated; i++)
+		__free_page(pages[i]);
+	kvfree(pages);
+err_put:
+	bpf_map_arena_backing_put(ab);
+	return ERR_PTR(-ENOMEM);
 }
 
 static struct bpf_map *array_map_alloc(union bpf_attr *attr)
@@ -129,7 +213,13 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
 	}
 
 	/* allocate all map elements and zero-initialize them */
-	if (attr->map_flags & BPF_F_MMAPABLE) {
+	if (attr->map_flags & BPF_F_ARENA_BACKED) {
+		/* value storage comes from a sub-region of the arena */
+		array = array_map_arena_alloc(attr, max_entries, elem_size,
+					      numa_node);
+		if (IS_ERR(array))
+			return ERR_CAST(array);
+	} else if (attr->map_flags & BPF_F_MMAPABLE) {
 		void *data;
 
 		/* kmalloc'ed memory can't be mmap'ed, use explicit vmalloc */
@@ -481,10 +571,27 @@ static void array_map_free(struct bpf_map *map)
 	if (array->map.map_type == BPF_MAP_TYPE_PERCPU_ARRAY)
 		bpf_array_free_percpu(array);
 
-	if (array->map.map_flags & BPF_F_MMAPABLE)
+	if (map->arena_backing) {
+		/* The struct and value region were vmap()ed together over
+		 * private meta pages + the arena's value pages. Reclaim the
+		 * private pages (grab them before vunmap()), drop the mapping,
+		 * and release the arena reservation, which owns the value pages.
+		 */
+		void *base = array_map_vmalloc_addr(array);
+		struct page *meta[ARRAY_ARENA_META_PAGES];
+		u32 i;
+
+		for (i = 0; i < ARRAY_ARENA_META_PAGES; i++)
+			meta[i] = vmalloc_to_page(base + (u64)i * PAGE_SIZE);
+		vunmap(base);
+		for (i = 0; i < ARRAY_ARENA_META_PAGES; i++)
+			__free_page(meta[i]);
+		bpf_map_arena_backing_put(map->arena_backing);
+	} else if (array->map.map_flags & BPF_F_MMAPABLE) {
 		bpf_map_area_free(array_map_vmalloc_addr(array));
-	else
+	} else {
 		bpf_map_area_free(array);
+	}
 }
 
 static void array_map_seq_show_elem(struct bpf_map *map, void *key,

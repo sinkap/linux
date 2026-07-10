@@ -1408,6 +1408,7 @@ static int map_create(union bpf_attr *attr, bpfptr_t uattr)
 	    attr->map_type != BPF_MAP_TYPE_ARENA &&
 	    attr->map_type != BPF_MAP_TYPE_RINGBUF &&
 	    attr->map_type != BPF_MAP_TYPE_USER_RINGBUF &&
+	    attr->map_type != BPF_MAP_TYPE_ARRAY &&
 	    attr->map_extra != 0)
 		return -EINVAL;
 
