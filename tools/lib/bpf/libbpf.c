@@ -5612,9 +5612,15 @@ retry:
 				if (err < 0)
 					goto err_out;
 			} else if (map->def.type == BPF_MAP_TYPE_ARENA) {
-				map->mmaped = mmap((void *)(long)map->map_extra,
+				/* For a dma-buf backed arena (BPF_F_DMABUF) map_extra
+				 * carries the dma-buf fd, not a fixed user VMA address.
+				 */
+				bool fixed = map->map_extra &&
+					     !(map->def.map_flags & BPF_F_DMABUF);
+
+				map->mmaped = mmap(fixed ? (void *)(long)map->map_extra : NULL,
 						   bpf_map_mmap_sz(map), PROT_READ | PROT_WRITE,
-						   map->map_extra ? MAP_SHARED | MAP_FIXED : MAP_SHARED,
+						   fixed ? MAP_SHARED | MAP_FIXED : MAP_SHARED,
 						   map->fd, 0);
 				if (map->mmaped == MAP_FAILED) {
 					err = -errno;
