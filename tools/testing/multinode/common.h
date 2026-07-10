@@ -5,12 +5,13 @@
 #include <cstdint>
 
 /*
- * Shared layout for the dma-buf backed ringbuf, as produced by the
- * kernel and consumed here (see Documentation/bpf/multi-node-bpf.md):
+ * Shared layout for an arena-backed ringbuf, as produced by the kernel
+ * and consumed here (see multi-node-bpf-migration.md). arena_off is the
+ * kernel-chosen placement reported in bpf_map_info:
  *
- *   dma-buf page 0:  consumer_pos
- *   dma-buf page 1:  producer_pos
- *   dma-buf page 2+: data
+ *   dma-buf arena_off + page 0:  consumer_pos
+ *   dma-buf arena_off + page 1:  producer_pos
+ *   dma-buf arena_off + page 2+: data
  */
 static const uint32_t BUSY_BIT = 1u << 31;
 static const uint32_t DISCARD_BIT = 1u << 30;

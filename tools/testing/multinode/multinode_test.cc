@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Functional test for dma-buf backed BPF ringbuf/arena and the
- * xnode_shmem window driver (Documentation/bpf/multi-node-bpf.md).
+ * Functional test for the arena-backed multi-node BPF model: a dma-buf
+ * (ideally from a device-tree carveout heap) backs an arena, ring buffers
+ * are placed inside the arena at kernel-chosen offsets (arena_off), and
+ * the consumer reads the dma-buf alone. Also covers the xnode_shmem
+ * window driver and the MMIO kfuncs (multi-node-bpf-migration.md).
  *
  * Runs on a single node, so it validates the layout contract, dma-buf
  * import, the produce/consume protocol, arena page identity and the
@@ -53,12 +56,27 @@ static long sys_bpf(int cmd, union bpf_attr *attr)
 	return syscall(__NR_bpf, cmd, attr, sizeof(*attr));
 }
 
-/* Allocate a page-backed dma-buf of npages pages from the system heap. */
+/* Allocate a page-backed dma-buf of npages pages. Prefer the device-tree
+ * carveout heap (a /reserved-memory node with `export;`, exposed as
+ * /dev/dma_heap/<node-name>, "xwin@..." in the QEMU harness) and fall
+ * back to the system heap.
+ */
 static int dmabuf_alloc(unsigned long npages)
 {
-	int heap = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
+	static bool reported;
+	int heap = open("/dev/dma_heap/xwin@50100000", O_RDWR | O_CLOEXEC);
+	const char *src = "carveout heap xwin@50100000";
+
+	if (heap < 0) {
+		heap = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
+		src = "system heap";
+	}
 	if (heap < 0)
 		return -1;
+	if (!reported) {
+		printf("dma-buf source: %s\n", src);
+		reported = true;
+	}
 
 	struct dma_heap_allocation_data a = {};
 	a.len = (uint64_t)npages * PAGE;
@@ -68,14 +86,38 @@ static int dmabuf_alloc(unsigned long npages)
 	return ret ? -1 : (int)a.fd;
 }
 
-static int create_ringbuf(uint32_t data_sz, int dmabuf_fd)
+static int create_arena(uint32_t nr_pages, int dmabuf_fd)
+{
+	union bpf_attr attr = {};
+	attr.map_type = BPF_MAP_TYPE_ARENA;
+	attr.max_entries = nr_pages;
+	attr.map_flags = BPF_F_DMABUF | BPF_F_MMAPABLE;
+	attr.map_extra = (uint32_t)dmabuf_fd;
+	return sys_bpf(BPF_MAP_CREATE, &attr);
+}
+
+static int create_ringbuf(uint32_t data_sz, int arena_fd)
 {
 	union bpf_attr attr = {};
 	attr.map_type = BPF_MAP_TYPE_RINGBUF;
 	attr.max_entries = data_sz;
-	attr.map_flags = BPF_F_DMABUF;
-	attr.map_extra = (uint32_t)dmabuf_fd;
+	attr.map_flags = BPF_F_ARENA_BACKED;
+	attr.map_extra = (uint32_t)arena_fd;
 	return sys_bpf(BPF_MAP_CREATE, &attr);
+}
+
+/* Where the kernel placed an arena-backed map within its arena. */
+static int64_t get_arena_off(int map_fd)
+{
+	struct bpf_map_info info = {};
+	union bpf_attr attr = {};
+
+	attr.info.bpf_fd = (uint32_t)map_fd;
+	attr.info.info_len = sizeof(info);
+	attr.info.info = (uint64_t)(unsigned long)&info;
+	if (sys_bpf(BPF_OBJ_GET_INFO_BY_FD, &attr))
+		return -1;
+	return (int64_t)info.arena_off;
 }
 
 static int load_producer(int ringbuf_fd)
@@ -128,16 +170,29 @@ static void test_ringbuf(void)
 {
 	printf("== ringbuf ==\n");
 	const uint32_t data_sz = PAGE;			/* 1 data page */
-	const unsigned long npages = 2 + data_sz / PAGE;
+	const unsigned long npages = 16;		/* whole shared window */
 
 	int dmabuf = dmabuf_alloc(npages);
 	CHECK(dmabuf >= 0, "dma-heap alloc %lu pages", npages);
 	if (dmabuf < 0)
 		return;
 
-	int rb = create_ringbuf(data_sz, dmabuf);
-	CHECK(rb >= 0, "create BPF_F_DMABUF ringbuf");
+	int arena = create_arena(npages, dmabuf);
+	CHECK(arena >= 0, "create BPF_F_DMABUF arena on the window");
+	if (arena < 0)
+		return;
+
+	int rb = create_ringbuf(data_sz, arena);
+	CHECK(rb >= 0, "create BPF_F_ARENA_BACKED ringbuf in the arena");
 	if (rb < 0)
+		return;
+
+	int64_t arena_off = get_arena_off(rb);
+	CHECK(arena_off >= 0 &&
+	      (uint64_t)arena_off + 2 * PAGE + data_sz <= npages * PAGE,
+	      "map_info reports arena_off (0x%llx)",
+	      (unsigned long long)arena_off);
+	if (arena_off < 0)
 		return;
 
 	int prog = load_producer(rb);
@@ -152,9 +207,10 @@ static void test_ringbuf(void)
 	if (m == MAP_FAILED)
 		return;
 
-	volatile uint64_t *consumer_pos = (volatile uint64_t *)(m + 0);
-	volatile uint64_t *producer_pos = (volatile uint64_t *)(m + PAGE);
-	const volatile unsigned char *data = m + 2 * PAGE;
+	/* the ring buffer sits at arena_off within the shared window */
+	volatile uint64_t *consumer_pos = (volatile uint64_t *)(m + arena_off);
+	volatile uint64_t *producer_pos = (volatile uint64_t *)(m + arena_off + PAGE);
+	const volatile unsigned char *data = m + arena_off + 2 * PAGE;
 	uint64_t mask = data_sz - 1;
 
 	/*
@@ -198,6 +254,7 @@ static void test_ringbuf(void)
 	munmap(m, npages * PAGE);
 	close(prog);
 	close(rb);
+	close(arena);
 	close(dmabuf);
 }
 
@@ -537,16 +594,14 @@ static void test_mmio(void)
 }
 
 /*
- * Exercise the JIT-inserted arena cache maintenance (BPF_F_ARENA_CLEAN):
- * load a program that allocates an arena page and stores to it, then
- * dump the JITed code and confirm a clflush (0F AE /7) was emitted after
- * the arena store. In QEMU the clflush is functionally a no-op (coherent
- * guest), so this checks the JIT emits well-formed code and the store
- * still works — not the coherency effect itself.
+ * Exercise the arena kfunc path on a dma-buf backed arena: load a program
+ * that bpf_arena_alloc_pages() (pure range-tree bookkeeping over the
+ * pre-populated window) and stores through the returned arena pointer.
+ * No cache maintenance is involved on this branch.
  */
 static void test_arena_jit(void)
 {
-	printf("== arena JIT clean ==\n");
+	printf("== arena kfunc alloc/store ==\n");
 
 	int id_alloc = btf_find_func("bpf_arena_alloc_pages");
 	if (id_alloc <= 0) {
@@ -563,11 +618,24 @@ static void test_arena_jit(void)
 	union bpf_attr ma = {};
 	ma.map_type = BPF_MAP_TYPE_ARENA;
 	ma.max_entries = 4;
-	ma.map_flags = BPF_F_DMABUF | BPF_F_MMAPABLE | BPF_F_ARENA_CLEAN;
+	ma.map_flags = BPF_F_DMABUF | BPF_F_MMAPABLE;
 	ma.map_extra = (uint32_t)dmabuf;
 	int arena = sys_bpf(BPF_MAP_CREATE, &ma);
-	CHECK(arena >= 0, "create BPF_F_ARENA_CLEAN arena");
+	CHECK(arena >= 0, "create dma-buf arena for kfunc alloc");
 	if (arena < 0) {
+		close(dmabuf);
+		return;
+	}
+
+	/* the verifier requires the arena's user address before load;
+	 * map at a fixed 4 GiB-aligned address
+	 */
+	void *am = mmap((void *)0x8000000000ULL, 4 * PAGE,
+			PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+			arena, 0);
+	CHECK(am != MAP_FAILED, "mmap arena before load");
+	if (am == MAP_FAILED) {
+		close(arena);
 		close(dmabuf);
 		return;
 	}
@@ -607,48 +675,6 @@ static void test_arena_jit(void)
 		return;
 	}
 
-	/* dump the JITed image and look for clflush (0F AE, ModRM.reg == 7) */
-	static unsigned char jit[65536];
-	struct bpf_prog_info info = {};
-	info.jited_prog_insns = (uint64_t)(unsigned long)jit;
-	info.jited_prog_len = sizeof(jit);
-	union bpf_attr ia = {};
-	ia.info.bpf_fd = (uint32_t)prog_fd;
-	ia.info.info_len = sizeof(info);
-	ia.info.info = (uint64_t)(unsigned long)&info;
-	bool has_clflush = false;
-	if (sys_bpf(BPF_OBJ_GET_INFO_BY_FD, &ia) == 0) {
-		uint32_t n = info.jited_prog_len;
-		if (n > sizeof(jit))
-			n = sizeof(jit);
-#if defined(__x86_64__)
-		/* clflush: 0F AE /7 with a memory operand (ModRM.mod != 3),
-		 * so sfence (0F AE F8) does not match.
-		 */
-		for (uint32_t i = 0; i + 2 < n; i++)
-			if (jit[i] == 0x0f && jit[i + 1] == 0xae &&
-			    ((jit[i + 2] >> 3) & 7) == 7 &&
-			    ((jit[i + 2] >> 6) != 3)) {
-				has_clflush = true;
-				break;
-			}
-#elif defined(__aarch64__)
-		/* dc cvac (0xd50b7a20) / dc ivac (0xd5087620) */
-		for (uint32_t i = 0; i + 3 < n; i += 4) {
-			uint32_t w = jit[i] | jit[i + 1] << 8 |
-				     jit[i + 2] << 16 |
-				     (uint32_t)jit[i + 3] << 24;
-			if ((w & ~0x1fU) == 0xd50b7a20U ||
-			    (w & ~0x1fU) == 0xd5087620U) {
-				has_clflush = true;
-				break;
-			}
-		}
-#else
-		has_clflush = true; /* unknown arch: don't fail the scan */
-#endif
-	}
-	CHECK(has_clflush, "JIT emitted cache maintenance after arena store");
 
 	/* run it: a malformed clflush would #UD here */
 	unsigned char ctx[8] = {};
@@ -658,6 +684,20 @@ static void test_arena_jit(void)
 	ta.test.ctx_size_in = sizeof(ctx);
 	CHECK(sys_bpf(BPF_PROG_TEST_RUN, &ta) == 0 && ta.test.retval == 0,
 	      "arena-writing program runs");
+
+	/* the store must be visible through the dma-buf (first free page
+	 * of the window is what the allocator hands out first)
+	 */
+	{
+		volatile uint64_t *dm = (volatile uint64_t *)mmap(NULL, 4 * PAGE,
+				PROT_READ, MAP_SHARED, dmabuf, 0);
+		if (dm != MAP_FAILED) {
+			CHECK(dm[0] == 0xABCD,
+			      "arena kfunc store visible via dma-buf (0x%llx)",
+			      (unsigned long long)dm[0]);
+			munmap((void *)dm, 4 * PAGE);
+		}
+	}
 
 	close(prog_fd);
 	close(arena);
@@ -673,23 +713,50 @@ static void test_negative(void)
 		return;
 	}
 
-	/* USER_RINGBUF makes the kernel the consumer; DMABUF is supported
-	 * (the kernel invalidates on consume).
+	int arena = create_arena(3, db);
+	CHECK(arena >= 0, "arena for negative tests");
+	if (arena < 0) {
+		close(db);
+		return;
+	}
+
+	/* USER_RINGBUF makes the kernel the consumer; arena backing is
+	 * supported for it too.
 	 */
 	union bpf_attr a = {};
 	a.map_type = BPF_MAP_TYPE_USER_RINGBUF;
 	a.max_entries = PAGE;
-	a.map_flags = BPF_F_DMABUF;
-	a.map_extra = (uint32_t)db;
+	a.map_flags = BPF_F_ARENA_BACKED;
+	a.map_extra = (uint32_t)arena;
 	int m = sys_bpf(BPF_MAP_CREATE, &a);
-	CHECK(m >= 0, "USER_RINGBUF + DMABUF allowed");
+	CHECK(m >= 0, "USER_RINGBUF + ARENA_BACKED allowed");
 	if (m >= 0)
 		close(m);
 
-	/* Note: the BPF_F_RB_OVERWRITE rejection check is omitted on this
-	 * 6.12 backport, which does not carry the ringbuf overwrite feature.
-	 */
+	/* overwrite mode keeps producer state in the shared page: rejected */
+	memset(&a, 0, sizeof(a));
+	a.map_type = BPF_MAP_TYPE_RINGBUF;
+	a.max_entries = PAGE;
+	a.map_flags = BPF_F_ARENA_BACKED | BPF_F_RB_OVERWRITE;
+	a.map_extra = (uint32_t)arena;
+	m = sys_bpf(BPF_MAP_CREATE, &a);
+	CHECK(m < 0 && errno == EINVAL,
+	      "RINGBUF + ARENA_BACKED + OVERWRITE rejected (EINVAL)");
+	if (m >= 0)
+		close(m);
 
+	/* map_extra must be an arena fd */
+	memset(&a, 0, sizeof(a));
+	a.map_type = BPF_MAP_TYPE_RINGBUF;
+	a.max_entries = PAGE;
+	a.map_flags = BPF_F_ARENA_BACKED;
+	a.map_extra = (uint32_t)db;		/* a dma-buf, not an arena */
+	m = sys_bpf(BPF_MAP_CREATE, &a);
+	CHECK(m < 0, "RINGBUF + ARENA_BACKED over a non-arena fd rejected");
+	if (m >= 0)
+		close(m);
+
+	close(arena);
 	close(db);
 }
 

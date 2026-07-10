@@ -65,6 +65,10 @@ arm64|aarch64)
 				printf "\t\t\treg = <0x00 %s 0x00 %s>;\n", base, size
 				print "\t\t\tno-map;"
 				print "\t\t};"
+				print "\t\txwin@50100000 {"
+				print "\t\t\treg = <0x00 0x50100000 0x00 0x100000>;"
+				print "\t\t\texport;"
+				print "\t\t};"
 				print "\t};"
 				in_mem = 0
 			}' "$work/virt.dts" > "$work/virt-xnode.dts"
