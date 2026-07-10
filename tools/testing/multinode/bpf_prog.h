@@ -24,8 +24,9 @@
 
 /*
  * XDP producer: read an 8-byte sequence from the packet, reserve an
- * 8-byte record in the ringbuf and submit it. The kernel does all the
- * dma-buf cache maintenance under the hood.
+ * 8-byte record in the ringbuf and submit it. Works unchanged for an
+ * arena-backed ring buffer — the map API is the same; only the backing
+ * pages come from the shared arena.
  *
  *   r2 = ctx->data; r3 = ctx->data_end
  *   if (r2 + 8 > r3) goto out
