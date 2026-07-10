@@ -677,12 +677,14 @@ static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt)
  * @pgoff: out: page offset of the reserved run within the arena
  * @pages: out: array of @nr_pages struct page*, filled on success
  *
- * The kernel picks the placement (range_tree_find), allocates the pages and
- * installs them in the arena's kernel and user address space, so a process
- * that mmap()s the arena observes the same pages at user_vm_start + *pgoff *
- * PAGE_SIZE. The pages remain owned by the arena; release with
- * bpf_arena_release_backing(). The arena must have an established user address
- * range (created with a fixed map_extra address, or already mmap()'d).
+ * The kernel picks the placement (range_tree_find). For a regular arena the
+ * pages are allocated and installed in the arena's kernel and user address
+ * space, so a process that mmap()s the arena observes the same pages at
+ * user_vm_start + *pgoff * PAGE_SIZE; such an arena must already have an
+ * established user address range (fixed map_extra address, or mmap()'d).
+ * For a dma-buf backed arena the pages are the dma-buf's own (pre-populated)
+ * pages and *pgoff is also the offset within the dma-buf. The pages remain
+ * owned by the arena; release with bpf_arena_release_backing().
  *
  * Returns 0 on success or a negative errno.
  */
@@ -696,13 +698,37 @@ int bpf_arena_reserve_backing(struct bpf_arena *arena, u32 nr_pages,
 
 	if (!nr_pages)
 		return -EINVAL;
-	/* A stable user address must exist so the reserved window sits at a
-	 * fixed offset the peer can read.
+
+	/* A dma-buf backed arena is fully pre-populated with the dma-buf's
+	 * pages, so reserving is pure range-tree bookkeeping and the backing
+	 * pages come straight from the attachment. The offset is stable
+	 * without any user mapping: offsets within the window equal offsets
+	 * within the dma-buf.
+	 */
+	if (arena->dmabuf_backed) {
+		long pg, ret;
+
+		scoped_guard(mutex, &arena->lock) {
+			ret = pg = range_tree_find(&arena->rt, nr_pages);
+			if (pg >= 0)
+				ret = range_tree_clear(&arena->rt, pg, nr_pages);
+		}
+		if (ret)
+			return -ENOMEM;
+
+		for (i = 0; i < nr_pages; i++)
+			pages[i] = arena->dmabuf.pages[pg + i];
+		*pgoff = pg;
+		return 0;
+	}
+
+	/* For a regular arena a stable user address range must exist so the
+	 * reserved window sits at a fixed offset the reader can rely on.
 	 */
 	if (!arena->user_vm_start || !arena->user_vm_end)
 		return -EINVAL;
 
-	full_uaddr = arena_alloc_pages(arena, 0, nr_pages, NUMA_NO_NODE, true);
+	full_uaddr = arena_alloc_pages(arena, 0, nr_pages, NUMA_NO_NODE);
 	if (!full_uaddr)
 		return -ENOMEM;
 	uaddr32 = (u32)full_uaddr;
@@ -713,7 +739,7 @@ int bpf_arena_reserve_backing(struct bpf_arena *arena, u32 nr_pages,
 		page = vmalloc_to_page((void *)(kbase + uaddr32 +
 						(u64)i * PAGE_SIZE));
 		if (WARN_ON_ONCE(!page)) {
-			arena_free_pages(arena, uaddr32, nr_pages, true);
+			arena_free_pages(arena, uaddr32, nr_pages);
 			return -EFAULT;
 		}
 		pages[i] = page;
@@ -731,7 +757,7 @@ void bpf_arena_release_backing(struct bpf_arena *arena, u32 pgoff, u32 nr_pages)
 {
 	u32 uaddr32 = (u32)(arena->user_vm_start + (u64)pgoff * PAGE_SIZE);
 
-	arena_free_pages(arena, uaddr32, nr_pages, true);
+	arena_free_pages(arena, uaddr32, nr_pages);
 }
 
 /**
