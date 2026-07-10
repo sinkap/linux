@@ -6702,6 +6702,8 @@ struct bpf_map_info {
 	__u64 map_extra;
 	__aligned_u64 hash;
 	__u32 hash_size;
+	__u32 arena_id;		/* arena map id for a BPF_F_ARENA_BACKED map, else 0 */
+	__u64 arena_off;	/* byte offset of the backing within the arena */
 } __attribute__((aligned(8)));
 
 struct bpf_btf_info {

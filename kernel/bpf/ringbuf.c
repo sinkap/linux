@@ -13,7 +13,8 @@
 #include <linux/btf_ids.h>
 #include <asm/rqspinlock.h>
 
-#define RINGBUF_CREATE_FLAG_MASK (BPF_F_NUMA_NODE | BPF_F_RB_OVERWRITE)
+#define RINGBUF_CREATE_FLAG_MASK \
+	(BPF_F_NUMA_NODE | BPF_F_RB_OVERWRITE | BPF_F_ARENA_BACKED)
 
 /* non-mmap()'able part of bpf_ringbuf (everything up to consumer page) */
 #define RINGBUF_PGOFF \
@@ -31,6 +32,18 @@ struct bpf_ringbuf {
 	struct page **pages;
 	int nr_pages;
 	bool overwrite_mode;
+	/* Set when the consumer/producer position and data pages are backed by
+	 * an external, remote-visible object (a sub-region of an arena) instead
+	 * of pages this ring buffer owns. The kernel keeps its private
+	 * bookkeeping out of those pages and must not free them.
+	 */
+	bool ext_backed;
+	/* Kernel-private copy of pending_pos. For an ext_backed ring buffer the
+	 * shared pending_pos below lives in the producer page, which user space
+	 * maps writable through the arena; the kernel must not trust it, so it
+	 * keeps the authoritative value here. See ringbuf_pending_pos().
+	 */
+	unsigned long pending_pos_priv;
 	rqspinlock_t spinlock ____cacheline_aligned_in_smp;
 	/* For user-space producer ring buffers, an atomic_t busy bit is used
 	 * to synchronize access to the ring buffers in the kernel, rather than
@@ -89,17 +102,34 @@ struct bpf_ringbuf_hdr {
 	u32 pg_off;
 };
 
-static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node)
+/* Where the kernel keeps the authoritative pending_pos: the shared producer
+ * page for a normal ring buffer, but a kernel-private field for an ext_backed
+ * ring buffer whose producer page is writable by user space through the arena.
+ */
+static inline unsigned long *ringbuf_pending_pos(struct bpf_ringbuf *rb)
+{
+	return rb->ext_backed ? &rb->pending_pos_priv : &rb->pending_pos;
+}
+
+static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node,
+						  struct page **shared_pages,
+						  u32 nr_shared)
 {
 	const gfp_t flags = GFP_KERNEL_ACCOUNT | __GFP_RETRY_MAYFAIL |
 			    __GFP_NOWARN | __GFP_ZERO;
 	int nr_meta_pages = RINGBUF_NR_META_PAGES;
 	int nr_data_pages = data_sz >> PAGE_SHIFT;
 	int nr_pages = nr_meta_pages + nr_data_pages;
+	/* consumer/producer position pages and data pages sourced externally */
+	unsigned long nr_shared_pages = RINGBUF_POS_PAGES + nr_data_pages;
+	bool ext_backed = (shared_pages != NULL);
 	struct page **pages, *page;
 	struct bpf_ringbuf *rb;
 	size_t array_size;
 	int i;
+
+	if (ext_backed && nr_shared < nr_shared_pages)
+		return NULL;
 
 	/* Each data page is mapped twice to allow "virtual"
 	 * continuous read of samples wrapping around the end of ring
@@ -124,10 +154,20 @@ static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node)
 		return NULL;
 
 	for (i = 0; i < nr_pages; i++) {
-		page = alloc_pages_node(numa_node, flags, 0);
-		if (!page) {
-			nr_pages = i;
-			goto err_free_pages;
+		/* The kernel-private part of the ring buffer (waitq, irq_work,
+		 * spinlock, ...) must never live in the externally-backed pages:
+		 * a remote peer can read and write that memory. Only the
+		 * consumer/producer position pages and the data pages (i >=
+		 * RINGBUF_PGOFF) come from the external backing.
+		 */
+		if (ext_backed && i >= RINGBUF_PGOFF) {
+			page = shared_pages[i - RINGBUF_PGOFF];
+		} else {
+			page = alloc_pages_node(numa_node, flags, 0);
+			if (!page) {
+				nr_pages = i;
+				goto err_free_pages;
+			}
 		}
 		pages[i] = page;
 		if (i >= nr_meta_pages)
@@ -138,14 +178,25 @@ static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz, int numa_node)
 		  VM_MAP | VM_USERMAP, PAGE_KERNEL);
 	if (rb) {
 		kmemleak_not_leak(pages);
+		/* Externally-backed pages are not guaranteed to be zeroed (e.g.
+		 * arena pages), so clear the shared region before first use.
+		 */
+		if (ext_backed)
+			memset(&rb->consumer_pos, 0,
+			       nr_shared_pages << PAGE_SHIFT);
 		rb->pages = pages;
 		rb->nr_pages = nr_pages;
+		rb->ext_backed = ext_backed;
 		return rb;
 	}
 
 err_free_pages:
+	/* Externally-backed pages (i >= RINGBUF_PGOFF) are owned by the backing
+	 * object and must not be freed here.
+	 */
 	for (i = 0; i < nr_pages; i++)
-		__free_page(pages[i]);
+		if (!ext_backed || i < RINGBUF_PGOFF)
+			__free_page(pages[i]);
 	bpf_map_area_free(pages);
 	return NULL;
 }
@@ -168,11 +219,14 @@ static void bpf_ringbuf_notify(struct irq_work *work)
  * considering that the maximum value of data_sz is (4GB - 1), there
  * will be no overflow, so just note the size limit in the comments.
  */
-static struct bpf_ringbuf *bpf_ringbuf_alloc(size_t data_sz, int numa_node, bool overwrite_mode)
+static struct bpf_ringbuf *bpf_ringbuf_alloc(size_t data_sz, int numa_node,
+					     bool overwrite_mode,
+					     struct page **shared_pages,
+					     u32 nr_shared)
 {
 	struct bpf_ringbuf *rb;
 
-	rb = bpf_ringbuf_area_alloc(data_sz, numa_node);
+	rb = bpf_ringbuf_area_alloc(data_sz, numa_node, shared_pages, nr_shared);
 	if (!rb)
 		return NULL;
 
@@ -184,7 +238,7 @@ static struct bpf_ringbuf *bpf_ringbuf_alloc(size_t data_sz, int numa_node, bool
 	rb->mask = data_sz - 1;
 	rb->consumer_pos = 0;
 	rb->producer_pos = 0;
-	rb->pending_pos = 0;
+	*ringbuf_pending_pos(rb) = 0;
 	rb->overwrite_mode = overwrite_mode;
 
 	return rb;
@@ -192,8 +246,14 @@ static struct bpf_ringbuf *bpf_ringbuf_alloc(size_t data_sz, int numa_node, bool
 
 static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 {
+	/* pos + data pages the ring buffer needs from an external backing */
+	u32 nr_shared_pages = RINGBUF_POS_PAGES +
+			      (attr->max_entries >> PAGE_SHIFT);
+	struct bpf_map_arena_backing *ab = NULL;
+	struct page **shared_pages = NULL;
 	bool overwrite_mode = false;
 	struct bpf_ringbuf_map *rb_map;
+	u32 nr_shared = 0;
 
 	if (attr->map_flags & ~RINGBUF_CREATE_FLAG_MASK)
 		return ERR_PTR(-EINVAL);
@@ -204,9 +264,20 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 		overwrite_mode = true;
 	}
 
+	/* Overwrite mode keeps extra producer-side bookkeeping (overwrite_pos)
+	 * in the shared producer page, which an arena maps writable to user
+	 * space; disallow the combination for now.
+	 */
+	if ((attr->map_flags & BPF_F_ARENA_BACKED) && overwrite_mode)
+		return ERR_PTR(-EINVAL);
+
 	if (attr->key_size || attr->value_size ||
 	    !is_power_of_2(attr->max_entries) ||
 	    !PAGE_ALIGNED(attr->max_entries))
+		return ERR_PTR(-EINVAL);
+
+	/* map_extra is the arena fd and must fit in an int */
+	if ((attr->map_flags & BPF_F_ARENA_BACKED) && attr->map_extra > INT_MAX)
 		return ERR_PTR(-EINVAL);
 
 	rb_map = bpf_map_area_alloc(sizeof(*rb_map), NUMA_NO_NODE);
@@ -215,8 +286,27 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 
 	bpf_map_init_from_attr(&rb_map->map, attr);
 
-	rb_map->rb = bpf_ringbuf_alloc(attr->max_entries, rb_map->map.numa_node, overwrite_mode);
+	if (attr->map_flags & BPF_F_ARENA_BACKED) {
+		/* Reserve a sub-region of the arena; the kernel picks the
+		 * placement and reports it via bpf_map_info.arena_off.
+		 */
+		ab = bpf_map_arena_backing_get((int)attr->map_extra,
+					       nr_shared_pages);
+		if (IS_ERR(ab)) {
+			int err = PTR_ERR(ab);
+
+			bpf_map_area_free(rb_map);
+			return ERR_PTR(err);
+		}
+		rb_map->map.arena_backing = ab;
+		shared_pages = ab->pages;
+		nr_shared = ab->nr_pages;
+	}
+
+	rb_map->rb = bpf_ringbuf_alloc(attr->max_entries, rb_map->map.numa_node,
+				       overwrite_mode, shared_pages, nr_shared);
 	if (!rb_map->rb) {
+		bpf_map_arena_backing_put(ab);
 		bpf_map_area_free(rb_map);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -233,10 +323,15 @@ static void bpf_ringbuf_free(struct bpf_ringbuf *rb)
 	 */
 	struct page **pages = rb->pages;
 	int i, nr_pages = rb->nr_pages;
+	bool ext_backed = rb->ext_backed;
 
 	vunmap(rb);
+	/* Externally-backed pages (i >= RINGBUF_PGOFF) are owned by the backing
+	 * object and released separately in ringbuf_map_free().
+	 */
 	for (i = 0; i < nr_pages; i++)
-		__free_page(pages[i]);
+		if (!ext_backed || i < RINGBUF_PGOFF)
+			__free_page(pages[i]);
 	bpf_map_area_free(pages);
 }
 
@@ -246,6 +341,10 @@ static void ringbuf_map_free(struct bpf_map *map)
 
 	rb_map = container_of(map, struct bpf_ringbuf_map, map);
 	bpf_ringbuf_free(rb_map->rb);
+	/* Releases the arena reservation and drops the arena reference; a
+	 * no-op for a ring buffer that is not arena-backed.
+	 */
+	bpf_map_arena_backing_put(rb_map->map.arena_backing);
 	bpf_map_area_free(rb_map);
 }
 
@@ -477,7 +576,7 @@ static void *__bpf_ringbuf_reserve(struct bpf_ringbuf *rb, u64 size)
 	if (raw_res_spin_lock_irqsave(&rb->spinlock, flags))
 		return NULL;
 
-	pend_pos = rb->pending_pos;
+	pend_pos = *ringbuf_pending_pos(rb);
 	prod_pos = rb->producer_pos;
 	new_prod_pos = prod_pos + len;
 
@@ -488,7 +587,7 @@ static void *__bpf_ringbuf_reserve(struct bpf_ringbuf *rb, u64 size)
 			break;
 		pend_pos += bpf_ringbuf_round_up_hdr_len(hdr_len);
 	}
-	rb->pending_pos = pend_pos;
+	*ringbuf_pending_pos(rb) = pend_pos;
 
 	if (!bpf_ringbuf_has_space(rb, new_prod_pos, cons_pos, pend_pos)) {
 		raw_res_spin_unlock_irqrestore(&rb->spinlock, flags);
