@@ -462,7 +462,7 @@ static void test_mmio(void)
 		close(xf);
 		return;
 	}
-	close(xf);
+	/* keep xf open: it is the provider fd the BPF program maps */
 
 	int id_map = btf_find_func("bpf_mmio_map");
 	int id_wr = btf_find_func("bpf_mmio_writel");
@@ -494,12 +494,13 @@ static void test_mmio(void)
 		ALU64_IMM(BPF_ADD, BPF_REG_2, -4),
 		LD_MAP_FD(BPF_REG_1, amap),			/* 2 slots */
 		EMIT_CALL(BPF_FUNC_map_lookup_elem),
-		JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 21),		/* -> fail(r0=2) */
+		JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 22),		/* -> fail(r0=2) */
 		MOV64_REG(BPF_REG_6, BPF_REG_0),		/* r6 = value */
-		LDX_MEM(BPF_DW, BPF_REG_8, BPF_REG_6, 0),	/* r8 = base */
-		/* region = bpf_mmio_map(base, 4096) */
+		LDX_MEM(BPF_DW, BPF_REG_8, BPF_REG_6, 0),	/* r8 = provider fd */
+		/* region = bpf_mmio_map(fd, 0, 4096) */
 		MOV64_REG(BPF_REG_1, BPF_REG_8),
-		MOV64_IMM(BPF_REG_2, 4096),
+		MOV64_IMM(BPF_REG_2, 0),
+		MOV64_IMM(BPF_REG_3, 4096),
 		KFUNC(id_map),
 		JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 13),		/* -> ret1 */
 		MOV64_REG(BPF_REG_7, BPF_REG_0),		/* r7 = region */
@@ -571,18 +572,19 @@ static void test_mmio(void)
 		return r == 0 ? (int)ta.test.retval : -1;
 	};
 
-	/* positive: registered window maps, write/read round-trips */
+	/* positive: the provider fd maps, write/read round-trips */
 	uint64_t result = 0;
-	int rv = run(info.base, &result);
-	CHECK(rv == 0, "bpf_mmio_map on registered window");
+	int rv = run((uint64_t)xf, &result);
+	CHECK(rv == 0, "bpf_mmio_map on the provider fd");
 	CHECK(result == 0x0AFEF00D, "mmio writel/readl round-trip");
 
-	/* negative: an unregistered address is refused (fail-closed) */
-	rv = run(info.base + 0x10000000ull, nullptr);
-	CHECK(rv == 1, "bpf_mmio_map on unregistered addr returns NULL");
+	/* negative: a non-provider fd is refused (fail-closed) */
+	rv = run((uint64_t)amap, nullptr);
+	CHECK(rv == 1, "bpf_mmio_map on a non-provider fd returns NULL");
 
 	close(prog_fd);
 	close(amap);
+	close(xf);
 }
 
 /*
@@ -639,7 +641,9 @@ static void test_arena_jit(void)
 		MOV64_IMM(BPF_REG_4, -1),			/* NUMA_NO_NODE */
 		MOV64_IMM(BPF_REG_5, 0),			/* flags */
 		INSN(BPF_JMP | BPF_CALL, 0, BPF_PSEUDO_KFUNC_CALL, 0, id_alloc),
-		JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 2),		/* NULL -> out */
+		JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 3),		/* NULL -> out */
+		/* addr_space_cast r0, as(1) -> as(0): kernel-usable pointer */
+		INSN(BPF_ALU64 | BPF_MOV | BPF_X, BPF_REG_0, BPF_REG_0, 1, 1),
 		MOV64_IMM(BPF_REG_1, 0xABCD),
 		STX_MEM(BPF_DW, BPF_REG_0, BPF_REG_1, 0),	/* arena store */
 		MOV64_IMM(BPF_REG_0, 0),			/* out */
@@ -648,6 +652,7 @@ static void test_arena_jit(void)
 	static char log[16384];
 	union bpf_attr la = {};
 	la.prog_type = BPF_PROG_TYPE_SYSCALL;
+	la.prog_flags = BPF_F_SLEEPABLE;
 	la.insn_cnt = sizeof(prog) / sizeof(prog[0]);
 	la.insns = (uint64_t)(unsigned long)prog;
 	la.license = (uint64_t)(unsigned long)"GPL";
