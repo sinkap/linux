@@ -10,9 +10,16 @@
  * array:  the value region lives in the arena; mmap()ing the array fd reads
  *   value[0] at offset 0 (the kernel hides the arena offset), while a peer
  *   reads the same bytes through the arena at arena_off + elem_size*index.
+ *
+ * The dmabuf_* subtests repeat this with the arena backed by a dma-buf
+ * (BPF_F_DMABUF, a udmabuf here) and consume purely through the dma-buf at
+ * arena_off — the shape a peer node that only shares the dma-buf sees.
  */
 #include <test_progs.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <linux/udmabuf.h>
 #include "arena_backed_maps.skel.h"
 
 #define ARENA_ADDR	0x100000000000ULL	/* fixed, 4G-aligned */
@@ -280,6 +287,171 @@ static void subtest_bad_flags(void)
 	close(arena_fd);
 }
 
+/* ---- the same maps in a dma-buf backed arena, consumed via the dma-buf ---- */
+
+static size_t win_bytes(void)
+{
+	return (size_t)ARENA_PAGES * getpagesize();
+}
+
+/* returns a dma-buf fd (from a udmabuf), or -1; skips if no /dev/udmabuf */
+static int create_udmabuf(void)
+{
+	struct udmabuf_create create;
+	int dev_udmabuf, memfd, dmabuf;
+
+	memfd = memfd_create("arena_backed_win", MFD_ALLOW_SEALING);
+	if (!ASSERT_OK_FD(memfd, "memfd_create"))
+		return -1;
+	if (!ASSERT_OK(ftruncate(memfd, win_bytes()), "ftruncate") ||
+	    !ASSERT_OK(fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK), "seal"))
+		goto close_memfd;
+
+	dev_udmabuf = open("/dev/udmabuf", O_RDONLY);
+	if (dev_udmabuf < 0) {
+		test__skip();
+		goto close_memfd;
+	}
+	memset(&create, 0, sizeof(create));
+	create.memfd = memfd;
+	create.flags = UDMABUF_FLAGS_CLOEXEC;
+	create.size = win_bytes();
+	dmabuf = ioctl(dev_udmabuf, UDMABUF_CREATE, &create);
+	close(dev_udmabuf);
+	close(memfd);
+	if (!ASSERT_OK_FD(dmabuf, "udmabuf create"))
+		return -1;
+	return dmabuf;
+
+close_memfd:
+	close(memfd);
+	return -1;
+}
+
+static int create_dmabuf_arena(int dmabuf)
+{
+	LIBBPF_OPTS(bpf_map_create_opts, opts,
+		    .map_flags = BPF_F_MMAPABLE | BPF_F_DMABUF,
+		    .map_extra = dmabuf);
+
+	return bpf_map_create(BPF_MAP_TYPE_ARENA, "win_arena", 0, 0,
+			      ARENA_PAGES, &opts);
+}
+
+static void subtest_ringbuf_dmabuf(void)
+{
+	struct arena_backed_maps *skel = NULL;
+	LIBBPF_OPTS(bpf_test_run_opts, topts);
+	struct bpf_map_info info = {}, ainfo = {};
+	__u32 len = sizeof(info);
+	int dmabuf = -1, arena_fd = -1, rb_fd = -1, page_size = getpagesize();
+	unsigned char *dbuf = MAP_FAILED, *data;
+	unsigned long prod_pos;
+
+	dmabuf = create_udmabuf();
+	if (dmabuf < 0)
+		return;
+
+	arena_fd = create_dmabuf_arena(dmabuf);
+	if (!ASSERT_OK_FD(arena_fd, "dmabuf arena create"))
+		goto out;
+	rb_fd = create_arena_backed_rb(arena_fd);
+	if (!ASSERT_OK_FD(rb_fd, "ringbuf create"))
+		goto out;
+
+	if (!ASSERT_OK(bpf_map_get_info_by_fd(rb_fd, &info, &len), "rb info"))
+		goto out;
+	len = sizeof(ainfo);
+	ASSERT_OK(bpf_map_get_info_by_fd(arena_fd, &ainfo, &len), "arena info");
+	ASSERT_EQ(info.arena_id, ainfo.id, "arena_id");
+
+	skel = arena_backed_maps__open();
+	if (!ASSERT_OK_PTR(skel, "skel open"))
+		goto out;
+	if (!ASSERT_OK(bpf_map__reuse_fd(skel->maps.ringbuf, rb_fd), "reuse fd") ||
+	    !ASSERT_OK(arena_backed_maps__load(skel), "skel load"))
+		goto out;
+	skel->bss->payload = TEST_PAYLOAD;
+	if (!ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(skel->progs.produce),
+					      &topts), "produce") ||
+	    !ASSERT_EQ(topts.retval, 0, "produce retval"))
+		goto out;
+
+	/* consume as a peer would: through the dma-buf only, at arena_off */
+	dbuf = mmap(NULL, win_bytes(), PROT_READ, MAP_SHARED, dmabuf, 0);
+	if (!ASSERT_NEQ(dbuf, MAP_FAILED, "mmap dmabuf"))
+		goto out;
+	prod_pos = *(volatile unsigned long *)(dbuf + info.arena_off + page_size);
+	ASSERT_EQ(prod_pos, 16, "producer_pos via dmabuf");
+	data = dbuf + info.arena_off + RB_POS_PAGES * page_size;
+	ASSERT_EQ(*(volatile __u32 *)data & ~(RB_BUSY_BIT | RB_DISCARD_BIT),
+		  sizeof(__u32), "record len via dmabuf");
+	ASSERT_EQ(*(volatile __u32 *)(data + 8), TEST_PAYLOAD,
+		  "record payload via dmabuf");
+out:
+	if (dbuf != MAP_FAILED)
+		munmap(dbuf, win_bytes());
+	arena_backed_maps__destroy(skel);
+	if (rb_fd >= 0)
+		close(rb_fd);
+	if (arena_fd >= 0)
+		close(arena_fd);
+	if (dmabuf >= 0)
+		close(dmabuf);
+}
+
+static void subtest_array_dmabuf(void)
+{
+	struct bpf_map_info info = {};
+	const __u32 nr = 64, vsz = sizeof(__u64);
+	int dmabuf = -1, arena_fd = -1, arr_fd = -1;
+	void *vals = MAP_FAILED, *dbuf = MAP_FAILED;
+	__u64 *fd_vals, *peer_vals;
+	__u32 len = sizeof(info);
+	int i;
+
+	dmabuf = create_udmabuf();
+	if (dmabuf < 0)
+		return;
+
+	arena_fd = create_dmabuf_arena(dmabuf);
+	if (!ASSERT_OK_FD(arena_fd, "dmabuf arena create"))
+		goto out;
+	arr_fd = create_arena_backed_array(arena_fd, vsz, nr, true);
+	if (!ASSERT_OK_FD(arr_fd, "array create"))
+		goto out;
+	if (!ASSERT_OK(bpf_map_get_info_by_fd(arr_fd, &info, &len), "array info"))
+		goto out;
+
+	vals = mmap(NULL, (size_t)nr * vsz, PROT_READ | PROT_WRITE, MAP_SHARED,
+		    arr_fd, 0);
+	dbuf = mmap(NULL, win_bytes(), PROT_READ, MAP_SHARED, dmabuf, 0);
+	if (!ASSERT_NEQ(vals, MAP_FAILED, "mmap array fd") ||
+	    !ASSERT_NEQ(dbuf, MAP_FAILED, "mmap dmabuf"))
+		goto out;
+
+	fd_vals = vals;
+	peer_vals = (void *)((char *)dbuf + info.arena_off);
+	/* write through the array fd (from 0); the peer reads it in the dma-buf */
+	for (i = 0; i < nr; i++)
+		fd_vals[i] = 0xa000 + i;
+	for (i = 0; i < nr; i++)
+		if (!ASSERT_EQ(peer_vals[i], 0xa000 + i,
+			       "array value visible in dmabuf at arena_off"))
+			break;
+out:
+	if (vals != MAP_FAILED)
+		munmap(vals, (size_t)nr * vsz);
+	if (dbuf != MAP_FAILED)
+		munmap(dbuf, win_bytes());
+	if (arr_fd >= 0)
+		close(arr_fd);
+	if (arena_fd >= 0)
+		close(arena_fd);
+	if (dmabuf >= 0)
+		close(dmabuf);
+}
+
 static bool overlaps(__u64 o1, __u64 s1, __u64 o2, __u64 s2)
 {
 	return o1 < o2 + s2 && o2 < o1 + s1;
@@ -383,6 +555,83 @@ out:
 		close(arena_fd);
 }
 
+/* The deployment shape: one dma-buf window holding a ring buffer and an
+ * array at once, both consumed by a peer through the dma-buf alone.
+ */
+static void subtest_mixed_dmabuf(void)
+{
+	struct arena_backed_maps *skel = NULL;
+	LIBBPF_OPTS(bpf_test_run_opts, topts);
+	struct bpf_map_info rbi = {}, ai = {};
+	const __u32 nr = 64, vsz = sizeof(__u64);
+	int dmabuf = -1, arena_fd = -1, rb_fd = -1, arr = -1, page_size = getpagesize();
+	unsigned char *dbuf = MAP_FAILED, *data;
+	void *vals = MAP_FAILED;
+	__u64 *fd_vals, *peer_vals;
+	__u32 len;
+	int i;
+
+	dmabuf = create_udmabuf();
+	if (dmabuf < 0)
+		return;
+	arena_fd = create_dmabuf_arena(dmabuf);
+	if (!ASSERT_OK_FD(arena_fd, "dmabuf arena"))
+		goto out;
+
+	rb_fd = create_arena_backed_rb(arena_fd);
+	arr = create_arena_backed_array(arena_fd, vsz, nr, true);
+	if (!ASSERT_OK_FD(rb_fd, "ringbuf") || !ASSERT_OK_FD(arr, "array"))
+		goto out;
+	len = sizeof(rbi);
+	ASSERT_OK(bpf_map_get_info_by_fd(rb_fd, &rbi, &len), "rb info");
+	len = sizeof(ai);
+	ASSERT_OK(bpf_map_get_info_by_fd(arr, &ai, &len), "array info");
+	ASSERT_NEQ(rbi.arena_off, ai.arena_off, "distinct offsets in one window");
+
+	skel = arena_backed_maps__open();
+	if (!ASSERT_OK_PTR(skel, "skel open"))
+		goto out;
+	if (!ASSERT_OK(bpf_map__reuse_fd(skel->maps.ringbuf, rb_fd), "reuse fd") ||
+	    !ASSERT_OK(arena_backed_maps__load(skel), "skel load"))
+		goto out;
+	skel->bss->payload = TEST_PAYLOAD;
+	if (!ASSERT_OK(bpf_prog_test_run_opts(bpf_program__fd(skel->progs.produce),
+					      &topts), "produce"))
+		goto out;
+	vals = mmap(NULL, (size_t)nr * vsz, PROT_READ | PROT_WRITE, MAP_SHARED, arr, 0);
+	if (!ASSERT_NEQ(vals, MAP_FAILED, "mmap array"))
+		goto out;
+	fd_vals = vals;
+	for (i = 0; i < nr; i++)
+		fd_vals[i] = 0xb000 + i;
+
+	/* peer: read both maps from the one dma-buf, each at its arena_off */
+	dbuf = mmap(NULL, win_bytes(), PROT_READ, MAP_SHARED, dmabuf, 0);
+	if (!ASSERT_NEQ(dbuf, MAP_FAILED, "mmap dmabuf"))
+		goto out;
+	data = dbuf + rbi.arena_off + RB_POS_PAGES * page_size;
+	ASSERT_EQ(*(volatile __u32 *)(data + 8), TEST_PAYLOAD,
+		  "ringbuf record via dmabuf");
+	peer_vals = (void *)(dbuf + ai.arena_off);
+	for (i = 0; i < nr; i++)
+		if (!ASSERT_EQ(peer_vals[i], 0xb000 + i, "array value via dmabuf"))
+			break;
+out:
+	if (vals != MAP_FAILED)
+		munmap(vals, (size_t)nr * vsz);
+	if (dbuf != MAP_FAILED)
+		munmap(dbuf, win_bytes());
+	arena_backed_maps__destroy(skel);
+	if (rb_fd >= 0)
+		close(rb_fd);
+	if (arr >= 0)
+		close(arr);
+	if (arena_fd >= 0)
+		close(arena_fd);
+	if (dmabuf >= 0)
+		close(dmabuf);
+}
+
 void test_arena_backed_maps(void)
 {
 	if (test__start_subtest("ringbuf"))
@@ -393,4 +642,10 @@ void test_arena_backed_maps(void)
 		subtest_mixed();
 	if (test__start_subtest("bad_flags"))
 		subtest_bad_flags();
+	if (test__start_subtest("ringbuf_dmabuf"))
+		subtest_ringbuf_dmabuf();
+	if (test__start_subtest("array_dmabuf"))
+		subtest_array_dmabuf();
+	if (test__start_subtest("mixed_dmabuf"))
+		subtest_mixed_dmabuf();
 }
