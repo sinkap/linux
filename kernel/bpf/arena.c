@@ -718,8 +718,12 @@ static u64 clear_lo32(u64 val)
 static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt, int node_id,
 			      bool sleepable)
 {
-	/* user_vm_end/start are fixed before bpf prog runs */
-	long page_cnt_max = (arena->user_vm_end - arena->user_vm_start) >> PAGE_SHIFT;
+	/* user_vm_end/start are fixed before bpf prog runs. A dma-buf backed
+	 * arena is fully populated up front and usable before (or without)
+	 * any user mapping, so its whole window is allocatable.
+	 */
+	long page_cnt_max = arena->dmabuf_backed ? arena->map.max_entries :
+			    (arena->user_vm_end - arena->user_vm_start) >> PAGE_SHIFT;
 	u64 kern_vm_start = bpf_arena_get_kern_vm_start(arena);
 	struct mem_cgroup *new_memcg, *old_memcg;
 	struct apply_range_data data;
@@ -937,7 +941,15 @@ static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt,
 	uaddr &= PAGE_MASK;
 	kaddr = bpf_arena_get_kern_vm_start(arena) + uaddr;
 	full_uaddr = clear_lo32(arena->user_vm_start) + uaddr;
-	uaddr_end = min(arena->user_vm_end, full_uaddr + (page_cnt << PAGE_SHIFT));
+	/* A dma-buf backed arena is usable before (or without) any user
+	 * mapping, so bound by the window size rather than user_vm_end.
+	 */
+	if (arena->dmabuf_backed)
+		uaddr_end = min(clear_lo32(arena->user_vm_start) +
+				((u64)arena->map.max_entries << PAGE_SHIFT),
+				full_uaddr + (page_cnt << PAGE_SHIFT));
+	else
+		uaddr_end = min(arena->user_vm_end, full_uaddr + (page_cnt << PAGE_SHIFT));
 	if (full_uaddr >= uaddr_end)
 		return;
 
@@ -1024,12 +1036,14 @@ defer:
  * @pgoff: out: page offset of the reserved run within the arena
  * @pages: out: array of @nr_pages struct page*, filled on success
  *
- * The kernel picks the placement (range_tree_find), allocates the pages and
- * installs them in the arena's kernel and user address space, so a process
- * that mmap()s the arena observes the same pages at user_vm_start + *pgoff *
- * PAGE_SIZE. The pages remain owned by the arena; release with
- * bpf_arena_release_backing(). The arena must have an established user address
- * range (created with a fixed map_extra address, or already mmap()'d).
+ * The kernel picks the placement (range_tree_find). For a regular arena the
+ * pages are allocated and installed in the arena's kernel and user address
+ * space, so a process that mmap()s the arena observes the same pages at
+ * user_vm_start + *pgoff * PAGE_SIZE; such an arena must already have an
+ * established user address range (fixed map_extra address, or mmap()'d).
+ * For a dma-buf backed arena the pages are the dma-buf's own (pre-populated)
+ * pages and *pgoff is also the offset within the dma-buf. The pages remain
+ * owned by the arena; release with bpf_arena_release_backing().
  *
  * Returns 0 on success or a negative errno.
  */
@@ -1043,8 +1057,34 @@ int bpf_arena_reserve_backing(struct bpf_arena *arena, u32 nr_pages,
 
 	if (!nr_pages)
 		return -EINVAL;
-	/* A stable user address must exist so the reserved window sits at a
-	 * fixed offset the peer can read.
+
+	/* A dma-buf backed arena is fully pre-populated with the dma-buf's
+	 * pages, so reserving is pure range-tree bookkeeping and the backing
+	 * pages come straight from the attachment. The offset is stable
+	 * without any user mapping: offsets within the window equal offsets
+	 * within the dma-buf.
+	 */
+	if (arena->dmabuf_backed) {
+		unsigned long flags;
+		long pg, ret;
+
+		if (raw_res_spin_lock_irqsave(&arena->spinlock, flags))
+			return -EBUSY;
+		ret = pg = range_tree_find(&arena->rt, nr_pages);
+		if (pg >= 0)
+			ret = range_tree_clear(&arena->rt, pg, nr_pages);
+		raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
+		if (ret)
+			return -ENOMEM;
+
+		for (i = 0; i < nr_pages; i++)
+			pages[i] = arena->dmabuf.pages[pg + i];
+		*pgoff = pg;
+		return 0;
+	}
+
+	/* For a regular arena a stable user address range must exist so the
+	 * reserved window sits at a fixed offset the reader can rely on.
 	 */
 	if (!arena->user_vm_start || !arena->user_vm_end)
 		return -EINVAL;
@@ -1149,7 +1189,8 @@ void bpf_map_arena_backing_put(struct bpf_map_arena_backing *ab)
  */
 static int arena_reserve_pages(struct bpf_arena *arena, long uaddr, u32 page_cnt)
 {
-	long page_cnt_max = (arena->user_vm_end - arena->user_vm_start) >> PAGE_SHIFT;
+	long page_cnt_max = arena->dmabuf_backed ? arena->map.max_entries :
+			    (arena->user_vm_end - arena->user_vm_start) >> PAGE_SHIFT;
 	struct mem_cgroup *new_memcg, *old_memcg;
 	unsigned long flags;
 	long pgoff;
