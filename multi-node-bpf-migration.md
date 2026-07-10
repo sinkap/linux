@@ -315,13 +315,21 @@ int setup(void *ctx)
 	return 0;
 }
 
-SEC("lsm/bprm_committed_creds")
+SEC("lsm/bprm_check_security")
 int BPF_PROG(on_exec, struct linux_binprm *bprm)
 {
-	struct bpf_mmio_region *r = val.region;   /* load kptr */
+	/* A *referenced* kptr read is untrusted, and bpf_mmio_writel is KF_RCU,
+	 * so a direct `r = val.region` is rejected ("R1 must be a rcu pointer").
+	 * Take the region out with an atomic xchg (an owned, trusted ref the
+	 * accessor accepts), use it, and put it back.
+	 */
+	struct bpf_mmio_region *r = bpf_kptr_xchg(&val.region, NULL);
 	if (!r)                                    /* setup hasn't run yet */
 		return 0;
 	bpf_mmio_writel(r, DOORBELL_OFF, value);
+	r = bpf_kptr_xchg(&val.region, r);         /* put it back */
+	if (r)
+		bpf_mmio_release(r);
 	return 0;
 }
 ```
@@ -333,10 +341,18 @@ Notes:
 
 - The mmio kfunc set is registered for tracing, sched_cls, xdp, struct_ops,
   **syscall**, and **lsm** program types — so both the `SEC("syscall")` setup
-  and the `SEC("lsm/…")` hook above can call it.
-- `bpf_mmio_writel` is `KF_RCU`: a kptr read is RCU-protected and a
-  non-sleepable LSM hook runs under RCU, so just NULL-check it (in a
-  *sleepable* hook, wrap the load/use in `bpf_rcu_read_lock()/unlock()`).
+  and the `SEC("lsm/…")` hook can call it.
+- **Referenced-kptr access.** `bpf_mmio_writel` is `KF_RCU`, and a referenced
+  kptr read is *untrusted* even inside `bpf_rcu_read_lock()` (the region is
+  not a registered RCU-safe type). Use `bpf_kptr_xchg()` out/in as above; note
+  it is atomic, so concurrent hook invocations serialize and a contended one
+  sees NULL (fine for a doorbell — one poke wins). If you need concurrent
+  lock-free reads, the region type would have to be made an RCU-safe kptr.
+- **BPF-LSM attach needs the trampoline.** LSM programs attach via an fentry
+  trampoline, which requires `CONFIG_FUNCTION_TRACER` /
+  `CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS`; without them attach fails with
+  `-EBUSY`. Prefer an *int*-returning hook such as `bprm_check_security` —
+  the `void` `bprm_committed_creds` is harder to attach a program to.
 - `bpf_mmio_readq`/`writeq` are 64-bit only.
 
 ## 6. Consumer node: prefer a driverless in-BPF consumer
