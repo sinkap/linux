@@ -1425,7 +1425,7 @@ enum {
 /* Place a map's backing inside an arena instead of allocating its own pages;
  * map_extra is the arena fd. The kernel picks the offset within the arena and
  * reports it via bpf_map_info.arena_off/arena_id. Supported by BPF_MAP_TYPE_
- * RINGBUF / BPF_MAP_TYPE_USER_RINGBUF.
+ * RINGBUF / BPF_MAP_TYPE_USER_RINGBUF / BPF_MAP_TYPE_ARRAY.
  *
  * Bit 19 (BPF_F_RB_OVERWRITE upstream) is intentionally left unused on this
  * base so the flag values match the v6.19 integration.
