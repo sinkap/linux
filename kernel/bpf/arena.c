@@ -921,6 +921,133 @@ defer:
 	irq_work_queue(&arena->free_irq);
 }
 
+/**
+ * bpf_arena_reserve_backing - reserve and populate a contiguous run of arena
+ * pages to back another map, returning their struct pages.
+ * @arena: the arena to carve the backing out of
+ * @nr_pages: number of contiguous pages to reserve
+ * @pgoff: out: page offset of the reserved run within the arena
+ * @pages: out: array of @nr_pages struct page*, filled on success
+ *
+ * The kernel picks the placement (range_tree_find), allocates the pages and
+ * installs them in the arena's kernel and user address space, so a process
+ * that mmap()s the arena observes the same pages at user_vm_start + *pgoff *
+ * PAGE_SIZE. The pages remain owned by the arena; release with
+ * bpf_arena_release_backing(). The arena must have an established user address
+ * range (created with a fixed map_extra address, or already mmap()'d).
+ *
+ * Returns 0 on success or a negative errno.
+ */
+int bpf_arena_reserve_backing(struct bpf_arena *arena, u32 nr_pages,
+			      u32 *pgoff, struct page **pages)
+{
+	u64 kbase = bpf_arena_get_kern_vm_start(arena);
+	u64 full_uaddr;
+	u32 uaddr32;
+	u32 i;
+
+	if (!nr_pages)
+		return -EINVAL;
+	/* A stable user address must exist so the reserved window sits at a
+	 * fixed offset the peer can read.
+	 */
+	if (!arena->user_vm_start || !arena->user_vm_end)
+		return -EINVAL;
+
+	full_uaddr = arena_alloc_pages(arena, 0, nr_pages, NUMA_NO_NODE, true);
+	if (!full_uaddr)
+		return -ENOMEM;
+	uaddr32 = (u32)full_uaddr;
+
+	for (i = 0; i < nr_pages; i++) {
+		struct page *page;
+
+		page = vmalloc_to_page((void *)(kbase + uaddr32 +
+						(u64)i * PAGE_SIZE));
+		if (WARN_ON_ONCE(!page)) {
+			arena_free_pages(arena, uaddr32, nr_pages, true);
+			return -EFAULT;
+		}
+		pages[i] = page;
+	}
+
+	*pgoff = compute_pgoff(arena, uaddr32);
+	return 0;
+}
+
+/**
+ * bpf_arena_release_backing - free a backing reserved with
+ * bpf_arena_reserve_backing().
+ */
+void bpf_arena_release_backing(struct bpf_arena *arena, u32 pgoff, u32 nr_pages)
+{
+	u32 uaddr32 = (u32)(arena->user_vm_start + (u64)pgoff * PAGE_SIZE);
+
+	arena_free_pages(arena, uaddr32, nr_pages, true);
+}
+
+/**
+ * bpf_map_arena_backing_get - resolve an arena fd and reserve @nr_pages of it
+ * to back a map. On success returns a descriptor that owns a reference on the
+ * arena and the reserved pages; free it with bpf_map_arena_backing_put().
+ */
+struct bpf_map_arena_backing *bpf_map_arena_backing_get(int arena_fd, u32 nr_pages)
+{
+	struct bpf_map_arena_backing *ab;
+	struct bpf_arena *arena;
+	struct page **pages;
+	struct bpf_map *map;
+	int err;
+
+	map = bpf_map_get(arena_fd);
+	if (IS_ERR(map))
+		return ERR_CAST(map);
+	if (map->map_type != BPF_MAP_TYPE_ARENA) {
+		err = -EINVAL;
+		goto put_map;
+	}
+	arena = container_of(map, struct bpf_arena, map);
+
+	ab = kzalloc(sizeof(*ab), GFP_KERNEL);
+	if (!ab) {
+		err = -ENOMEM;
+		goto put_map;
+	}
+	pages = kvcalloc(nr_pages, sizeof(*pages), GFP_KERNEL);
+	if (!pages) {
+		err = -ENOMEM;
+		goto free_ab;
+	}
+
+	err = bpf_arena_reserve_backing(arena, nr_pages, &ab->pgoff, pages);
+	if (err)
+		goto free_pages;
+
+	ab->arena = arena;		/* keep the reference from bpf_map_get() */
+	ab->arena_id = arena->map.id;
+	ab->nr_pages = nr_pages;
+	ab->pages = pages;
+	return ab;
+
+free_pages:
+	kvfree(pages);
+free_ab:
+	kfree(ab);
+put_map:
+	bpf_map_put(map);
+	return ERR_PTR(err);
+}
+
+void bpf_map_arena_backing_put(struct bpf_map_arena_backing *ab)
+{
+	if (!ab)
+		return;
+	bpf_arena_release_backing(ab->arena, ab->pgoff, ab->nr_pages);
+	bpf_map_put(&ab->arena->map);
+	kvfree(ab->pages);
+	kfree(ab);
+}
+
 /*
  * Reserve an arena virtual address range without populating it. This call stops
  * bpf_arena_alloc_pages from adding pages to this range.
