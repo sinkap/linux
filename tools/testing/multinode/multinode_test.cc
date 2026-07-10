@@ -96,6 +96,18 @@ static int create_ringbuf(uint32_t data_sz, int arena_fd)
 	return sys_bpf(BPF_MAP_CREATE, &attr);
 }
 
+static int create_array(uint32_t value_size, uint32_t max_entries, int arena_fd)
+{
+	union bpf_attr attr = {};
+	attr.map_type = BPF_MAP_TYPE_ARRAY;
+	attr.key_size = 4;
+	attr.value_size = value_size;
+	attr.max_entries = max_entries;
+	attr.map_flags = BPF_F_ARENA_BACKED | BPF_F_MMAPABLE;
+	attr.map_extra = (uint32_t)arena_fd;
+	return sys_bpf(BPF_MAP_CREATE, &attr);
+}
+
 /* Where the kernel placed an arena-backed map within its arena. */
 static int64_t get_arena_off(int map_fd)
 {
@@ -303,6 +315,65 @@ static void test_arena(void)
 		munmap(am, nr_pages * PAGE);
 	if (dm != MAP_FAILED)
 		munmap(dm, nr_pages * PAGE);
+	close(arena);
+	close(dmabuf);
+}
+
+static void test_array(void)
+{
+	printf("== array (arena-backed) ==\n");
+	const uint32_t nr = 64, vsz = 8, win_pages = 16;
+
+	int dmabuf = dmabuf_alloc(win_pages);
+	CHECK(dmabuf >= 0, "dma-heap alloc %u pages", win_pages);
+	if (dmabuf < 0)
+		return;
+
+	int arena = create_arena(win_pages, dmabuf);
+	CHECK(arena >= 0, "create dma-buf arena");
+	if (arena < 0) {
+		close(dmabuf);
+		return;
+	}
+
+	int arr = create_array(vsz, nr, arena);
+	CHECK(arr >= 0, "create BPF_F_ARENA_BACKED array");
+	if (arr < 0) {
+		close(arena);
+		close(dmabuf);
+		return;
+	}
+
+	int64_t off = get_arena_off(arr);
+	CHECK(off >= 0 && (uint64_t)off + (uint64_t)nr * vsz <= win_pages * PAGE,
+	      "array reports arena_off (0x%llx)", (unsigned long long)off);
+
+	/* local view: mmap the array fd; value[i] at offset i*vsz, from 0 */
+	uint64_t *vals = (uint64_t *)mmap(NULL, (size_t)nr * vsz,
+			PROT_READ | PROT_WRITE, MAP_SHARED, arr, 0);
+	CHECK(vals != MAP_FAILED, "mmap array fd");
+	/* peer view: the dma-buf; value[i] at arena_off + i*vsz */
+	unsigned char *dm = (unsigned char *)mmap(NULL, win_pages * PAGE,
+			PROT_READ, MAP_SHARED, dmabuf, 0);
+	CHECK(dm != MAP_FAILED, "mmap dma-buf");
+
+	if (vals != MAP_FAILED && dm != MAP_FAILED && off >= 0) {
+		volatile uint64_t *peer = (volatile uint64_t *)(dm + off);
+		bool match = true;
+
+		for (uint32_t i = 0; i < nr; i++)
+			vals[i] = 0xA5A50000ull + i;
+		for (uint32_t i = 0; i < nr; i++)
+			if (peer[i] != 0xA5A50000ull + i)
+				match = false;
+		CHECK(match, "array values visible via dma-buf at arena_off");
+	}
+
+	if (vals != MAP_FAILED)
+		munmap(vals, (size_t)nr * vsz);
+	if (dm != MAP_FAILED)
+		munmap(dm, win_pages * PAGE);
+	close(arr);
 	close(arena);
 	close(dmabuf);
 }
@@ -651,6 +722,7 @@ int main(void)
 
 	test_ringbuf();
 	test_arena();
+	test_array();
 	test_arena_jit();
 	test_negative();
 	test_fdlink();
