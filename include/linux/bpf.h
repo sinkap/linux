@@ -306,6 +306,10 @@ struct bpf_map {
 	bool free_after_rcu_gp;
 	atomic64_t sleepable_refcnt;
 	s64 __percpu *elem_count;
+	/* set for a BPF_F_ARENA_BACKED map: describes the sub-region of an
+	 * arena that backs this map's pages (see bpf_map_arena_backing_get())
+	 */
+	struct bpf_map_arena_backing *arena_backing;
 };
 
 static inline const char *btf_field_type_name(enum btf_field_type type)
@@ -543,6 +547,27 @@ void bpf_rb_root_free(const struct btf_field *field, void *rb_root,
 u64 bpf_arena_get_kern_vm_start(struct bpf_arena *arena);
 u64 bpf_arena_get_user_vm_start(struct bpf_arena *arena);
 struct bpf_map *bpf_prog_arena(struct bpf_prog *prog);
+
+/*
+ * A contiguous run of pages reserved out of an arena to back another map
+ * (e.g. a ring buffer). The kernel picks the placement; the byte offset
+ * (pgoff << PAGE_SHIFT) and the arena id are reported to user space via
+ * bpf_map_info so a peer that maps the same arena can locate the backing.
+ */
+struct bpf_map_arena_backing {
+	struct bpf_arena *arena;	/* reference held for the map's lifetime */
+	u32 arena_id;			/* cached arena->map.id for info reporting */
+	u32 pgoff;			/* page offset within the arena */
+	u32 nr_pages;
+	struct page **pages;		/* the reserved pages, owned by the arena */
+};
+
+int bpf_arena_reserve_backing(struct bpf_arena *arena, u32 nr_pages,
+			      u32 *pgoff, struct page **pages);
+void bpf_arena_release_backing(struct bpf_arena *arena, u32 pgoff, u32 nr_pages);
+struct bpf_map_arena_backing *bpf_map_arena_backing_get(int arena_fd, u32 nr_pages);
+void bpf_map_arena_backing_put(struct bpf_map_arena_backing *ab);
+
 int bpf_obj_name_cpy(char *dst, const char *src, unsigned int size);
 
 struct bpf_offload_dev;
