@@ -10,6 +10,7 @@
 #include <linux/btf_ids.h>
 #include <linux/vmalloc.h>
 #include <linux/pagemap.h>
+#include "dmabuf_backing.h"
 #include <asm/tlbflush.h>
 #include "range_tree.h"
 
@@ -65,6 +66,11 @@ struct bpf_arena {
 	struct irq_work     free_irq;
 	struct work_struct  free_work;
 	struct llist_head   free_spans;
+	/* set for BPF_F_DMABUF: the dma-buf whose pages pre-populate the
+	 * arena, kept attached for the map's lifetime
+	 */
+	bool dmabuf_backed;
+	struct bpf_dmabuf_backing dmabuf;
 };
 
 static void arena_free_worker(struct work_struct *work);
@@ -274,18 +280,25 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 	    /* BPF_F_MMAPABLE must be set */
 	    !(attr->map_flags & BPF_F_MMAPABLE) ||
 	    /* No unsupported flags present */
-	    (attr->map_flags & ~(BPF_F_SEGV_ON_FAULT | BPF_F_MMAPABLE | BPF_F_NO_USER_CONV)))
+	    (attr->map_flags & ~(BPF_F_SEGV_ON_FAULT | BPF_F_MMAPABLE |
+				 BPF_F_NO_USER_CONV | BPF_F_DMABUF)))
 		return ERR_PTR(-EINVAL);
 
-	if (attr->map_extra & ~PAGE_MASK)
+	if (attr->map_flags & BPF_F_DMABUF) {
+		/* map_extra is a dma-buf fd whose pages back the arena */
+		if (attr->map_extra > INT_MAX)
+			return ERR_PTR(-EINVAL);
+	} else if (attr->map_extra & ~PAGE_MASK) {
 		/* If non-zero the map_extra is an expected user VMA start address */
 		return ERR_PTR(-EINVAL);
+	}
 
 	vm_range = (u64)attr->max_entries * PAGE_SIZE;
 	if (vm_range > SZ_4G)
 		return ERR_PTR(-E2BIG);
 
-	if ((attr->map_extra >> 32) != ((attr->map_extra + vm_range - 1) >> 32))
+	if (!(attr->map_flags & BPF_F_DMABUF) &&
+	    (attr->map_extra >> 32) != ((attr->map_extra + vm_range - 1) >> 32))
 		/* user vma must not cross 32-bit boundary */
 		return ERR_PTR(-ERANGE);
 
@@ -298,9 +311,16 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 		goto err;
 
 	arena->kern_vm = kern_vm;
-	arena->user_vm_start = attr->map_extra;
-	if (arena->user_vm_start)
-		arena->user_vm_end = arena->user_vm_start + vm_range;
+	if (attr->map_flags & BPF_F_DMABUF) {
+		/* A dma-buf backed arena is addressed through the dma-buf by a
+		 * peer, not through a user VMA, so it has no user_vm_start.
+		 */
+		arena->dmabuf_backed = true;
+	} else {
+		arena->user_vm_start = attr->map_extra;
+		if (arena->user_vm_start)
+			arena->user_vm_end = arena->user_vm_start + vm_range;
+	}
 
 	INIT_LIST_HEAD(&arena->vma_list);
 	init_llist_head(&arena->free_spans);
@@ -323,6 +343,30 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 	if (err)
 		goto err_destroy_rt;
 
+	/* Pre-populate a dma-buf backed arena with the dma-buf's pages: import
+	 * them (the fd authorizes use of the exporter-owned memory) and map the
+	 * whole window into the arena's kernel address space. The attachment
+	 * keeps the pages pinned until arena_map_free(); allocation then becomes
+	 * pure range-tree bookkeeping over the pre-mapped window.
+	 */
+	if (arena->dmabuf_backed) {
+		u64 kstart = bpf_arena_get_kern_vm_start(arena);
+		unsigned long nr_pages = attr->max_entries;
+
+		err = bpf_dmabuf_backing_get((int)attr->map_extra, nr_pages,
+					     &arena->dmabuf);
+		if (err)
+			goto err_destroy_rt;
+
+		err = vm_area_map_pages(arena->kern_vm, kstart,
+					kstart + nr_pages * PAGE_SIZE,
+					arena->dmabuf.pages);
+		if (err) {
+			bpf_dmabuf_backing_put(&arena->dmabuf);
+			goto err_destroy_rt;
+		}
+	}
+
 	return &arena->map;
 
 err_destroy_rt:
@@ -341,6 +385,12 @@ static int existing_page_cb(pte_t *ptep, unsigned long addr, void *data)
 	struct bpf_arena *arena = data;
 	struct page *page;
 	pte_t pte;
+
+	/* For a dma-buf backed arena every mapped page is owned by the dma-buf
+	 * and released via bpf_dmabuf_backing_put(); never free them here.
+	 */
+	if (arena->dmabuf_backed)
+		return 0;
 
 	pte = ptep_get(ptep);
 	if (!pte_present(pte)) /* sanity check */
@@ -389,6 +439,9 @@ static void arena_map_free(struct bpf_map *map)
 	apply_to_existing_page_range(&init_mm, bpf_arena_get_kern_vm_start(arena),
 				     SZ_4G + GUARD_SZ / 2, existing_page_cb, arena);
 	free_vm_area(arena->kern_vm);
+	/* Release the dma-buf attachment after its pages are unmapped above. */
+	if (arena->dmabuf_backed)
+		bpf_dmabuf_backing_put(&arena->dmabuf);
 	range_tree_destroy(&arena->rt);
 	__free_page(arena->scratch_page);
 	bpf_map_area_free(arena);
@@ -569,7 +622,13 @@ static unsigned long arena_get_unmapped_area(struct file *filp, unsigned long ad
 	ret = mm_get_unmapped_area(filp, addr, len * 2, 0, flags);
 	if (IS_ERR_VALUE(ret))
 		return ret;
-	if ((ret >> 32) == ((ret + len - 1) >> 32))
+	/* A dma-buf backed arena is pre-populated at kernel offsets keyed by
+	 * the lower 32 bits of the user address, starting at 0. Its user
+	 * mapping must be 4G-aligned so page faults resolve to the dma-buf's
+	 * pages instead of allocating fresh ones over the window.
+	 */
+	if (!arena->dmabuf_backed &&
+	    (ret >> 32) == ((ret + len - 1) >> 32))
 		return ret;
 	if (WARN_ON_ONCE(arena->user_vm_start))
 		/* checks at map creation time should prevent this */
@@ -686,6 +745,31 @@ static long arena_alloc_pages(struct bpf_arena *arena, long uaddr, long page_cnt
 		if (pgoff > page_cnt_max - page_cnt)
 			/* requested address will be outside of user VMA */
 			return 0;
+	}
+
+	/* dma-buf backed arenas are fully pre-populated, so allocation is
+	 * pure range-tree bookkeeping over the existing pages: no page
+	 * allocation, mapping or memcg accounting. Note that unlike
+	 * normally allocated arena pages the returned range is not zeroed;
+	 * its contents are whatever the shared window last held.
+	 */
+	if (arena->dmabuf_backed) {
+		if (raw_res_spin_lock_irqsave(&arena->spinlock, flags))
+			return 0;
+		if (uaddr) {
+			ret = is_range_tree_set(&arena->rt, pgoff, page_cnt);
+			if (!ret)
+				ret = range_tree_clear(&arena->rt, pgoff, page_cnt);
+		} else {
+			ret = pgoff = range_tree_find(&arena->rt, page_cnt);
+			if (pgoff >= 0)
+				ret = range_tree_clear(&arena->rt, pgoff, page_cnt);
+		}
+		raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
+		if (ret)
+			return 0;
+		uaddr32 = (u32)(arena->user_vm_start + pgoff * PAGE_SIZE);
+		return clear_lo32(arena->user_vm_start) + uaddr32;
 	}
 
 	bpf_map_memcg_enter(&arena->map, &old_memcg, &new_memcg);
@@ -872,6 +956,17 @@ static void arena_free_pages(struct bpf_arena *arena, long uaddr, long page_cnt,
 
 	range_tree_set(&arena->rt, pgoff, page_cnt);
 
+	/* dma-buf backed arenas: freeing is pure range-tree bookkeeping.
+	 * The pages stay mapped in the kernel area and in user vmas (the
+	 * whole window remains accessible) and their contents are
+	 * preserved — nothing to unmap, zap or release.
+	 */
+	if (arena->dmabuf_backed) {
+		raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
+		bpf_map_memcg_exit(old_memcg, new_memcg);
+		return;
+	}
+
 	init_llist_head(&free_pages);
 	cdata.free_pages = &free_pages;
 	cdata.scratch_page = arena->scratch_page;
@@ -993,9 +1088,14 @@ static void arena_free_worker(struct work_struct *work)
 		kaddr = arena_vm_start + s->uaddr;
 		pgoff = compute_pgoff(arena, s->uaddr);
 
-		/* clear ptes and collect pages in free_pages llist */
-		apply_to_existing_page_range(&init_mm, kaddr, page_cnt << PAGE_SHIFT,
-					     apply_range_clear_cb, &cdata);
+		/* dma-buf backed arenas free ranges, never pages: the pages
+		 * stay mapped and belong to the dma-buf attachment
+		 */
+		if (!arena->dmabuf_backed)
+			/* clear ptes and collect pages in free_pages llist */
+			apply_to_existing_page_range(&init_mm, kaddr,
+						     page_cnt << PAGE_SHIFT,
+						     apply_range_clear_cb, &cdata);
 
 		range_tree_set(&arena->rt, pgoff, page_cnt);
 	}
@@ -1008,11 +1108,13 @@ static void arena_free_worker(struct work_struct *work)
 		full_uaddr = clear_lo32(user_vm_start) + s->uaddr;
 		kaddr = arena_vm_start + s->uaddr;
 
-		/* ensure no stale TLB entries */
-		flush_tlb_kernel_range(kaddr, kaddr + (page_cnt * PAGE_SIZE));
+		if (!arena->dmabuf_backed) {
+			/* ensure no stale TLB entries */
+			flush_tlb_kernel_range(kaddr, kaddr + (page_cnt * PAGE_SIZE));
 
-		/* remove pages from user vmas */
-		zap_pages(arena, full_uaddr, page_cnt);
+			/* remove pages from user vmas */
+			zap_pages(arena, full_uaddr, page_cnt);
+		}
 
 		kfree_nolock(s);
 	}

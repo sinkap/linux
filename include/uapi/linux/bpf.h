@@ -1466,6 +1466,13 @@ enum {
 
 /* Enable BPF ringbuf overwrite mode */
 	BPF_F_RB_OVERWRITE	= (1U << 19),
+
+/* Back a map by a dma-buf: map_extra is the dma-buf fd. For an arena, its
+ * pages are pre-populated from the dma-buf so the arena can be shared with
+ * a peer that addresses the same dma-buf. (Bit 20 is claimed by the
+ * BPF_F_ARENA_BACKED series.)
+ */
+	BPF_F_DMABUF		= (1U << 21),
 };
 
 /* Flags for BPF_PROG_QUERY. */
