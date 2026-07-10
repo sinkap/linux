@@ -3,8 +3,7 @@
  * Functional test for the arena-backed multi-node BPF model: a dma-buf
  * (ideally from a device-tree carveout heap) backs an arena, ring buffers
  * are placed inside the arena at kernel-chosen offsets (arena_off), and
- * the consumer reads the dma-buf alone. Also covers the xnode_shmem
- * window driver and the MMIO kfuncs (multi-node-bpf-migration.md).
+ * the consumer reads the dma-buf alone (multi-node-bpf-migration.md).
  *
  * Runs on a single node, so it validates the layout contract, dma-buf
  * import, the produce/consume protocol, arena page identity and the
@@ -30,7 +29,6 @@
 #include <sys/syscall.h>
 #include <linux/bpf.h>
 #include <linux/dma-heap.h>
-#include <linux/xnode_shmem.h>
 
 #include "common.h"
 #include "bpf_prog.h"
@@ -309,76 +307,6 @@ static void test_arena(void)
 	close(dmabuf);
 }
 
-static void test_xnode(void)
-{
-	printf("== xnode_shmem driver ==\n");
-	int fd = open("/dev/xnode_shmem", O_RDWR | O_CLOEXEC);
-	if (fd < 0) {
-		printf("skip: /dev/xnode_shmem not present\n");
-		return;
-	}
-
-	struct xnode_shmem_info info = {};
-	CHECK(ioctl(fd, XNODE_SHMEM_GET_INFO, &info) == 0, "GET_INFO");
-	CHECK(info.size >= 2 * PAGE, "window >= 2 pages (%llu)",
-	      (unsigned long long)info.size);
-
-	/* page 0 (consumer_pos) is writable */
-	void *p0 = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	CHECK(p0 != MAP_FAILED, "mmap page 0 RW allowed");
-	if (p0 != MAP_FAILED) {
-		*(volatile uint64_t *)p0 = 0x1234;
-		CHECK(*(volatile uint64_t *)p0 == 0x1234, "page 0 read-back");
-		munmap(p0, PAGE);
-	}
-
-	/* page 1 (producer_pos) must reject a writable mapping */
-	void *p1w = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED,
-			 fd, PAGE);
-	CHECK(p1w == MAP_FAILED && errno == EPERM,
-	      "mmap page 1 RW rejected (EPERM)");
-	if (p1w != MAP_FAILED)
-		munmap(p1w, PAGE);
-
-	void *p1r = mmap(NULL, PAGE, PROT_READ, MAP_SHARED, fd, PAGE);
-	CHECK(p1r != MAP_FAILED, "mmap page 1 RO allowed");
-	if (p1r != MAP_FAILED)
-		munmap(p1r, PAGE);
-
-	/* cached mode + range sync */
-	uint32_t mode = XNODE_SHMEM_CACHED;
-	int sm = ioctl(fd, XNODE_SHMEM_SET_MODE, &mode);
-	CHECK(sm == 0, "SET_MODE cached");
-	if (sm == 0) {
-		struct xnode_shmem_sync s = {};
-		s.offset = 0;
-		s.size = 64;
-		s.flags = XNODE_SHMEM_SYNC_INVAL | XNODE_SHMEM_SYNC_CLEAN;
-		CHECK(ioctl(fd, XNODE_SHMEM_SYNC, &s) == 0, "SYNC range");
-	}
-
-	/*
-	 * Re-export the window as a dma-buf and map it. Export CACHED: the
-	 * SET_MODE/SYNC above left a write-back kernel mapping of the
-	 * window, and on x86 a write-combine user mapping of the same
-	 * physical range would conflict with it under PAT. Cacheable
-	 * matches, so it maps on both arches.
-	 */
-	struct xnode_shmem_dmabuf ex = {};
-	ex.flags = XNODE_SHMEM_CACHED;
-	int r = ioctl(fd, XNODE_SHMEM_EXPORT_DMABUF, &ex);
-	CHECK(r == 0 && ex.fd >= 0, "EXPORT_DMABUF");
-	if (r == 0 && ex.fd >= 0) {
-		void *p = mmap(NULL, PAGE, PROT_READ, MAP_SHARED, ex.fd, 0);
-		CHECK(p != MAP_FAILED, "mmap exported dma-buf");
-		if (p != MAP_FAILED)
-			munmap(p, PAGE);
-		close(ex.fd);
-	}
-
-	close(fd);
-}
-
 /* ---- MMIO: needs kfunc calls, so resolve kfunc BTF ids first ---- */
 
 struct btf_hdr {
@@ -446,146 +374,6 @@ static int btf_find_func(const char *name)
 	return -1;
 }
 
-static void test_mmio(void)
-{
-	printf("== bpf_mmio kfuncs ==\n");
-
-	/* window base/size come from the driver (expose_mmio registered it) */
-	int xf = open("/dev/xnode_shmem", O_RDONLY | O_CLOEXEC);
-	if (xf < 0) {
-		printf("skip: /dev/xnode_shmem not present\n");
-		return;
-	}
-	struct xnode_shmem_info info = {};
-	if (ioctl(xf, XNODE_SHMEM_GET_INFO, &info)) {
-		printf("skip: GET_INFO failed\n");
-		close(xf);
-		return;
-	}
-	/* keep xf open: it is the provider fd the BPF program maps */
-
-	int id_map = btf_find_func("bpf_mmio_map");
-	int id_wr = btf_find_func("bpf_mmio_writel");
-	int id_rd = btf_find_func("bpf_mmio_readl");
-	int id_rel = btf_find_func("bpf_mmio_release");
-	if (id_map <= 0 || id_wr <= 0 || id_rd <= 0 || id_rel <= 0) {
-		/* No vmlinux BTF (CONFIG_DEBUG_INFO_BTF): can't call kfuncs. */
-		printf("skip: bpf_mmio kfunc BTF ids unavailable\n");
-		return;
-	}
-	CHECK(true, "resolve bpf_mmio kfunc BTF ids");
-
-	/* array[0] = { base(in), result(out) }, one 16-byte element */
-	union bpf_attr ma = {};
-	ma.map_type = BPF_MAP_TYPE_ARRAY;
-	ma.key_size = 4;
-	ma.value_size = 16;
-	ma.max_entries = 1;
-	int amap = sys_bpf(BPF_MAP_CREATE, &ma);
-	CHECK(amap >= 0, "create scratch array map");
-	if (amap < 0)
-		return;
-
-#define KFUNC(id) INSN(BPF_JMP | BPF_CALL, 0, BPF_PSEUDO_KFUNC_CALL, 0, id)
-	struct bpf_insn prog[] = {
-		/* r0 = lookup(amap, &key0) */
-		INSN(BPF_ST | BPF_W | BPF_MEM, BPF_REG_10, 0, -4, 0),
-		MOV64_REG(BPF_REG_2, BPF_REG_10),
-		ALU64_IMM(BPF_ADD, BPF_REG_2, -4),
-		LD_MAP_FD(BPF_REG_1, amap),			/* 2 slots */
-		EMIT_CALL(BPF_FUNC_map_lookup_elem),
-		JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 22),		/* -> fail(r0=2) */
-		MOV64_REG(BPF_REG_6, BPF_REG_0),		/* r6 = value */
-		LDX_MEM(BPF_DW, BPF_REG_8, BPF_REG_6, 0),	/* r8 = provider fd */
-		/* region = bpf_mmio_map(fd, 0, 4096) */
-		MOV64_REG(BPF_REG_1, BPF_REG_8),
-		MOV64_IMM(BPF_REG_2, 0),
-		MOV64_IMM(BPF_REG_3, 4096),
-		KFUNC(id_map),
-		JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 13),		/* -> ret1 */
-		MOV64_REG(BPF_REG_7, BPF_REG_0),		/* r7 = region */
-		/* bpf_mmio_writel(region, 0, MARKER) */
-		MOV64_REG(BPF_REG_1, BPF_REG_7),
-		MOV64_IMM(BPF_REG_2, 0),
-		MOV64_IMM(BPF_REG_3, 0x0AFEF00D),
-		KFUNC(id_wr),
-		/* r0 = bpf_mmio_readl(region, 0) */
-		MOV64_REG(BPF_REG_1, BPF_REG_7),
-		MOV64_IMM(BPF_REG_2, 0),
-		KFUNC(id_rd),
-		STX_MEM(BPF_DW, BPF_REG_6, BPF_REG_0, 8),	/* value[8] = read */
-		/* bpf_mmio_release(region) */
-		MOV64_REG(BPF_REG_1, BPF_REG_7),
-		KFUNC(id_rel),
-		MOV64_IMM(BPF_REG_0, 0),
-		EXIT_INSN(),
-		MOV64_IMM(BPF_REG_0, 1), EXIT_INSN(),		/* ret1: map==NULL */
-		MOV64_IMM(BPF_REG_0, 2), EXIT_INSN(),		/* fail: lookup==NULL */
-	};
-	int n = sizeof(prog) / sizeof(prog[0]);
-	static char log[16384];
-
-	union bpf_attr la = {};
-	la.prog_type = BPF_PROG_TYPE_SYSCALL;
-	la.prog_flags = BPF_F_SLEEPABLE;
-	la.insn_cnt = n;
-	la.insns = (uint64_t)(unsigned long)prog;
-	la.license = (uint64_t)(unsigned long)"GPL";
-	la.log_level = 1;
-	la.log_buf = (uint64_t)(unsigned long)log;
-	la.log_size = sizeof(log);
-	int prog_fd = sys_bpf(BPF_PROG_LOAD, &la);
-	if (prog_fd < 0)
-		printf("prog load failed: %s\nverifier:\n%s\n",
-		       strerror(errno), log);
-	CHECK(prog_fd >= 0, "load MMIO kfunc program");
-	if (prog_fd < 0) {
-		close(amap);
-		return;
-	}
-
-	auto run = [&](uint64_t base, uint64_t *out_result) -> int {
-		uint32_t key = 0;
-		uint64_t val[2] = { base, 0 };
-		union bpf_attr up = {};
-		up.map_fd = (uint32_t)amap;
-		up.key = (uint64_t)(unsigned long)&key;
-		up.value = (uint64_t)(unsigned long)val;
-		up.flags = 0;
-		sys_bpf(BPF_MAP_UPDATE_ELEM, &up);
-
-		/* SYSCALL test_run rejects repeat/flags/data_in — only ctx. */
-		unsigned char ctx[8] = {};
-		union bpf_attr ta = {};
-		ta.test.prog_fd = (uint32_t)prog_fd;
-		ta.test.ctx_in = (uint64_t)(unsigned long)ctx;
-		ta.test.ctx_size_in = sizeof(ctx);
-		int r = sys_bpf(BPF_PROG_TEST_RUN, &ta);
-		if (r == 0 && out_result) {
-			union bpf_attr lu = {};
-			lu.map_fd = (uint32_t)amap;
-			lu.key = (uint64_t)(unsigned long)&key;
-			lu.value = (uint64_t)(unsigned long)val;
-			sys_bpf(BPF_MAP_LOOKUP_ELEM, &lu);
-			*out_result = val[1];
-		}
-		return r == 0 ? (int)ta.test.retval : -1;
-	};
-
-	/* positive: the provider fd maps, write/read round-trips */
-	uint64_t result = 0;
-	int rv = run((uint64_t)xf, &result);
-	CHECK(rv == 0, "bpf_mmio_map on the provider fd");
-	CHECK(result == 0x0AFEF00D, "mmio writel/readl round-trip");
-
-	/* negative: a non-provider fd is refused (fail-closed) */
-	rv = run((uint64_t)amap, nullptr);
-	CHECK(rv == 1, "bpf_mmio_map on a non-provider fd returns NULL");
-
-	close(prog_fd);
-	close(amap);
-	close(xf);
-}
 
 /*
  * Exercise the arena kfunc path on a dma-buf backed arena: load a program
@@ -840,8 +628,8 @@ static void test_fdlink(void)
 
 /*
  * When run as PID 1 (as the initramfs /init) there is no shell to set
- * up mounts, so do it here: devtmpfs is needed for /dev/dma_heap/system
- * and /dev/xnode_shmem to appear.
+ * up mounts, so do it here: devtmpfs is needed for the /dev/dma_heap
+ * nodes to appear.
  */
 static bool as_init;
 
@@ -866,12 +654,6 @@ int main(void)
 	test_arena_jit();
 	test_negative();
 	test_fdlink();
-	/* Before test_xnode(): its cached SYNC leaves a write-back kernel
-	 * mapping of the window, which conflicts with the UC ioremap here
-	 * under x86 PAT.
-	 */
-	test_mmio();
-	test_xnode();
 
 	printf("\nMULTINODE: %s (%d failure%s)\n",
 	       fails ? "FAIL" : "ALL PASS", fails, fails == 1 ? "" : "s");

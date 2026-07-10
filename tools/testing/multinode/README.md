@@ -1,7 +1,6 @@
 # multinode functional test
 
 End-to-end test for the dma-buf backed BPF ringbuf/arena and the
-`xnode_shmem` window driver described in
 `Documentation/bpf/multi-node-bpf.md`.
 
 `multinode_test` is a single self-contained binary (hand-assembled BPF
@@ -17,7 +16,6 @@ runs in a minimal initramfs. It exercises three things:
 - **arena**: create a `BPF_F_DMABUF` arena and confirm its pages alias
   the dma-buf's pages. The mapping is placed 4 GiB-aligned because
   arenas address pages by the low 32 bits of the user address.
-- **xnode_shmem**: `GET_INFO`, the page-0-only-writable mmap
   discipline, and `SET_MODE`/`SYNC` in cached mode.
 
 ## What it does and does not prove
@@ -46,7 +44,7 @@ tools/testing/multinode/run.sh --arch arm64  --arm64 <kbuild-arm64>
 `--arch` selects `x86_64`, `arm64` or `both` (default). arm64 is
 cross-built with `CROSS_CXX` (default `aarch64-linux-gnu-g++`). The
 kernel needs `BPF_SYSCALL`, `BPF_JIT`, `DMA_SHARED_BUFFER`,
-`DMABUF_HEAPS_SYSTEM`, `XNODE_SHMEM` and initramfs support (see
+`DMABUF_HEAPS_SYSTEM`, initramfs support (see
 `multinode.config`).
 
 ### How each arch is booted
@@ -54,14 +52,12 @@ kernel needs `BPF_SYSCALL`, `BPF_JIT`, `DMA_SHARED_BUFFER`,
 `run.sh` calls `run_qemu.sh` per arch (which can also be used directly:
 `ARCH=<arch> run_qemu.sh <kernel-image> <test-binary>`):
 
-- **x86_64** (`qemu-system-x86_64`) carves the `xnode_shmem` window
   with `memmap=` and passes `base=`/`size=` to the builtin driver; the
   window base must be below guest RAM.
 - **arm64** (`qemu-system-aarch64 -M virt`) exercises the real
   `dc civac`/`dc ivac` maintenance. `virt` has no `memmap=`, so the
   runner reserves the window by dumping the machine DTB, splicing in a
   `reserved-memory` node and passing it back with `-dtb` (needs
-  `dtc`). Without `dtc` only the `xnode_shmem` sub-test is skipped.
 
 All three sub-tests pass on both x86_64 and arm64.
 

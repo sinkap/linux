@@ -15,9 +15,9 @@
 # ARCH defaults to the host (uname -m). The test binary must be built
 # for the target architecture (see the Makefile's CXX override).
 #
-# The xnode_shmem window is reserved differently per arch: x86_64 uses
-# memmap= on the cmdline; arm64 'virt' has no memmap=, so the runner
-# generates a DTB with a reserved-memory node (needs dtc). If dtc is
+# On arm64 the runner reserves the shared window as a carveout heap
+# node in the device tree ('virt' has no memmap=), so it
+# generates a DTB with a carveout reserved-memory node (needs dtc). If dtc is
 # missing on arm64 the window is not set up and the driver sub-test is
 # skipped; the dma-heap ringbuf/arena sub-tests still run and exercise
 # the real dc civac/ivac maintenance.
@@ -35,17 +35,12 @@ x86_64)
 	QEMU=qemu-system-x86_64
 	CONSOLE=ttyS0
 	MACHINE=(-machine q35)
-	WIN_BASE=0x30000000
-	WIN_SIZE=0x100000
-	WINDOW_CMDLINE="memmap=${WIN_SIZE}\$${WIN_BASE} \
-		xnode_shmem.base=${WIN_BASE} xnode_shmem.size=${WIN_SIZE} xnode_shmem.expose_mmio=1"
+	WINDOW_CMDLINE=""
 	;;
 arm64|aarch64)
 	QEMU=qemu-system-aarch64
 	CONSOLE=ttyAMA0
 	MACHINE=(-machine virt -cpu max)
-	WIN_BASE=0x50000000		# within virt RAM (0x40000000 + 1 GiB)
-	WIN_SIZE=0x100000
 	WINDOW_CMDLINE=""
 	if command -v dtc >/dev/null; then
 		# Reserve the window in a patched copy of the virt DTB.
@@ -53,7 +48,7 @@ arm64|aarch64)
 			-m 1024 -smp 2 -nographic >/dev/null 2>&1
 		dtc -I dtb -O dts "$work/virt.dtb" -o "$work/virt.dts" 2>/dev/null
 		# Insert a reserved-memory node after the memory node.
-		awk -v base="$WIN_BASE" -v size="$WIN_SIZE" '
+		awk '
 			{ print }
 			/device_type = "memory";/ { in_mem = 1 }
 			in_mem && /};/ {
@@ -61,22 +56,17 @@ arm64|aarch64)
 				print "\t\t#address-cells = <0x02>;"
 				print "\t\t#size-cells = <0x02>;"
 				print "\t\tranges;"
-				print "\t\txnode@50000000 {"
-				printf "\t\t\treg = <0x00 %s 0x00 %s>;\n", base, size
-				print "\t\t\tno-map;"
-				print "\t\t};"
 				print "\t\txwin@50100000 {"
 				print "\t\t\treg = <0x00 0x50100000 0x00 0x100000>;"
 				print "\t\t\texport;"
 				print "\t\t};"
 				print "\t};"
 				in_mem = 0
-			}' "$work/virt.dts" > "$work/virt-xnode.dts"
-		dtc -I dts -O dtb "$work/virt-xnode.dts" -o "$work/virt-xnode.dtb" 2>/dev/null
-		DTB_ARG=(-dtb "$work/virt-xnode.dtb")
-		WINDOW_CMDLINE="xnode_shmem.base=${WIN_BASE} xnode_shmem.size=${WIN_SIZE} xnode_shmem.expose_mmio=1"
+			}' "$work/virt.dts" > "$work/virt-carveout.dts"
+		dtc -I dts -O dtb "$work/virt-carveout.dts" -o "$work/virt-carveout.dtb" 2>/dev/null
+		DTB_ARG=(-dtb "$work/virt-carveout.dtb")
 	else
-		echo "note: dtc not found; xnode_shmem window not set up on arm64" >&2
+		echo "note: dtc not found; carveout heap not set up on arm64" >&2
 	fi
 	;;
 *)

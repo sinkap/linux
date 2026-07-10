@@ -398,7 +398,7 @@ Notes:
 ## 6. Consumer node: prefer a driverless in-BPF consumer
 
 The reading node must stop mapping the window through raw `/dev/mem`. The
-**recommended** consumer is driverless and needs no `xnode_shmem`:
+**recommended** consumer is driverless:
 
 - Declare the same window on the consumer as its own CMA region (§2a) at
   the consumer node's physical base (daemon-injected) and allocate a
@@ -410,16 +410,11 @@ The reading node must stop mapping the window through raw `/dev/mem`. The
   node (§3a case 2) no invalidate is needed; if your topology ever needs
   one, that is the point to reintroduce the maintenance layer.
 
-`xnode_shmem` is only for cases the in-BPF consumer doesn't cover: a
-**userspace** consumer that must `mmap` the window write-combine, or a
-**cached** userspace consumer that needs the privileged `DC IVAC` via a
-range-sync ioctl, plus the page-0-only-writable discipline.
-`drivers/misc/xnode_shmem.c` provides that, **but it is a reference driver,
-not for upstream as-is** — fold its interface (`GET_INFO`, mmap discipline,
-`SET_MODE`/`SYNC`) into the device driver that owns the window. When the
-producer is coherent with the consumer (§3a case 2), a driverless
-*userspace* consumer — no BPF map, no `xnode_shmem` — is also possible; see
-§6a.
+With a producer that is coherent toward the consumer (§3a case 2), a
+driverless *userspace* consumer — no BPF map, no window driver — is the
+simplest option; see §6a. (This branch carries no window driver: mmap
+discipline and any cache synchronization are owned by the device driver
+that owns the window, e.g. via its dma_sync ioctl.)
 
 ## 6a. Userspace consumer when the producer is coherent with the consumer
 
