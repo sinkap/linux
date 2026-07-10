@@ -1410,6 +1410,7 @@ static int map_create_alloc(union bpf_attr *attr, bpfptr_t uattr, struct bpf_ver
 	    attr->map_type != BPF_MAP_TYPE_RHASH &&
 	    attr->map_type != BPF_MAP_TYPE_RINGBUF &&
 	    attr->map_type != BPF_MAP_TYPE_USER_RINGBUF &&
+	    attr->map_type != BPF_MAP_TYPE_ARRAY &&
 	    attr->map_extra != 0) {
 		bpf_log(log, "Invalid map_extra.\n");
 		return -EINVAL;
