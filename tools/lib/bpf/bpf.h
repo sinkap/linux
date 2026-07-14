@@ -54,9 +54,13 @@ struct bpf_map_create_opts {
 	__s32 value_type_btf_obj_fd;
 
 	__u32 token_fd;
+	/* eventfd signaled on ring buffer wakeup (BPF_MAP_TYPE_RINGBUF
+	 * only); zero means none
+	 */
+	__u32 notify_fd;
 	size_t :0;
 };
-#define bpf_map_create_opts__last_field token_fd
+#define bpf_map_create_opts__last_field notify_fd
 
 LIBBPF_API int bpf_map_create(enum bpf_map_type map_type,
 			      const char *map_name,
