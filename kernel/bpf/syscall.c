@@ -1366,7 +1366,7 @@ free_map_tab:
 	return ret;
 }
 
-#define BPF_MAP_CREATE_LAST_FIELD excl_prog_hash_size
+#define BPF_MAP_CREATE_LAST_FIELD notify_fd
 /* called via syscall */
 static int map_create_alloc(union bpf_attr *attr, bpfptr_t uattr, struct bpf_verifier_log *log,
 			    struct bpf_map **mapp, struct bpf_token **tokenp)
@@ -1410,6 +1410,15 @@ static int map_create_alloc(union bpf_attr *attr, bpfptr_t uattr, struct bpf_ver
 	    attr->map_type != BPF_MAP_TYPE_RHASH &&
 	    attr->map_extra != 0) {
 		bpf_log(log, "Invalid map_extra.\n");
+		return -EINVAL;
+	}
+
+	/* Only kernel-producer ring buffers notify consumers; the
+	 * user-ringbuf wakeup runs the opposite direction and is not
+	 * covered (yet).
+	 */
+	if (attr->map_type != BPF_MAP_TYPE_RINGBUF && attr->notify_fd) {
+		bpf_log(log, "Invalid notify_fd.\n");
 		return -EINVAL;
 	}
 

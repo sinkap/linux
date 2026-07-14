@@ -1576,6 +1576,12 @@ union bpf_attr {
 		__aligned_u64 excl_prog_hash;
 		/* Size of the passed excl_prog_hash. */
 		__u32 excl_prog_hash_size;
+		/* Eventfd signaled whenever the ring buffer notifies consumers
+		 * of new data (same policy as the map fd's poll readiness,
+		 * including BPF_RB_FORCE_WAKEUP/BPF_RB_NO_WAKEUP). Zero means
+		 * no eventfd. BPF_MAP_TYPE_RINGBUF only.
+		 */
+		__u32	notify_fd;
 	};
 
 	struct { /* anonymous struct used by BPF_MAP_*_ELEM and BPF_MAP_FREEZE commands */

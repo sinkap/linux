@@ -2,6 +2,7 @@
 #include <linux/bpf.h>
 #include <linux/btf.h>
 #include <linux/err.h>
+#include <linux/eventfd.h>
 #include <linux/irq_work.h>
 #include <linux/slab.h>
 #include <linux/filter.h>
@@ -28,6 +29,7 @@
 struct bpf_ringbuf {
 	wait_queue_head_t waitq;
 	struct irq_work work;
+	struct eventfd_ctx *notify_ctx;	/* NULL: wake only the local waitq */
 	u64 mask;
 	struct page **pages;
 	int nr_pages;
@@ -156,6 +158,18 @@ static void bpf_ringbuf_notify(struct irq_work *work)
 	struct bpf_ringbuf *rb = container_of(work, struct bpf_ringbuf, work);
 
 	wake_up_all(&rb->waitq);
+	if (rb->notify_ctx) {
+		/* eventfd_signal() is forbidden (and would be dropped with a
+		 * warn) while the task this irq_work interrupted is itself
+		 * mid-signal on an eventfd. Requeue instead of losing the
+		 * wakeup; the interrupted signal is nearly done, so this
+		 * settles in a bounded number of retries.
+		 */
+		if (unlikely(!eventfd_signal_allowed()))
+			irq_work_queue(&rb->work);
+		else
+			eventfd_signal(rb->notify_ctx);
+	}
 }
 
 /* Maximum size of ring buffer area is limited by 32-bit page offset within
@@ -193,8 +207,10 @@ static struct bpf_ringbuf *bpf_ringbuf_alloc(size_t data_sz, int numa_node, bool
 
 static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 {
+	struct eventfd_ctx *notify_ctx = NULL;
 	bool overwrite_mode = false;
 	struct bpf_ringbuf_map *rb_map;
+	int err;
 
 	if (attr->map_flags & ~RINGBUF_CREATE_FLAG_MASK)
 		return ERR_PTR(-EINVAL);
@@ -210,24 +226,46 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 	    !PAGE_ALIGNED(attr->max_entries))
 		return ERR_PTR(-EINVAL);
 
+	/* Resolve the eventfd first: the reference is held for the map's
+	 * lifetime, so a one-shot loader can create the map, exit, and the
+	 * wakeup keeps signaling without any process holding the fd.
+	 */
+	if (attr->notify_fd) {
+		notify_ctx = eventfd_ctx_fdget(attr->notify_fd);
+		if (IS_ERR(notify_ctx))
+			return ERR_CAST(notify_ctx);
+	}
+
 	rb_map = bpf_map_area_alloc(sizeof(*rb_map), NUMA_NO_NODE);
-	if (!rb_map)
-		return ERR_PTR(-ENOMEM);
+	if (!rb_map) {
+		err = -ENOMEM;
+		goto err_put_notify;
+	}
 
 	bpf_map_init_from_attr(&rb_map->map, attr);
 
 	rb_map->rb = bpf_ringbuf_alloc(attr->max_entries, rb_map->map.numa_node, overwrite_mode);
 	if (!rb_map->rb) {
 		bpf_map_area_free(rb_map);
-		return ERR_PTR(-ENOMEM);
+		err = -ENOMEM;
+		goto err_put_notify;
 	}
+	rb_map->rb->notify_ctx = notify_ctx;
 
 	return &rb_map->map;
+
+err_put_notify:
+	if (notify_ctx)
+		eventfd_ctx_put(notify_ctx);
+	return ERR_PTR(err);
 }
 
 static void bpf_ringbuf_free(struct bpf_ringbuf *rb)
 {
 	irq_work_sync(&rb->work);
+
+	if (rb->notify_ctx)
+		eventfd_ctx_put(rb->notify_ctx);
 
 	/* copy pages pointer and nr_pages to local variable, as we are going
 	 * to unmap rb itself with vunmap() below
