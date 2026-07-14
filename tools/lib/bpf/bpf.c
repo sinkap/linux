@@ -210,7 +210,7 @@ int bpf_map_create(enum bpf_map_type map_type,
 		   __u32 max_entries,
 		   const struct bpf_map_create_opts *opts)
 {
-	const size_t attr_sz = offsetofend(union bpf_attr, excl_prog_hash_size);
+	const size_t attr_sz = offsetofend(union bpf_attr, notify_fd);
 	const size_t attr_common_sz = sizeof(struct bpf_common_attr);
 	struct bpf_common_attr attr_common;
 	struct bpf_log_opts *log_opts;
@@ -246,6 +246,7 @@ int bpf_map_create(enum bpf_map_type map_type,
 	attr.map_token_fd = OPTS_GET(opts, token_fd, 0);
 	attr.excl_prog_hash = ptr_to_u64(OPTS_GET(opts, excl_prog_hash, NULL));
 	attr.excl_prog_hash_size = OPTS_GET(opts, excl_prog_hash_size, 0);
+	attr.notify_fd = OPTS_GET(opts, notify_fd, 0);
 
 	log_opts = OPTS_GET(opts, log_opts, NULL);
 	if (!OPTS_VALID(log_opts, bpf_log_opts))
