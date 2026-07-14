@@ -1373,7 +1373,7 @@ static bool bpf_net_capable(void)
 	return capable(CAP_NET_ADMIN) || capable(CAP_SYS_ADMIN);
 }
 
-#define BPF_MAP_CREATE_LAST_FIELD excl_prog_hash_size
+#define BPF_MAP_CREATE_LAST_FIELD notify_fd
 /* called via syscall */
 static int map_create(union bpf_attr *attr, bpfptr_t uattr)
 {
@@ -1415,6 +1415,13 @@ static int map_create(union bpf_attr *attr, bpfptr_t uattr)
 	f_flags = bpf_get_file_flag(attr->map_flags);
 	if (f_flags < 0)
 		return f_flags;
+
+	/* Only kernel-producer ring buffers notify consumers; the
+	 * user-ringbuf wakeup runs the opposite direction and is not
+	 * covered (yet).
+	 */
+	if (attr->map_type != BPF_MAP_TYPE_RINGBUF && attr->notify_fd)
+		return -EINVAL;
 
 	if (numa_node != NUMA_NO_NODE &&
 	    ((unsigned int)numa_node >= nr_node_ids ||
