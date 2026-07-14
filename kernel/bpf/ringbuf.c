@@ -1,6 +1,7 @@
 #include <linux/bpf.h>
 #include <linux/btf.h>
 #include <linux/err.h>
+#include <linux/eventfd.h>
 #include <linux/irq_work.h>
 #include <linux/slab.h>
 #include <linux/filter.h>
@@ -26,6 +27,7 @@
 struct bpf_ringbuf {
 	wait_queue_head_t waitq;
 	struct irq_work work;
+	struct eventfd_ctx *notify_ctx;	/* NULL: wake only the local waitq */
 	u64 mask;
 	struct page **pages;
 	int nr_pages;
@@ -206,6 +208,18 @@ static void bpf_ringbuf_notify(struct irq_work *work)
 	struct bpf_ringbuf *rb = container_of(work, struct bpf_ringbuf, work);
 
 	wake_up_all(&rb->waitq);
+	if (rb->notify_ctx) {
+		/* eventfd_signal() is forbidden (and would be dropped with a
+		 * warn) while the task this irq_work interrupted is itself
+		 * mid-signal on an eventfd. Requeue instead of losing the
+		 * wakeup; the interrupted signal is nearly done, so this
+		 * settles in a bounded number of retries.
+		 */
+		if (unlikely(!eventfd_signal_allowed()))
+			irq_work_queue(&rb->work);
+		else
+			eventfd_signal(rb->notify_ctx);
+	}
 }
 
 /* Maximum size of ring buffer area is limited by 32-bit page offset within
@@ -251,9 +265,11 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 			      (attr->max_entries >> PAGE_SHIFT);
 	struct bpf_map_arena_backing *ab = NULL;
 	struct page **shared_pages = NULL;
+	struct eventfd_ctx *notify_ctx = NULL;
 	bool overwrite_mode = false;
 	struct bpf_ringbuf_map *rb_map;
 	u32 nr_shared = 0;
+	int err;
 
 	if (attr->map_flags & ~RINGBUF_CREATE_FLAG_MASK)
 		return ERR_PTR(-EINVAL);
@@ -274,9 +290,21 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 	if (!(attr->map_flags & BPF_F_ARENA_BACKED) && attr->map_extra)
 		return ERR_PTR(-EINVAL);
 
+	/* Resolve the eventfd first: the reference is held for the map's
+	 * lifetime, so a one-shot loader can create the map, exit, and the
+	 * wakeup keeps signaling without any process holding the fd.
+	 */
+	if (attr->notify_fd) {
+		notify_ctx = eventfd_ctx_fdget(attr->notify_fd);
+		if (IS_ERR(notify_ctx))
+			return ERR_CAST(notify_ctx);
+	}
+
 	rb_map = bpf_map_area_alloc(sizeof(*rb_map), NUMA_NO_NODE);
-	if (!rb_map)
-		return ERR_PTR(-ENOMEM);
+	if (!rb_map) {
+		err = -ENOMEM;
+		goto err_put_notify;
+	}
 
 	bpf_map_init_from_attr(&rb_map->map, attr);
 
@@ -287,10 +315,9 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 		ab = bpf_map_arena_backing_get((int)attr->map_extra,
 					       nr_shared_pages);
 		if (IS_ERR(ab)) {
-			int err = PTR_ERR(ab);
-
+			err = PTR_ERR(ab);
 			bpf_map_area_free(rb_map);
-			return ERR_PTR(err);
+			goto err_put_notify;
 		}
 		rb_map->map.arena_backing = ab;
 		shared_pages = ab->pages;
@@ -302,14 +329,26 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 	if (!rb_map->rb) {
 		bpf_map_arena_backing_put(ab);
 		bpf_map_area_free(rb_map);
-		return ERR_PTR(-ENOMEM);
+		err = -ENOMEM;
+		goto err_put_notify;
 	}
+	rb_map->rb->notify_ctx = notify_ctx;
 
 	return &rb_map->map;
+
+err_put_notify:
+	if (notify_ctx)
+		eventfd_ctx_put(notify_ctx);
+	return ERR_PTR(err);
 }
 
 static void bpf_ringbuf_free(struct bpf_ringbuf *rb)
 {
+	irq_work_sync(&rb->work);
+
+	if (rb->notify_ctx)
+		eventfd_ctx_put(rb->notify_ctx);
+
 	/* copy pages pointer and nr_pages to local variable, as we are going
 	 * to unmap rb itself with vunmap() below
 	 */

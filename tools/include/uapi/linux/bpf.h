@@ -1524,6 +1524,12 @@ union bpf_attr {
 		 * If provided, map_flags should have BPF_F_TOKEN_FD flag set.
 		 */
 		__s32	map_token_fd;
+		/* Eventfd signaled whenever the ring buffer notifies consumers
+		 * of new data (same policy as the map fd's poll readiness,
+		 * including BPF_RB_FORCE_WAKEUP/BPF_RB_NO_WAKEUP). Zero means
+		 * no eventfd. BPF_MAP_TYPE_RINGBUF only.
+		 */
+		__u32	notify_fd;
 	};
 
 	struct { /* anonymous struct used by BPF_MAP_*_ELEM commands */
