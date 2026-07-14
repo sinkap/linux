@@ -631,6 +631,77 @@ static void test_arena_jit(void)
 	close(dmabuf);
 }
 
+/*
+ * notify_fd: the ring buffer signals an eventfd on wakeup. This is the
+ * producer node's doorbell hook -- a fabric driver binds the same
+ * eventfd irqfd-style and turns each signal into a doorbell write; here
+ * the eventfd itself is observed (same-node view of the same chain).
+ */
+static void test_notify(void)
+{
+	printf("== notify_fd ==\n");
+	const uint32_t data_sz = PAGE;
+	const unsigned long npages = 8;
+
+	int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	CHECK(efd >= 0, "eventfd");
+	if (efd < 0)
+		return;
+
+	int dmabuf = dmabuf_alloc(npages);
+	int arena = dmabuf >= 0 ? create_arena(npages, dmabuf) : -1;
+	CHECK(arena >= 0, "dma-buf arena for the notify ring");
+	if (arena < 0)
+		return;
+
+	union bpf_attr attr = {};
+	attr.map_type = BPF_MAP_TYPE_RINGBUF;
+	attr.max_entries = data_sz;
+	attr.map_flags = BPF_F_ARENA_BACKED;
+	attr.map_extra = (uint32_t)arena;
+	attr.notify_fd = (uint32_t)efd;
+	int rb = sys_bpf(BPF_MAP_CREATE, &attr);
+	CHECK(rb >= 0, "create arena-backed ringbuf with notify_fd");
+	if (rb < 0)
+		return;
+
+	int prog = load_producer(rb);
+	CHECK(prog >= 0, "load producer program");
+	if (prog < 0)
+		return;
+
+	/* First record: the consumer is "caught up" at pos 0, so the
+	 * adaptive wakeup fires; the signal is deferred via irq_work, so
+	 * poll rather than race it.
+	 */
+	CHECK(produce_one(prog, 1) == 0, "produce a record");
+	uint64_t cnt = 0;
+	int ready = -1;
+	for (int i = 0; i < 5000; i++) {
+		if (read(efd, &cnt, sizeof(cnt)) == (ssize_t)sizeof(cnt)) {
+			ready = 0;
+			break;
+		}
+		usleep(1000);
+	}
+	CHECK(ready == 0 && cnt >= 1, "eventfd signaled on commit (cnt=%llu)",
+	      (unsigned long long)cnt);
+
+	/* notify_fd is only for kernel-producer ring buffers */
+	union bpf_attr bad = {};
+	bad.map_type = BPF_MAP_TYPE_ARRAY;
+	bad.key_size = 4;
+	bad.value_size = 4;
+	bad.max_entries = 1;
+	bad.notify_fd = (uint32_t)efd;
+	int fd = sys_bpf(BPF_MAP_CREATE, &bad);
+	CHECK(fd < 0 && errno == EINVAL, "notify_fd on an array is rejected");
+	if (fd >= 0)
+		close(fd);
+
+	close(prog); close(rb); close(arena); close(dmabuf); close(efd);
+}
+
 static void test_negative(void)
 {
 	printf("== negative map flags ==\n");
@@ -796,6 +867,7 @@ int main(void)
 	test_array();
 	test_mixed();
 	test_arena_jit();
+	test_notify();
 	test_negative();
 	test_fdlink();
 
