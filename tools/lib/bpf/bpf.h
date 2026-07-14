@@ -57,9 +57,13 @@ struct bpf_map_create_opts {
 
 	const void *excl_prog_hash;
 	__u32 excl_prog_hash_size;
+	/* eventfd signaled on ring buffer wakeup (BPF_MAP_TYPE_RINGBUF
+	 * only); zero means none
+	 */
+	__u32 notify_fd;
 	size_t :0;
 };
-#define bpf_map_create_opts__last_field excl_prog_hash_size
+#define bpf_map_create_opts__last_field notify_fd
 
 LIBBPF_API int bpf_map_create(enum bpf_map_type map_type,
 			      const char *map_name,
