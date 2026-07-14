@@ -4,7 +4,8 @@ The original prototype (the 5 `multi-node-bpf` patches) authorized shared
 memory by **raw physical address** and had a few unsafe/broken corners.
 The current design authorizes by **dma-buf fd**: one dma-buf backs one
 arena, ring buffers *and* arrays are placed inside it, there is **no**
-in-kernel cache maintenance, and MMIO access and fd links are reworked.
+in-kernel cache maintenance, wakeups ride a ring buffer **notify_fd**
+eventfd instead of MMIO kfuncs, and fd links are reworked.
 This is a breaking change to the UAPI. Below is what to change, by area.
 
 ## 1. Map flags: one dma-buf arena backs everything
@@ -297,103 +298,64 @@ kernel.
   (it knows a dma-buf arena's `map_extra` is an fd, not an address), so
   skeleton users need no extra step.
 
-## 5. MMIO kfuncs: two ways to name an aperture
+## 5. Wakeups: the ring buffer signals an eventfd (`notify_fd`)
 
-There are two ways to obtain a `struct bpf_mmio_region *`; pick per aperture.
-Everything downstream — the `bpf_mmio_readl`/`writel`/… accessors,
-`bpf_mmio_release`, and the kptr/destructor — is identical, and both map
-kfuncs are `KF_ACQUIRE | KF_RET_NULL | KF_SLEEPABLE`.
-
-**(a) `bpf_mmio_map_region(phys, size)` — driver-allowlisted physical range.**
-For a *fixed* aperture owned by a trusted in-kernel driver (a doorbell /
-mailbox). The driver blesses the range; access is gated by that registration
-plus `CAP_BPF`. Takes **no fd**, so it can be mapped from any process context.
-
-```c
-/* driver that owns the aperture */
-bpf_mmio_register_region(doorbell_phys, size);   /* ... unregister at exit */
-
-/* BPF: map once (any context — no fget) and stash the kptr */
-r = bpf_mmio_map_region(DOORBELL_PHYS, size);
-```
-Fail-closed: with nothing registered, `bpf_mmio_map_region()` returns NULL.
-
-**(b) `bpf_mmio_map(fd, offset, size)` — fd-scoped via a provider.** For an
-aperture whose access should follow *fd/process ownership* (e.g. a vfio-pci
-BAR handed to a specific process). A provider registers its fd's
-`file_operations` + a resolver via `bpf_mmio_register_provider()`;
-`bpf_mmio_map()` `fget()`s the fd, so the map call **must run in the process
-holding the fd**. With no provider registered it fails for every fd.
+The prototype rang the consumer's doorbell **from the BPF program** with
+MMIO kfuncs (map a register region, stash a kptr, `bpf_mmio_writel()` on
+the hot path). That whole surface is gone. Instead the ring buffer itself
+carries the notification: create it with the new `notify_fd` attr naming
+an **eventfd**, and every time the ring would wake a consumer (the
+existing adaptive policy, including `BPF_RB_FORCE_WAKEUP` /
+`BPF_RB_NO_WAKEUP` per commit), the kernel signals that eventfd from the
+same irq_work that does the local waitqueue wakeup.
 
 ```c
-r = bpf_mmio_map(bar_fd, offset, size);   /* fd from the provider */
+int efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+
+attr.map_type  = BPF_MAP_TYPE_RINGBUF;
+attr.map_flags = BPF_F_ARENA_BACKED;
+attr.map_extra = arena_fd;
+attr.notify_fd = efd;                 /* NEW */
+/* ... BPF_MAP_CREATE ... */
 ```
 
-Which to use: a fixed doorbell your own driver owns → (a); a per-process
-device handoff → (b).
+The BPF program needs **nothing**: plain `bpf_ringbuf_output()` /
+`reserve`+`submit`. No kptr dance, no MMIO kfunc set, no per-hook
+context concerns — the wakeup policy the ringbuf already implements is
+reused as the doorbell policy.
 
-### Usage pattern (both): map once, stash a kptr, use later
+**Who turns the signal into hardware?** The driver that owns the
+doorbell register binds the *same eventfd* irqfd-style (the KVM irqfd /
+vhost-kick pattern): an `add_wait_queue()` callback that runs inline in
+`eventfd_signal()`, consumes the count, and `writel()`s the doorbell
+toward the peer node. BPF core knows only eventfd; the driver knows only
+eventfd. See the dummy doorbell in `bpf_testmod`
+(`BPF_TESTMOD_DB_IOC_BIND`) for a complete reference implementation of
+the binding.
 
-`ioremap()` is sleepable, so you don't map per event — map once in a
-sleepable context, stash the acquired region as a
-`struct bpf_mmio_region __kptr *`, and read it from the fast path (e.g. an
-LSM hook). For path (b) the setup program must run in the fd holder's
-process; for path (a) any context works.
+Properties that matter for this deployment:
 
-```c
-struct { struct bpf_mmio_region __kptr *region; } val;   /* in a map / global */
+- **One-shot friendly.** The eventfd reference is taken once at
+  `BPF_MAP_CREATE` and held by the map. The loader can exit; the wakeup
+  keeps firing with no process holding the fd and no fd resolution on
+  the datapath. (This is what made the fd-scoped MMIO kfunc awkward —
+  it resolved the fd in the caller's process at map time.)
+- **Same-host consumers need no driver at all**: poll the eventfd
+  directly. `ring_buffer__add_dmabuf(..., notify_fd, ...)` already
+  epolls it, and `ring_buffer__poll()` re-arms (reads) the eventfd
+  before draining, so the poll loop blocks correctly when idle.
+- **Stale `consumer_pos` caveat**: the adaptive wakeup compares against
+  the shared consumer page, which a remote consumer only updates via the
+  out-of-band sync-back. If that path is lazy, commit with
+  `BPF_RB_FORCE_WAKEUP` (signals coalesce at the eventfd) or run a slow
+  periodic drain as a safety net.
+- `notify_fd` is accepted only on `BPF_MAP_TYPE_RINGBUF`; anything else
+  is `-EINVAL`.
 
-SEC("syscall")                           /* run once via bpf_prog_test_run */
-int setup(void *ctx)
-{
-	struct bpf_mmio_region *r = bpf_mmio_map_region(DOORBELL_PHYS, 0x1000);
-	if (!r)
-		return 1;
-	r = bpf_kptr_xchg(&val.region, r);   /* stash; returns previous (NULL) */
-	if (r)
-		bpf_mmio_release(r);
-	return 0;
-}
-
-SEC("lsm/bprm_check_security")
-int BPF_PROG(on_exec, struct linux_binprm *bprm)
-{
-	/* A *referenced* kptr read is untrusted, and bpf_mmio_writel is KF_RCU,
-	 * so a direct `r = val.region` is rejected ("R1 must be a rcu pointer").
-	 * Take the region out with an atomic xchg (an owned, trusted ref the
-	 * accessor accepts), use it, and put it back.
-	 */
-	struct bpf_mmio_region *r = bpf_kptr_xchg(&val.region, NULL);
-	if (!r)                                    /* setup hasn't run yet */
-		return 0;
-	bpf_mmio_writel(r, DOORBELL_OFF, value);
-	r = bpf_kptr_xchg(&val.region, r);         /* put it back */
-	if (r)
-		bpf_mmio_release(r);
-	return 0;
-}
-```
-
-The kptr's destructor `iounmap()`s (and `fput()`s the fd, for path (b)) when
-it is replaced or the map is freed.
-
-Notes:
-
-- The mmio kfunc set is registered for tracing, sched_cls, xdp, struct_ops,
-  **syscall**, and **lsm** program types — so both the `SEC("syscall")` setup
-  and the `SEC("lsm/…")` hook can call it.
-- **Referenced-kptr access.** `bpf_mmio_writel` is `KF_RCU`, and a referenced
-  kptr read is *untrusted* even inside `bpf_rcu_read_lock()` (the region is
-  not a registered RCU-safe type). Use `bpf_kptr_xchg()` out/in as above; note
-  it is atomic, so concurrent hook invocations serialize and a contended one
-  sees NULL (fine for a doorbell — one poke wins). If you need concurrent
-  lock-free reads, the region type would have to be made an RCU-safe kptr.
-- **BPF-LSM attach needs the trampoline.** LSM programs attach via an fentry
-  trampoline, which requires `CONFIG_FUNCTION_TRACER` /
-  `CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS`; without them attach fails with
-  `-EBUSY`. Prefer an *int*-returning hook such as `bprm_check_security` —
-  the `void` `bprm_committed_creds` is harder to attach a program to.
-- `bpf_mmio_readq`/`writeq` are 64-bit only.
+The MMIO kfuncs themselves (fd-scoped provider and register-region
+variants) are no longer part of this branch; they live on the standalone
+`feature/bpf-next/mmio` branch if a use case ever needs raw register
+access from BPF.
 
 ## 6. Consumer node: prefer a driverless in-BPF consumer
 
@@ -537,8 +499,8 @@ longer works. Link info now reports the kind/inode
       coherency is the fabric + your `dma_sync` ioctl.
 - [ ] Consumer: `ring_buffer__add_dmabuf(rb, dmabuf_fd, arena_off, ...)`
       (§6a), or the in-BPF consumer (§6).
-- [ ] MMIO: for a driver-owned fixed aperture, `bpf_mmio_register_region()`
-      + `bpf_mmio_map_region(phys,size)`; for a per-process aperture,
-      `bpf_mmio_register_provider()` + `bpf_mmio_map(fd,offset,size)`. Map
-      once, stash a `bpf_mmio_region __kptr`, use from the hook (§5).
+- [ ] Doorbell: create the producer ring with `notify_fd` = an eventfd;
+      the doorbell driver binds the same eventfd irqfd-style and writes
+      the register. The BPF program just commits records — no MMIO
+      kfuncs, no kptr (§5).
 - [ ] Ensure any pinned fd links are eventfd or dma-buf only (§7).
