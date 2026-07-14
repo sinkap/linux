@@ -3,7 +3,15 @@
 #ifndef _BPF_TESTMOD_H
 #define _BPF_TESTMOD_H
 
+#include <linux/ioctl.h>
 #include <linux/types.h>
+
+/* Dummy doorbell device (/dev/bpf_testmod_doorbell): binds an eventfd
+ * irqfd-style and counts every signal as a doorbell ring -- a stand-in
+ * for a fabric driver that would writel() into a doorbell register.
+ */
+#define BPF_TESTMOD_DB_IOC_BIND		_IO('t', 0x64)	/* arg: eventfd */
+#define BPF_TESTMOD_DB_IOC_RINGS	_IOR('t', 0x65, __u64)
 
 struct task_struct;
 
