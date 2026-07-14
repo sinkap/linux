@@ -20,6 +20,9 @@
 #include <linux/filter.h>
 #include <net/sock.h>
 #include <linux/namei.h>
+#include <linux/eventfd.h>
+#include <linux/miscdevice.h>
+#include <linux/poll.h>
 #include "bpf_testmod.h"
 #include "bpf_testmod_kfunc.h"
 
@@ -1717,6 +1720,134 @@ struct bpf_struct_ops testmod_multi_st_ops = {
 
 extern int bpf_fentry_test1(int a);
 
+/* Dummy doorbell device: a stand-in for a fabric/NIC driver that turns
+ * a ring buffer's notify_fd eventfd into a hardware doorbell write.
+ *
+ * BPF_TESTMOD_DB_IOC_BIND attaches to the eventfd irqfd-style (the KVM
+ * irqfd / vhost-kick pattern): a waitqueue callback that runs inline in
+ * eventfd_signal(), consumes the count, and "rings the doorbell". Here
+ * the ring is an atomic counter the test reads back with
+ * BPF_TESTMOD_DB_IOC_RINGS; a real driver would writel() into its
+ * mapped register. Signals raised before BIND are not counted.
+ */
+struct bpf_testmod_doorbell {
+	struct mutex lock;
+	struct eventfd_ctx *ctx;
+	wait_queue_entry_t wait;
+	poll_table pt;
+	atomic64_t rings;
+};
+
+static int bpf_testmod_db_wakeup(wait_queue_entry_t *wait, unsigned int mode,
+				 int sync, void *key)
+{
+	struct bpf_testmod_doorbell *db =
+		container_of(wait, struct bpf_testmod_doorbell, wait);
+	__poll_t flags = key_to_poll(key);
+	u64 cnt;
+
+	if (flags & EPOLLIN) {
+		/* Called with the eventfd's wqh.lock held; consume the
+		 * count and ring. A real driver would writel() here.
+		 */
+		eventfd_ctx_do_read(db->ctx, &cnt);
+		atomic64_add(cnt, &db->rings);
+	}
+	/* EPOLLHUP needs no action: we hold a ctx reference, and detach
+	 * happens in our release path.
+	 */
+	return 0;
+}
+
+static void bpf_testmod_db_ptqueue(struct file *file, wait_queue_head_t *wqh,
+				   poll_table *pt)
+{
+	struct bpf_testmod_doorbell *db =
+		container_of(pt, struct bpf_testmod_doorbell, pt);
+
+	add_wait_queue(wqh, &db->wait);
+}
+
+static long bpf_testmod_db_bind(struct bpf_testmod_doorbell *db, int fd)
+{
+	struct eventfd_ctx *ctx;
+	long ret = 0;
+
+	CLASS(fd, f)(fd);
+	if (fd_empty(f))
+		return -EBADF;
+
+	ctx = eventfd_ctx_fileget(fd_file(f));
+	if (IS_ERR(ctx))
+		return PTR_ERR(ctx);
+
+	mutex_lock(&db->lock);
+	if (db->ctx) {
+		mutex_unlock(&db->lock);
+		eventfd_ctx_put(ctx);
+		return -EBUSY;
+	}
+	db->ctx = ctx;
+	init_waitqueue_func_entry(&db->wait, bpf_testmod_db_wakeup);
+	init_poll_funcptr(&db->pt, bpf_testmod_db_ptqueue);
+	vfs_poll(fd_file(f), &db->pt);
+	mutex_unlock(&db->lock);
+	return ret;
+}
+
+static long bpf_testmod_db_ioctl(struct file *file, unsigned int cmd,
+				 unsigned long arg)
+{
+	struct bpf_testmod_doorbell *db = file->private_data;
+
+	switch (cmd) {
+	case BPF_TESTMOD_DB_IOC_BIND:
+		return bpf_testmod_db_bind(db, (int)arg);
+	case BPF_TESTMOD_DB_IOC_RINGS:
+		return put_user((u64)atomic64_read(&db->rings),
+				(u64 __user *)arg);
+	}
+	return -ENOTTY;
+}
+
+static int bpf_testmod_db_open(struct inode *inode, struct file *file)
+{
+	struct bpf_testmod_doorbell *db;
+
+	db = kzalloc(sizeof(*db), GFP_KERNEL);
+	if (!db)
+		return -ENOMEM;
+	mutex_init(&db->lock);
+	file->private_data = db;
+	return 0;
+}
+
+static int bpf_testmod_db_release(struct inode *inode, struct file *file)
+{
+	struct bpf_testmod_doorbell *db = file->private_data;
+	u64 cnt;
+
+	if (db->ctx) {
+		eventfd_ctx_remove_wait_queue(db->ctx, &db->wait, &cnt);
+		eventfd_ctx_put(db->ctx);
+	}
+	kfree(db);
+	return 0;
+}
+
+static const struct file_operations bpf_testmod_db_fops = {
+	.owner		= THIS_MODULE,
+	.open		= bpf_testmod_db_open,
+	.release	= bpf_testmod_db_release,
+	.unlocked_ioctl	= bpf_testmod_db_ioctl,
+};
+
+static struct miscdevice bpf_testmod_db_dev = {
+	.minor	= MISC_DYNAMIC_MINOR,
+	.name	= "bpf_testmod_doorbell",
+	.fops	= &bpf_testmod_db_fops,
+};
+
 static int bpf_testmod_init(void)
 {
 	const struct btf_id_dtor_kfunc bpf_testmod_dtors[] = {
@@ -1753,6 +1884,9 @@ static int bpf_testmod_init(void)
 	ret = register_bpf_testmod_uprobe();
 	if (ret < 0)
 		return ret;
+	ret = misc_register(&bpf_testmod_db_dev);
+	if (ret < 0)
+		return ret;
 
 	/* Ensure nothing is between tramp_1..tramp_40 */
 	BUILD_BUG_ON(offsetof(struct bpf_testmod_ops, tramp_1) + 40 * sizeof(long) !=
@@ -1775,6 +1909,7 @@ static void bpf_testmod_exit(void)
 		msleep(20);
 
 	bpf_kfunc_close_sock();
+	misc_deregister(&bpf_testmod_db_dev);
 	sysfs_remove_bin_file(kernel_kobj, &bin_attr_bpf_testmod_file);
 	unregister_bpf_testmod_uprobe();
 }
