@@ -88,7 +88,7 @@ log="$work/serial.log"
 	-kernel "$KERNEL" \
 	-initrd "$work/initramfs.cpio.gz" \
 	"${MACHINE[@]}" "${DTB_ARG[@]}" -m 1024 -smp 2 -no-reboot -nographic \
-	-append "console=${CONSOLE} panic=-1 ${WINDOW_CMDLINE}" \
+	-append "console=${CONSOLE} panic=-1 oops=panic ${WINDOW_CMDLINE}" \
 	2>&1 | tee "$log"
 
 echo "-------------------------------------------"
