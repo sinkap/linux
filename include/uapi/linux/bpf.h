@@ -1473,6 +1473,12 @@ enum {
  * RINGBUF / BPF_MAP_TYPE_USER_RINGBUF / BPF_MAP_TYPE_ARRAY.
  */
 	BPF_F_ARENA_BACKED	= (1U << 20),
+
+/* Back a map by a dma-buf: map_extra is the dma-buf fd. For an arena, its
+ * pages are pre-populated from the dma-buf so the arena can be shared with
+ * a peer that addresses the same dma-buf.
+ */
+	BPF_F_DMABUF		= (1U << 21),
 };
 
 /* Flags for BPF_PROG_QUERY. */
