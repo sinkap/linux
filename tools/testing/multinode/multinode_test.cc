@@ -871,6 +871,14 @@ int main(void)
 	test_negative();
 	test_fdlink();
 
+	/* The subtests close their maps, but the actual teardown runs in a
+	 * deferred workqueue item -- give it time to execute (and, with
+	 * oops=panic on the command line, to take the run down) before
+	 * declaring a verdict and powering off. Without this the free paths
+	 * are never exercised: the whole run completes in ~1s.
+	 */
+	usleep(500 * 1000);
+
 	printf("\nMULTINODE: %s (%d failure%s)\n",
 	       fails ? "FAIL" : "ALL PASS", fails, fails == 1 ? "" : "s");
 
