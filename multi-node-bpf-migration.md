@@ -473,13 +473,76 @@ write-combine so its store reaches DRAM). It is *not* sufficient for cases
 cannot) do — use the in-BPF drain (§6) there. See
 `ring_buffer__add_dmabuf()` in `tools/lib/bpf/libbpf.h` for the contract.
 
-## 7. fd links: only leaf file types
+## 7. fd links: dependency edges, one pin per external resource
 
-`BPF_LINK_TYPE_FD` (`attach_type BPF_DEPENDENT_FD`) now accepts only
-**eventfd** and **dma-buf** fds; pinning any other fd type returns
-`-EPERM` (reference-cycle safety). If you pinned other fd types, that no
-longer works. Link info now reports the kind/inode
-(`bpf_link_info.fd`).
+`BPF_LINK_TYPE_FD` (`attach_type BPF_DEPENDENT_FD`) pins an external fd
+in bpffs — and now records **which BPF object depends on it**. The link
+takes:
+
+- `target_fd` — the external fd. Only **leaf** file types: eventfd,
+  dma-buf, or a driver-registered kind
+  (`bpf_fd_link_register_kind(&fops, name)` — register your doorbell /
+  DMA-binding fops; a binding must hold `eventfd_ctx` / internal
+  attachments, never a `struct file`). Anything else: `-EPERM`.
+- `prog_fd` — the **anchor** (mandatory): a BPF link, prog, or map
+  (classified by fd type). An fd link always names the object that
+  depends on the fd — a link referencing no BPF object is rejected
+  (`-EINVAL`). The link holds a reference on the anchor, and
+  through the kernel's own graph everything downstream: an attach link
+  holds its prog, a prog its `used_maps`, an arena-backed map its arena,
+  the arena its dma-buf attachment. On release the anchor is dropped
+  *before* the external file.
+
+### The pin structure
+
+One directory per pipeline; each pin names a dependency:
+
+```
+/sys/fs/bpf/telemetry0/
+├── prog_link    attach link pin      → prog → used_maps (ringbuf, arrays)
+├── ring_efd     fd-link { notify eventfd,   anchor: ringbuf map }
+├── ring_mbox    fd-link { doorbell binding, anchor: ringbuf map }
+└── arena_iova   fd-link { DMA-bind fd,      anchor: arena map   }
+```
+
+No separate map pins: each map-anchored fd-link doubles as the map's
+pin, and the arena/dma-buf ride the reference graph. The eventfd pin
+keeps the eventfd *file* alive, so `POLLHUP` is never delivered to the
+doorbell binding and the fd stays reacquirable. Partial operations are
+meaningful units — `rm ring_mbox` rewires the doorbell without touching
+the ring; `rm arena_iova` fences the device while the CPU-side window
+persists — and `rm -r` of the directory is full teardown, unwinding
+anchor-before-file at every link.
+
+### Restart: BPF_LINK_GET_DEP_FD
+
+`BPF_OBJ_GET` on a pin returns the *link* fd; the new
+`BPF_LINK_GET_DEP_FD { link_fd, which }` unwraps it:
+`BPF_FD_LINK_DEP_EXTERNAL` returns the wrapped fd,
+`BPF_FD_LINK_DEP_ANCHOR` the anchored link/prog/map fd
+(libbpf: `bpf_link_get_dep_fd()`). A restarted loader recovers the full
+working set from bpffs paths alone; deeper objects come from
+`link_info → prog_id → map_ids → *_GET_FD_BY_ID`. Gated by
+`bpf_capable()` plus the pin's FS ACLs. `bpf_link_info.fd` reports
+`anchor_kind`/`anchor_id`, and the link's fdinfo prints the anchor, so
+the edges are visible from the outside.
+
+### The whole flow
+
+1. **Boot**: carveout heap from DT; drivers register their binding fops
+   as pinnable kinds.
+2. **Loader (one-shot)**: alloc window dma-buf → dma-buf arena → maps in
+   the arena (`notify_fd` = eventfd on the ring) → load + attach prog →
+   driver ioctls (DMA bind, doorbell bind on the same eventfd) →
+   fd-links per the table above → pin → exit.
+3. **Steady state**: zero userspace. Commit → `eventfd_signal()` →
+   binding writes the doorbell register → peer wakes, reads the window
+   at `arena_off`, syncs `consumer_pos` back out of band.
+4. **Restart**: reopen pins, `GET_DEP_FD` both sides of each, resume.
+5. **Teardown**: `rm -r` the directory. Reference counts make
+   use-after-free unrepresentable; no steady-state partial
+   configuration can exist because every partial state requires an
+   explicit named unpin.
 
 ## Quick checklist
 
@@ -503,4 +566,9 @@ longer works. Link info now reports the kind/inode
       the doorbell driver binds the same eventfd irqfd-style and writes
       the register. The BPF program just commits records — no MMIO
       kfuncs, no kptr (§5).
-- [ ] Ensure any pinned fd links are eventfd or dma-buf only (§7).
+- [ ] One bpffs directory per pipeline: attach-link pin + one anchored
+      fd-link per external resource (eventfd, doorbell binding, DMA
+      bind), each anchored at the map/arena it serves (§7). Register
+      driver fd types with `bpf_fd_link_register_kind()`.
+- [ ] Restart = reopen pins + `BPF_LINK_GET_DEP_FD`; teardown = remove
+      the directory (§7).
