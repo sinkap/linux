@@ -750,12 +750,24 @@ static void test_negative(void)
 	close(db);
 }
 
-static int link_create_fd(int target)
+static int link_create_fd(int target, int anchor)
 {
 	union bpf_attr a = {};
 	a.link_create.target_fd = (uint32_t)target;
+	a.link_create.prog_fd = (uint32_t)anchor;	/* mandatory anchor */
 	a.link_create.attach_type = BPF_DEPENDENT_FD;
 	return sys_bpf(BPF_LINK_CREATE, &a);
+}
+
+/* every fd link names the BPF object that depends on the fd */
+static int fdlink_anchor_map(void)
+{
+	union bpf_attr ma = {};
+	ma.map_type = BPF_MAP_TYPE_ARRAY;
+	ma.key_size = 4;
+	ma.value_size = 4;
+	ma.max_entries = 1;
+	return sys_bpf(BPF_MAP_CREATE, &ma);
 }
 
 static bool fdinfo_contains(int fd, const char *needle)
@@ -777,9 +789,72 @@ static void test_fdlink(void)
 {
 	printf("== fd link ==\n");
 
+	int fdl_anchor = fdlink_anchor_map();
+	CHECK(fdl_anchor >= 0, "fd link anchor map");
+
+	/* anchored dependency: fd-link { eventfd, anchor: map }. The link
+	 * holds the map; GET_DEP_FD reacquires both sides -- the restart
+	 * path of the pin structure (see the migration guide).
+	 */
+	{
+		union bpf_attr ma = {};
+		ma.map_type = BPF_MAP_TYPE_ARRAY;
+		ma.key_size = 4;
+		ma.value_size = 8;
+		ma.max_entries = 4;
+		int arr = sys_bpf(BPF_MAP_CREATE, &ma);
+		int aev = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+		CHECK(arr >= 0 && aev >= 0, "anchored: array + eventfd");
+
+		struct bpf_map_info mi = {};
+		union bpf_attr ia = {};
+		ia.info.bpf_fd = (uint32_t)arr;
+		ia.info.info_len = sizeof(mi);
+		ia.info.info = (uint64_t)(unsigned long)&mi;
+		sys_bpf(BPF_OBJ_GET_INFO_BY_FD, &ia);
+		uint32_t map_id = mi.id;
+
+		union bpf_attr la = {};
+		la.link_create.target_fd = (uint32_t)aev;
+		la.link_create.prog_fd = (uint32_t)arr;	/* the anchor */
+		la.link_create.attach_type = BPF_DEPENDENT_FD;
+		int alink = sys_bpf(BPF_LINK_CREATE, &la);
+		CHECK(alink >= 0, "create anchored fd link");
+
+		close(arr);	/* the link now keeps the map alive */
+
+		union bpf_attr ga = {};
+		ga.link_get_dep.link_fd = (uint32_t)alink;
+		ga.link_get_dep.which = BPF_FD_LINK_DEP_ANCHOR;
+		int r_map = sys_bpf(BPF_LINK_GET_DEP_FD, &ga);
+		CHECK(r_map >= 0, "reacquire anchor (map)");
+		if (r_map >= 0) {
+			struct bpf_map_info mi2 = {};
+			union bpf_attr ia2 = {};
+			ia2.info.bpf_fd = (uint32_t)r_map;
+			ia2.info.info_len = sizeof(mi2);
+			ia2.info.info = (uint64_t)(unsigned long)&mi2;
+			sys_bpf(BPF_OBJ_GET_INFO_BY_FD, &ia2);
+			CHECK(mi2.id == map_id, "anchor is the same map");
+			close(r_map);
+		}
+		ga.link_get_dep.which = BPF_FD_LINK_DEP_EXTERNAL;
+		int r_ev = sys_bpf(BPF_LINK_GET_DEP_FD, &ga);
+		CHECK(r_ev >= 0, "reacquire external (eventfd)");
+		if (r_ev >= 0) {
+			uint64_t v = 1, out = 0;
+			CHECK(write(aev, &v, sizeof(v)) == (ssize_t)sizeof(v) &&
+			      read(r_ev, &out, sizeof(out)) == (ssize_t)sizeof(out) &&
+			      out >= 1, "reacquired eventfd is the same one");
+			close(r_ev);
+		}
+		close(alink);
+		close(aev);
+	}
+
 	/* eventfd: a leaf file, allowed */
 	int ev = eventfd(0, EFD_CLOEXEC);
-	int link = link_create_fd(ev);
+	int link = link_create_fd(ev, fdl_anchor);
 	CHECK(link >= 0, "create fd link over eventfd");
 	if (link >= 0) {
 		struct bpf_link_info info = {};
@@ -802,7 +877,7 @@ static void test_fdlink(void)
 	/* dma-buf: also a leaf, allowed */
 	int db = dmabuf_alloc(1);
 	if (db >= 0) {
-		int l = link_create_fd(db);
+		int l = link_create_fd(db, fdl_anchor);
 		CHECK(l >= 0, "create fd link over dma-buf");
 		if (l >= 0) {
 			struct bpf_link_info info = {};
@@ -821,7 +896,7 @@ static void test_fdlink(void)
 	/* a pipe is not a whitelisted leaf type: rejected */
 	int pfd[2];
 	if (pipe(pfd) == 0) {
-		int bad = link_create_fd(pfd[0]);
+		int bad = link_create_fd(pfd[0], fdl_anchor);
 		CHECK(bad < 0 && errno == EPERM,
 		      "non-whitelisted fd rejected (EPERM)");
 		if (bad >= 0)
@@ -829,6 +904,19 @@ static void test_fdlink(void)
 		close(pfd[0]);
 		close(pfd[1]);
 	}
+
+	/* an fd link without an anchor is not a dependency: rejected */
+	{
+		int aev = eventfd(0, EFD_CLOEXEC);
+		int bare = link_create_fd(aev, 0);
+		CHECK(bare < 0 && errno == EINVAL,
+		      "anchorless fd link rejected (EINVAL)");
+		if (bare >= 0)
+			close(bare);
+		close(aev);
+	}
+
+	close(fdl_anchor);
 }
 
 /*
