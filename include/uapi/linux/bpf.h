@@ -1199,6 +1199,19 @@ enum bpf_fd_link_kind {
 	BPF_FD_LINK_KIND_EXTERNAL,	/* driver-registered pinnable fd */
 };
 
+/* Kind of BPF object a BPF_LINK_TYPE_FD link is anchored to
+ * (bpf_link_info.fd.anchor_kind). The link holds a reference on the anchor:
+ * pinning the link keeps the anchor -- and everything the anchor references
+ * (a link holds its prog, a prog its maps, an arena-backed map its arena,
+ * an arena its dma-buf) -- alive.
+ */
+enum bpf_fd_link_anchor_kind {
+	BPF_FD_LINK_ANCHOR_NONE = 0,
+	BPF_FD_LINK_ANCHOR_LINK,
+	BPF_FD_LINK_ANCHOR_PROG,
+	BPF_FD_LINK_ANCHOR_MAP,
+};
+
 enum bpf_perf_event_type {
 	BPF_PERF_EVENT_UNSPEC = 0,
 	BPF_PERF_EVENT_UPROBE = 1,
@@ -6832,6 +6845,8 @@ struct bpf_link_info {
 		struct {
 			__u64 ino;	/* inode of the pinned file */
 			__u32 kind;	/* enum bpf_fd_link_kind */
+			__u32 anchor_kind; /* enum bpf_fd_link_anchor_kind */
+			__u32 anchor_id;   /* id of the anchored link/prog/map */
 		} fd;
 		struct {
 			__u32 pf;
