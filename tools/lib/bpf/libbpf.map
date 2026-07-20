@@ -449,6 +449,7 @@ LIBBPF_1.6.0 {
 
 LIBBPF_1.7.0 {
 	global:
+		bpf_link_get_dep_fd;
 		bpf_map__set_exclusive_program;
 		bpf_map__exclusive_program;
 		ring_buffer__add_dmabuf;
