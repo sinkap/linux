@@ -5324,13 +5324,76 @@ struct bpf_fd_link {
 	struct bpf_link link;
 	struct file *external_file;
 	__u32 kind;		/* BPF_FD_LINK_KIND_* */
+	/* Optional BPF object this dependency is anchored to. The link holds
+	 * a reference: pinning the link keeps the anchor -- and everything
+	 * the anchor transitively references -- alive.
+	 */
+	__u32 anchor_kind;	/* BPF_FD_LINK_ANCHOR_* */
+	union {
+		struct bpf_link *link;
+		struct bpf_prog *prog;
+		struct bpf_map *map;
+	} anchor;
 };
+
+/* Resolve an anchor fd to a BPF object reference: a link, a program, or a
+ * map, tried in that order (the fd's file type decides; the error of the
+ * last attempt is returned if none match).
+ */
+static int bpf_fd_link_get_anchor(struct bpf_fd_link *efl, u32 fd)
+{
+	struct bpf_link *link;
+	struct bpf_prog *prog;
+	struct bpf_map *map;
+
+	link = bpf_link_get_from_fd(fd);
+	if (!IS_ERR(link)) {
+		efl->anchor_kind = BPF_FD_LINK_ANCHOR_LINK;
+		efl->anchor.link = link;
+		return 0;
+	}
+	prog = bpf_prog_get(fd);
+	if (!IS_ERR(prog)) {
+		efl->anchor_kind = BPF_FD_LINK_ANCHOR_PROG;
+		efl->anchor.prog = prog;
+		return 0;
+	}
+	map = bpf_map_get(fd);
+	if (!IS_ERR(map)) {
+		efl->anchor_kind = BPF_FD_LINK_ANCHOR_MAP;
+		efl->anchor.map = map;
+		return 0;
+	}
+	return PTR_ERR(map);
+}
+
+static void bpf_fd_link_put_anchor(struct bpf_fd_link *efl)
+{
+	switch (efl->anchor_kind) {
+	case BPF_FD_LINK_ANCHOR_LINK:
+		bpf_link_put(efl->anchor.link);
+		break;
+	case BPF_FD_LINK_ANCHOR_PROG:
+		bpf_prog_put(efl->anchor.prog);
+		break;
+	case BPF_FD_LINK_ANCHOR_MAP:
+		bpf_map_put(efl->anchor.map);
+		break;
+	}
+	efl->anchor_kind = BPF_FD_LINK_ANCHOR_NONE;
+}
 
 static void bpf_fd_link_release(struct bpf_link *link)
 {
 	struct bpf_fd_link *efl =
 		container_of(link, struct bpf_fd_link, link);
 
+	/* Drop the anchor before the external file: the BPF side (hooks,
+	 * progs, maps, arena, its dma-buf) starts tearing down before the
+	 * external dependency (a doorbell binding, a device DMA binding)
+	 * goes away.
+	 */
+	bpf_fd_link_put_anchor(efl);
 	if (efl->external_file) {
 		fput(efl->external_file);
 		efl->external_file = NULL;
@@ -5342,6 +5405,7 @@ static void bpf_fd_link_dealloc(struct bpf_link *link)
 	struct bpf_fd_link *efl =
 		container_of(link, struct bpf_fd_link, link);
 
+	bpf_fd_link_put_anchor(efl);
 	if (efl->external_file)
 		fput(efl->external_file);
 	kfree(efl);
@@ -5357,6 +5421,18 @@ static int bpf_fd_link_fill_info(const struct bpf_link *link,
 	info->fd.kind = efl->kind;
 	if (efl->external_file)
 		info->fd.ino = file_inode(efl->external_file)->i_ino;
+	info->fd.anchor_kind = efl->anchor_kind;
+	switch (efl->anchor_kind) {
+	case BPF_FD_LINK_ANCHOR_LINK:
+		info->fd.anchor_id = efl->anchor.link->id;
+		break;
+	case BPF_FD_LINK_ANCHOR_PROG:
+		info->fd.anchor_id = efl->anchor.prog->aux->id;
+		break;
+	case BPF_FD_LINK_ANCHOR_MAP:
+		info->fd.anchor_id = efl->anchor.map->id;
+		break;
+	}
 	return 0;
 }
 
@@ -5374,6 +5450,17 @@ static void bpf_fd_link_show_fdinfo(const struct bpf_link *link,
 		seq_printf(seq, "fd_kind:\t%s\n", name);
 	} else {
 		seq_printf(seq, "fd_kind:\t%s\n", bpf_fd_link_kind_str(efl->kind));
+	}
+	switch (efl->anchor_kind) {
+	case BPF_FD_LINK_ANCHOR_LINK:
+		seq_printf(seq, "anchor:\tlink %u\n", efl->anchor.link->id);
+		break;
+	case BPF_FD_LINK_ANCHOR_PROG:
+		seq_printf(seq, "anchor:\tprog %u\n", efl->anchor.prog->aux->id);
+		break;
+	case BPF_FD_LINK_ANCHOR_MAP:
+		seq_printf(seq, "anchor:\tmap %u\n", efl->anchor.map->id);
+		break;
 	}
 	if (efl->external_file)
 		seq_printf(seq, "fd_ino:\t%llu\n",
@@ -5406,6 +5493,13 @@ static int bpf_fd_link_create(union bpf_attr *attr)
 	if (!bpf_capable())
 		return -EPERM;
 
+	/* The anchor is mandatory: a link that references no BPF object is
+	 * generic fd parking, not a BPF dependency. Every external fd names
+	 * the object that depends on it.
+	 */
+	if (!attr->link_create.prog_fd)
+		return -EINVAL;
+
 	/* Pin the file first, then classify the pinned file: classifying the
 	 * fd and fget()'ing it separately would let a dup2() swap in a
 	 * different file in between.
@@ -5435,6 +5529,16 @@ static int bpf_fd_link_create(union bpf_attr *attr)
 	}
 	efl->kind = err;
 
+	/* The anchor: the BPF object (link, prog, or map) that depends on
+	 * the external fd.
+	 */
+	err = bpf_fd_link_get_anchor(efl, attr->link_create.prog_fd);
+	if (err) {
+		fput(external_file);
+		kfree(efl);
+		return err;
+	}
+
 	/* this base's bpf_link_init() does not record an attach_type; the
 	 * BPF_DEPENDENT_FD routing happens in link_create()
 	 */
@@ -5443,6 +5547,7 @@ static int bpf_fd_link_create(union bpf_attr *attr)
 
 	err = bpf_link_prime(&efl->link, &link_primer);
 	if (err) {
+		bpf_fd_link_put_anchor(efl);
 		fput(external_file);
 		kfree(efl);
 		return err;
