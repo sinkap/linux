@@ -5556,6 +5556,72 @@ static int bpf_fd_link_create(union bpf_attr *attr)
 	return bpf_link_settle(&link_primer);
 }
 
+#define BPF_LINK_GET_DEP_FD_LAST_FIELD link_get_dep.which
+/* Reacquire one side of a pinned BPF_LINK_TYPE_FD link: the wrapped
+ * external fd or the anchored BPF object. This is the restart path: a
+ * process that reaches the link through its bpffs pin (FS ACLs) gets the
+ * original resources back; without it a pin keeps things alive but can
+ * never hand them out again. Same privilege gate as creating the link.
+ */
+static int bpf_link_get_dep_fd(union bpf_attr *attr)
+{
+	struct bpf_fd_link *efl;
+	struct bpf_link *link;
+	int fd = -EINVAL;
+
+	if (CHECK_ATTR(BPF_LINK_GET_DEP_FD))
+		return -EINVAL;
+
+	if (!bpf_capable())
+		return -EPERM;
+
+	link = bpf_link_get_from_fd(attr->link_get_dep.link_fd);
+	if (IS_ERR(link))
+		return PTR_ERR(link);
+	if (link->ops != &bpf_fd_link_ops) {
+		bpf_link_put(link);
+		return -EINVAL;
+	}
+	efl = container_of(link, struct bpf_fd_link, link);
+
+	switch (attr->link_get_dep.which) {
+	case BPF_FD_LINK_DEP_EXTERNAL:
+		if (!efl->external_file)
+			break;
+		fd = get_unused_fd_flags(O_CLOEXEC);
+		if (fd >= 0) {
+			get_file(efl->external_file);
+			fd_install(fd, efl->external_file);
+		}
+		break;
+	case BPF_FD_LINK_DEP_ANCHOR:
+		switch (efl->anchor_kind) {
+		case BPF_FD_LINK_ANCHOR_LINK:
+			bpf_link_inc(efl->anchor.link);
+			fd = bpf_link_new_fd(efl->anchor.link);
+			if (fd < 0)
+				bpf_link_put(efl->anchor.link);
+			break;
+		case BPF_FD_LINK_ANCHOR_PROG:
+			bpf_prog_inc(efl->anchor.prog);
+			fd = bpf_prog_new_fd(efl->anchor.prog);
+			if (fd < 0)
+				bpf_prog_put(efl->anchor.prog);
+			break;
+		case BPF_FD_LINK_ANCHOR_MAP:
+			bpf_map_inc(efl->anchor.map);
+			fd = bpf_map_new_fd(efl->anchor.map, O_RDWR);
+			if (fd < 0)
+				bpf_map_put(efl->anchor.map);
+			break;
+		}
+		break;
+	}
+
+	bpf_link_put(link);
+	return fd;
+}
+
 #define BPF_LINK_CREATE_LAST_FIELD link_create.uprobe_multi.pid
 static int link_create(union bpf_attr *attr, bpfptr_t uattr)
 {
@@ -6135,6 +6201,9 @@ static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 		break;
 	case BPF_TOKEN_CREATE:
 		err = token_create(&attr);
+		break;
+	case BPF_LINK_GET_DEP_FD:
+		err = bpf_link_get_dep_fd(&attr);
 		break;
 	default:
 		err = -EINVAL;

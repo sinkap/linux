@@ -449,6 +449,11 @@ LIBBPF_API int bpf_link_create(int prog_fd, int target_fd,
 			       const struct bpf_link_create_opts *opts);
 
 LIBBPF_API int bpf_link_detach(int link_fd);
+/* Reacquire one side of a BPF_LINK_TYPE_FD link: which is
+ * BPF_FD_LINK_DEP_EXTERNAL (the wrapped fd) or BPF_FD_LINK_DEP_ANCHOR
+ * (the anchored link/prog/map). Returns a new fd or a negative errno.
+ */
+LIBBPF_API int bpf_link_get_dep_fd(int link_fd, __u32 which);
 
 struct bpf_link_update_opts {
 	size_t sz; /* size of this struct for forward/backward compatibility */
