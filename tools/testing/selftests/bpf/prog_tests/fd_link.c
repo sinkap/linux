@@ -15,13 +15,22 @@
 #include <sys/eventfd.h>
 #include <linux/udmabuf.h>
 
-static int link_create_fd(int target)
+static int link_create_fd(int target, int anchor)
 {
 	union bpf_attr attr = {};
 
 	attr.link_create.target_fd = target;
+	attr.link_create.prog_fd = anchor;	/* mandatory */
 	attr.link_create.attach_type = BPF_DEPENDENT_FD;
 	return syscall(__NR_bpf, BPF_LINK_CREATE, &attr, sizeof(attr));
+}
+
+/* every fd link names the BPF object depending on the fd; tests anchor
+ * to a scratch map
+ */
+static int scratch_anchor(void)
+{
+	return bpf_map_create(BPF_MAP_TYPE_ARRAY, "fdl_anchor", 4, 4, 1, NULL);
 }
 
 static int get_link_info(int link, struct bpf_link_info *info)
@@ -53,13 +62,18 @@ static bool fdinfo_contains(int fd, const char *needle)
 static void subtest_eventfd(void)
 {
 	struct bpf_link_info info;
-	int ev, link;
+	int ev, link, anchor;
 
-	ev = eventfd(0, EFD_CLOEXEC);
-	if (!ASSERT_OK_FD(ev, "eventfd"))
+	anchor = scratch_anchor();
+	if (!ASSERT_OK_FD(anchor, "anchor map"))
 		return;
+	ev = eventfd(0, EFD_CLOEXEC);
+	if (!ASSERT_OK_FD(ev, "eventfd")) {
+		close(anchor);
+		return;
+	}
 
-	link = link_create_fd(ev);
+	link = link_create_fd(ev, anchor);
 	if (!ASSERT_OK_FD(link, "link over eventfd"))
 		goto out;
 
@@ -73,17 +87,23 @@ static void subtest_eventfd(void)
 	close(link);
 out:
 	close(ev);
+	close(anchor);
 }
 
 static void subtest_dmabuf(void)
 {
 	struct udmabuf_create create;
 	struct bpf_link_info info;
-	int memfd, dev, dmabuf, link;
+	int memfd, dev, dmabuf, link, anchor;
 
-	memfd = memfd_create("fd_link_buf", MFD_ALLOW_SEALING);
-	if (!ASSERT_OK_FD(memfd, "memfd_create"))
+	anchor = scratch_anchor();
+	if (!ASSERT_OK_FD(anchor, "anchor map"))
 		return;
+	memfd = memfd_create("fd_link_buf", MFD_ALLOW_SEALING);
+	if (!ASSERT_OK_FD(memfd, "memfd_create")) {
+		close(anchor);
+		return;
+	}
 	if (!ASSERT_OK(ftruncate(memfd, getpagesize()), "ftruncate"))
 		goto close_memfd;
 	if (!ASSERT_OK(fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK), "seal"))
@@ -103,7 +123,7 @@ static void subtest_dmabuf(void)
 	if (!ASSERT_OK_FD(dmabuf, "udmabuf create"))
 		goto close_memfd;
 
-	link = link_create_fd(dmabuf);
+	link = link_create_fd(dmabuf, anchor);
 	if (ASSERT_OK_FD(link, "link over dma-buf")) {
 		if (ASSERT_OK(get_link_info(link, &info), "link info"))
 			ASSERT_EQ(info.fd.kind, BPF_FD_LINK_KIND_DMABUF,
@@ -113,21 +133,32 @@ static void subtest_dmabuf(void)
 	close(dmabuf);
 close_memfd:
 	close(memfd);
+	close(anchor);
 }
 
 static void subtest_rejected(void)
 {
-	int pfd[2], link;
+	int pfd[2], link, anchor;
 
-	if (!ASSERT_OK(pipe(pfd), "pipe"))
+	anchor = scratch_anchor();
+	if (!ASSERT_OK(pipe(pfd), "pipe")) {
+		close(anchor);
 		return;
+	}
 
-	link = link_create_fd(pfd[0]);
+	link = link_create_fd(pfd[0], anchor);
 	if (!ASSERT_ERR(link, "non-leaf fd rejected"))
 		close(link);
 	ASSERT_EQ(errno, EPERM, "rejected with EPERM");
+
+	/* an fd link without an anchor is not a dependency: rejected */
+	link = link_create_fd(pfd[0], 0);
+	if (!ASSERT_ERR(link, "anchorless link rejected"))
+		close(link);
+
 	close(pfd[0]);
 	close(pfd[1]);
+	close(anchor);
 }
 
 void test_fd_link(void)
