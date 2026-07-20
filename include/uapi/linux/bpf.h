@@ -993,6 +993,7 @@ enum bpf_cmd {
 	BPF_TOKEN_CREATE,
 	BPF_PROG_STREAM_READ_BY_FD,
 	BPF_PROG_ASSOC_STRUCT_OPS,
+	BPF_LINK_GET_DEP_FD,
 	__MAX_BPF_CMD,
 	BPF_COMMON_ATTRS = 1 << 16, /* Indicate carrying syscall common attrs. */
 };
@@ -1210,6 +1211,12 @@ enum bpf_fd_link_anchor_kind {
 	BPF_FD_LINK_ANCHOR_LINK,
 	BPF_FD_LINK_ANCHOR_PROG,
 	BPF_FD_LINK_ANCHOR_MAP,
+};
+
+/* BPF_LINK_GET_DEP_FD: which side of a BPF_LINK_TYPE_FD link to reacquire. */
+enum bpf_fd_link_dep {
+	BPF_FD_LINK_DEP_EXTERNAL = 1,	/* the wrapped external fd */
+	BPF_FD_LINK_DEP_ANCHOR = 2,	/* the anchored link/prog/map */
 };
 
 enum bpf_perf_event_type {
@@ -1972,6 +1979,11 @@ union bpf_attr {
 		__u32		prog_fd;
 		__u32		flags;
 	} prog_assoc_struct_ops;
+
+	struct { /* struct used by BPF_LINK_GET_DEP_FD command */
+		__u32		link_fd;	/* a BPF_LINK_TYPE_FD link */
+		__u32		which;		/* enum bpf_fd_link_dep */
+	} link_get_dep;
 
 } __attribute__((aligned(8)));
 

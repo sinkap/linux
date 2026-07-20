@@ -1004,6 +1004,20 @@ int bpf_link_detach(int link_fd)
 	return libbpf_err_errno(ret);
 }
 
+int bpf_link_get_dep_fd(int link_fd, __u32 which)
+{
+	const size_t attr_sz = offsetofend(union bpf_attr, link_get_dep);
+	union bpf_attr attr;
+	int fd;
+
+	memset(&attr, 0, attr_sz);
+	attr.link_get_dep.link_fd = link_fd;
+	attr.link_get_dep.which = which;
+
+	fd = sys_bpf_fd(BPF_LINK_GET_DEP_FD, &attr, attr_sz);
+	return libbpf_err_errno(fd);
+}
+
 int bpf_link_update(int link_fd, int new_prog_fd,
 		    const struct bpf_link_update_opts *opts)
 {
