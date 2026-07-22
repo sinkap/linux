@@ -225,27 +225,27 @@ static const struct dma_heap_ops carveout_heap_ops = {
 	.allocate = carveout_allocate,
 };
 
-static int __init carveout_heap_setup(struct device_node *node)
+/*
+ * Expose [base, base+size) as an exclusive carveout dma-heap named @name.
+ * The region must be reserved RAM with valid struct pages (a DT
+ * reserved-memory node without `no-map`, or a reserve_mem= region) so the
+ * resulting dma-buf is page-backed and can back a BPF map.
+ */
+static int __init carveout_heap_add(const char *name, phys_addr_t base,
+				    phys_addr_t size)
 {
 	struct dma_heap_export_info exp_info = {};
-	const struct reserved_mem *rmem;
 	struct carveout_heap *ch;
 	int ret;
 
-	rmem = of_reserved_mem_lookup(node);
-	if (!rmem)
-		return -EINVAL;
-
 	/*
-	 * A static `reg` can carry any value. An unaligned base would make
-	 * gen_pool hand out unaligned paddrs whose PHYS_PFN() truncates into
-	 * memory before the region; an unaligned size would leave a partial
-	 * tail page in the pool. Reject both up front.
+	 * An unaligned base would make gen_pool hand out unaligned paddrs
+	 * whose PHYS_PFN() truncates into memory before the region; an
+	 * unaligned size would leave a partial tail page in the pool.
 	 */
-	if (!rmem->size || !PAGE_ALIGNED(rmem->base) ||
-	    !PAGE_ALIGNED(rmem->size)) {
-		pr_err("%pOFn: base %pa / size %pa must be non-zero and page-aligned\n",
-		       node, &rmem->base, &rmem->size);
+	if (!size || !PAGE_ALIGNED(base) || !PAGE_ALIGNED(size)) {
+		pr_err("%s: base %pa / size %pa must be non-zero and page-aligned\n",
+		       name, &base, &size);
 		return -EINVAL;
 	}
 
@@ -258,11 +258,11 @@ static int __init carveout_heap_setup(struct device_node *node)
 		ret = -ENOMEM;
 		goto err_free;
 	}
-	ret = gen_pool_add(ch->pool, rmem->base, rmem->size, NUMA_NO_NODE);
+	ret = gen_pool_add(ch->pool, base, size, NUMA_NO_NODE);
 	if (ret)
 		goto err_pool;
 
-	exp_info.name = node->full_name;
+	exp_info.name = name;
 	exp_info.ops = &carveout_heap_ops;
 	exp_info.priv = ch;
 
@@ -272,8 +272,7 @@ static int __init carveout_heap_setup(struct device_node *node)
 		goto err_pool;
 	}
 
-	pr_info("%pOFn: %zu MiB at %pa\n", node,
-		(size_t)rmem->size / SZ_1M, &rmem->base);
+	pr_info("%s: %zu MiB at %pa\n", name, (size_t)size / SZ_1M, &base);
 	return 0;
 
 err_pool:
@@ -283,26 +282,76 @@ err_free:
 	return ret;
 }
 
+static int __init carveout_heap_of_setup(struct device_node *node)
+{
+	const struct reserved_mem *rmem;
+
+	rmem = of_reserved_mem_lookup(node);
+	if (!rmem)
+		return -EINVAL;
+	return carveout_heap_add(node->full_name, rmem->base, rmem->size);
+}
+
+/*
+ * Regions reserved via the arch-generic reserve_mem= command line
+ * (e.g. on x86, which has no /reserved-memory device tree): opt in by
+ * naming them in carveout_heap.export=<name>[,<name>...]. reserve_mem
+ * keeps the region as reserved RAM with struct pages, matching a DT
+ * reserved-memory node without `no-map`.
+ */
+static char *carveout_export;
+module_param_named(export, carveout_export, charp, 0444);
+MODULE_PARM_DESC(export,
+		 "comma-separated reserve_mem region names to expose as carveout heaps");
+
+static void __init carveout_heap_reserve_mem_setup(void)
+{
+	char *list, *p, *name;
+
+	if (!carveout_export)
+		return;
+	list = kstrdup(carveout_export, GFP_KERNEL);
+	if (!list)
+		return;
+	p = list;
+	while ((name = strsep(&p, ","))) {
+		phys_addr_t start, size;
+
+		if (!*name)
+			continue;
+		if (!reserve_mem_find_by_name(name, &start, &size)) {
+			pr_warn("%s: no reserve_mem region by that name\n", name);
+			continue;
+		}
+		if (carveout_heap_add(name, start, size))
+			pr_warn("%s: failed to add carveout heap\n", name);
+	}
+	kfree(list);
+}
+
 static int __init carveout_heap_init(void)
 {
 	struct device_node *rmem_node, *node;
 
+	/* Device-tree path: /reserved-memory nodes that opt in with export. */
 	rmem_node = of_find_node_by_path("/reserved-memory");
-	if (!rmem_node)
-		return 0;
-
-	for_each_child_of_node(rmem_node, node) {
-		/* Handled by their own allocators; not exclusive carveouts. */
-		if (of_device_is_compatible(node, "shared-dma-pool") ||
-		    of_device_is_compatible(node, "restricted-dma-pool"))
-			continue;
-		if (!of_property_read_bool(node, "export"))
-			continue;
-		if (carveout_heap_setup(node))
-			pr_warn("%pOFn: failed to add carveout heap\n", node);
+	if (rmem_node) {
+		for_each_child_of_node(rmem_node, node) {
+			/* Handled by their own allocators. */
+			if (of_device_is_compatible(node, "shared-dma-pool") ||
+			    of_device_is_compatible(node, "restricted-dma-pool"))
+				continue;
+			if (!of_property_read_bool(node, "export"))
+				continue;
+			if (carveout_heap_of_setup(node))
+				pr_warn("%pOFn: failed to add carveout heap\n",
+					node);
+		}
+		of_node_put(rmem_node);
 	}
 
-	of_node_put(rmem_node);
+	/* Arch-generic path: reserve_mem= regions named in carveout_heap.export. */
+	carveout_heap_reserve_mem_setup();
 	return 0;
 }
 module_init(carveout_heap_init);
