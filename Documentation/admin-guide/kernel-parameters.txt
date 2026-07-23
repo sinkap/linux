@@ -5797,6 +5797,11 @@
 
 			reserve_mem=2M:2M:agent_win@0x20000000
 
+			On x86 a fixed-base region is reserved early enough to
+			survive page-table setup, so a base at the very top of
+			RAM is honoured rather than lost to the kernel's own
+			top-down page-table allocations.
+
 	reservetop=	[X86-32,EARLY]
 			Format: nn[KMG]
 			Reserves a hole at the top of the kernel virtual

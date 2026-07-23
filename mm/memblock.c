@@ -2306,24 +2306,21 @@ int reserve_mem_find_by_name(const char *name, phys_addr_t *start, phys_addr_t *
 EXPORT_SYMBOL_GPL(reserve_mem_find_by_name);
 
 /*
- * Parse reserve_mem=nn:align:name[@base]
+ * Parse "nn[KMG]:align:name[@base]" in place (the '@' and ':' separators are
+ * NUL'd in @p). Returns 0 and fills the out params, or -EINVAL. Does no
+ * reservation, so it is safe to call from more than one pass.
  */
-static int __init reserve_mem(char *p)
+static int __init parse_reserve_mem(char *p, phys_addr_t *psize,
+				    phys_addr_t *palign, char **pname,
+				    phys_addr_t *pbase, bool *phave_base)
 {
-	phys_addr_t start, size, align, tmp;
-	phys_addr_t base = 0;
+	phys_addr_t size, align, base = 0;
 	bool have_base = false;
-	char *name;
-	char *oldp;
-	char *at;
+	char *name, *oldp, *at;
 	int len;
 
 	if (!p)
 		return -EINVAL;
-
-	/* Check if there's room for more reserved memory */
-	if (reserved_mem_count >= RESERVE_MEM_MAX_ENTRIES)
-		return -EBUSY;
 
 	oldp = p;
 	size = memparse(p, &p);
@@ -2333,7 +2330,7 @@ static int __init reserve_mem(char *p)
 	if (*p != ':')
 		return -EINVAL;
 
-	align = memparse(p+1, &p);
+	align = memparse(p + 1, &p);
 	if (*p != ':')
 		return -EINVAL;
 
@@ -2377,36 +2374,147 @@ static int __init reserve_mem(char *p)
 	if (!*p)
 		return -EINVAL;
 
-	/* Make sure the name is not already used */
-	if (reserve_mem_find_by_name(name, &start, &tmp))
+	*psize = size;
+	*palign = align;
+	*pname = name;
+	*pbase = base;
+	*phave_base = have_base;
+	return 0;
+}
+
+/*
+ * Reserve a fixed-base region at exactly @base and register it. The base must
+ * honour @align, lie entirely within usable memory, and not overlap an
+ * existing reservation; any failure is fatal (no fallback to dynamic
+ * placement). Returns 0 on success or a negative errno.
+ */
+static int __init reserve_mem_fixed(phys_addr_t base, phys_addr_t size,
+				    phys_addr_t align, const char *name)
+{
+	if (!IS_ALIGNED(base, align)) {
+		pr_err("reserve_mem: base %pa not aligned to %pa\n",
+		       &base, &align);
+		return -EINVAL;
+	}
+	if (!memblock_is_region_memory(base, size)) {
+		pr_err("reserve_mem: region [%pa, +%pa) is not memory\n",
+		       &base, &size);
+		return -ENOMEM;
+	}
+	if (memblock_is_region_reserved(base, size)) {
+		pr_err("reserve_mem: region [%pa, +%pa) overlaps an existing reservation\n",
+		       &base, &size);
 		return -EBUSY;
+	}
+	if (memblock_reserve(base, size)) {
+		pr_err("reserve_mem: failed to reserve at %pa\n", &base);
+		return -ENOMEM;
+	}
+	reserved_mem_add(base, size, name);
+	return 0;
+}
+
+/*
+ * Reserve fixed-base reserve_mem= regions early, before the arch builds its
+ * page tables. The __setup pass below runs after page-table setup, which is
+ * too late to protect an address the allocator has already taken -- e.g. a
+ * top-of-RAM window versus x86 init_mem_mapping()'s top-down page-table
+ * allocations. Arches that place page tables this way call this once, after
+ * memblock.memory is populated and before the direct map is built. Dynamic
+ * (no @base) entries are left to the __setup pass.
+ */
+void __init reserve_mem_init_fixed(void)
+{
+	static char buf[RESERVE_MEM_NAME_SIZE + 64] __initdata;
+	const char *key = "reserve_mem=";
+	const size_t keylen = strlen(key);
+	const char *p = boot_command_line;
+
+	while ((p = strstr(p, key))) {
+		phys_addr_t size, align, base, s, t;
+		const char *val, *end;
+		bool have_base;
+		size_t vlen;
+		char *name;
+
+		/* Match only at a token boundary so pnp_reserve_mem= etc. and
+		 * substrings inside other options are not caught.
+		 */
+		if (p != boot_command_line && !isspace(p[-1])) {
+			p += keylen;
+			continue;
+		}
+		val = p + keylen;
+		for (end = val; *end && !isspace(*end); end++)
+			;
+		p = end;
+
+		vlen = end - val;
+		if (!vlen || vlen >= sizeof(buf))
+			continue;
+		memcpy(buf, val, vlen);
+		buf[vlen] = '\0';
+
+		if (parse_reserve_mem(buf, &size, &align, &name, &base, &have_base))
+			continue;
+		if (!have_base)
+			continue;
+		if (reserved_mem_count >= RESERVE_MEM_MAX_ENTRIES)
+			break;
+		if (reserve_mem_find_by_name(name, &s, &t))
+			continue;	/* already reserved */
+		reserve_mem_fixed(base, size, align, name);
+	}
+}
+
+/*
+ * Parse reserve_mem=nn:align:name[@base]
+ */
+static int __init reserve_mem(char *p)
+{
+	phys_addr_t start, size, align, base, tmp;
+	bool have_base;
+	char *name;
+	int ret;
+
+	ret = parse_reserve_mem(p, &size, &align, &name, &base, &have_base);
+	if (ret) {
+		pr_err("reserve_mem: empty or malformed parameter\n");
+		return ret;
+	}
+
+	/* Make sure the name is not already used */
+	if (reserve_mem_find_by_name(name, &start, &tmp)) {
+		/*
+		 * A fixed-base region may already have been reserved early by
+		 * reserve_mem_init_fixed(); this late pass then just finds it.
+		 */
+		if (have_base)
+			return 1;
+		pr_err("reserve_mem: name \"%s\" was already used\n", name);
+		return -EBUSY;
+	}
+
+	/* Check if there's room for more reserved memory */
+	if (reserved_mem_count >= RESERVE_MEM_MAX_ENTRIES) {
+		pr_err("reserve_mem: no more room for reserved memory\n");
+		return -EBUSY;
+	}
 
 	if (have_base) {
-		/* A fixed base is already stable across boots. */
-		if (!IS_ALIGNED(base, align)) {
-			pr_err("reserve_mem: base %pa not aligned to %pa\n",
-			       &base, &align);
+		/* On arches without an early pass this is the only chance; it
+		 * still works when the base has not been taken yet.
+		 */
+		if (reserve_mem_fixed(base, size, align, name))
 			return -EINVAL;
-		}
-		if (!memblock_is_region_memory(base, size)) {
-			pr_err("reserve_mem: region [%pa, +%pa) is not memory\n",
-			       &base, &size);
-			return -ENOMEM;
-		}
-		if (memblock_is_region_reserved(base, size)) {
-			pr_err("reserve_mem: region [%pa, +%pa) overlaps an existing reservation\n",
-			       &base, &size);
-			return -EBUSY;
-		}
-		if (memblock_reserve(base, size)) {
-			pr_err("reserve_mem: failed to reserve at %pa\n", &base);
-			return -ENOMEM;
-		}
-		start = base;
-	} else {
-		start = memblock_phys_alloc(size, align);
-		if (!start)
-			return -ENOMEM;
+		return 1;
+	}
+
+	/* TODO: Allocation must be outside of scratch region */
+	start = memblock_phys_alloc(size, align);
+	if (!start) {
+		pr_err("reserve_mem: memblock allocation failed\n");
+		return -ENOMEM;
 	}
 
 	reserved_mem_add(start, size, name);

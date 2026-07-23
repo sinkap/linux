@@ -1037,6 +1037,14 @@ void __init setup_arch(char **cmdline_p)
 	 */
 	x86_platform.realmode_reserve();
 
+	/*
+	 * Honour fixed-base reserve_mem= regions now, before
+	 * init_mem_mapping()'s top-down page-table allocations can take
+	 * the same address. memblock.memory is populated by
+	 * e820__memblock_setup() above.
+	 */
+	reserve_mem_init_fixed();
+
 	init_mem_mapping();
 
 	/*
