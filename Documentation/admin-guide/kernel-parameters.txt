@@ -5764,7 +5764,7 @@
 			is assumed to be I/O ports; otherwise it is memory.
 
 	reserve_mem=	[RAM]
-			Format: nn[KNG]:<align>:<label>
+			Format: nn[KMG]:<align>:<label>[@<base>]
 			Reserve physical memory and label it with a name that
 			other subsystems can use to access it. This is typically
 			used for systems that do not wipe the RAM, and this command
@@ -5784,6 +5784,18 @@
 			12 megabytes of 4096 alignment for ramoops:
 
 			reserve_mem=12M:4096:oops ramoops.mem_name=oops
+
+			An optional @<base> pins the reservation to that exact
+			physical address, for platforms that agree on a
+			location out of band (for example a hypervisor that
+			pre-arranges a shared window at a known guest-physical
+			address). With a fixed base the reservation either
+			succeeds at exactly that address or fails -- it never
+			falls back to dynamic placement. The base must honour
+			the requested alignment, lie entirely within usable
+			memory, and not overlap an existing reservation:
+
+			reserve_mem=2M:2M:agent_win@0x20000000
 
 	reservetop=	[X86-32,EARLY]
 			Format: nn[KMG]
