@@ -2634,13 +2634,16 @@ static bool __init reserve_mem_kho_revive(const char *name, phys_addr_t size,
 #endif /* CONFIG_KEXEC_HANDOVER */
 
 /*
- * Parse reserve_mem=nn:align:name
+ * Parse reserve_mem=nn:align:name[@base]
  */
 static int __init reserve_mem(char *p)
 {
 	phys_addr_t start, size, align, tmp;
+	phys_addr_t base = 0;
+	bool have_base = false;
 	char *name;
 	char *oldp;
+	char *at;
 	int len;
 
 	if (!p)
@@ -2670,6 +2673,24 @@ static int __init reserve_mem(char *p)
 		align = SMP_CACHE_BYTES;
 
 	name = p + 1;
+
+	/*
+	 * An optional @base pins the reservation to an exact address, for
+	 * callers that pre-arrange the region's location out of band (e.g.
+	 * a VMM placing a small shared window at a known guest-physical
+	 * address). Determinism is the point: an unusable base is an error,
+	 * never a fallback to dynamic placement.
+	 */
+	at = strchr(name, '@');
+	if (at) {
+		*at = '\0';
+		oldp = at + 1;
+		base = memparse(oldp, &p);
+		if (p == oldp || *p)
+			return -EINVAL;
+		have_base = true;
+	}
+
 	len = strlen(name);
 
 	/* name needs to have length but not too big */
@@ -2688,14 +2709,40 @@ static int __init reserve_mem(char *p)
 	if (reserve_mem_find_by_name(name, &start, &tmp))
 		return -EBUSY;
 
-	/* Pick previous allocations up from KHO if available */
-	if (reserve_mem_kho_revive(name, size, align))
-		return 1;
+	if (have_base) {
+		/* A fixed base is already stable across boots; KHO revival
+		 * could only ever agree with it or lose to these checks.
+		 */
+		if (!IS_ALIGNED(base, align)) {
+			pr_err("reserve_mem: base %pa not aligned to %pa\n",
+			       &base, &align);
+			return -EINVAL;
+		}
+		if (!memblock_is_region_memory(base, size)) {
+			pr_err("reserve_mem: region [%pa, +%pa) is not memory\n",
+			       &base, &size);
+			return -ENOMEM;
+		}
+		if (memblock_is_region_reserved(base, size)) {
+			pr_err("reserve_mem: region [%pa, +%pa) overlaps an existing reservation\n",
+			       &base, &size);
+			return -EBUSY;
+		}
+		if (memblock_reserve(base, size)) {
+			pr_err("reserve_mem: failed to reserve at %pa\n", &base);
+			return -ENOMEM;
+		}
+		start = base;
+	} else {
+		/* Pick previous allocations up from KHO if available */
+		if (reserve_mem_kho_revive(name, size, align))
+			return 1;
 
-	/* TODO: Allocation must be outside of scratch region */
-	start = memblock_phys_alloc(size, align);
-	if (!start)
-		return -ENOMEM;
+		/* TODO: Allocation must be outside of scratch region */
+		start = memblock_phys_alloc(size, align);
+		if (!start)
+			return -ENOMEM;
+	}
 
 	reserved_mem_add(start, size, name);
 
