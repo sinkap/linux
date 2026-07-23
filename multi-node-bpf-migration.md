@@ -139,22 +139,29 @@ fine.
 
 **Production VMs — a second small shared zone (`mem1`).** Do **not** back
 all of VM RAM with a shared memfd (it breaks overcommit/isolation for a
-tiny window). Instead give the window its *own* small `share=on`
-`memory-backend-file` (`mem1`, ≈512 KiB–2 MiB), placed **in `mem0`'s last
-section** and the same `guest_numa_id=0`; `mem0` (bulk VM RAM) stays
-private, demand-paged, overcommitted. Reserve the window at a **fixed
-guest-physical base** the VMM chose:
+tiny window). Instead map a small `share=on` `memory-backend-file` region
+(`mem1`, ≈512 KiB–2 MiB) as guest RAM, placed **in `mem0`'s last section**
+and the same `guest_numa_id=0`; `mem0` (bulk VM RAM) stays private,
+demand-paged, overcommitted. `mem1`'s backing is **not** a private
+per-window memfd — it is a **slice, at a per-VM `file_offset`, of one shared
+region memfd** (host slot + all VMs' slices) that the host binds and
+IOMMU-maps **once** for every VM. The `file_offset` is a host coordinate;
+the guest only sees its guest-physical base. Reserve the window at a
+**fixed guest-physical base** the VMM chose:
 
 ```
 reserve_mem=2M:2M:agent_win@0x<base>  carveout_heap.export=agent_win
 ```
-The `@<base>` form (added alongside this branch) reserves at exactly that
-address or fails — never relocating. Because the VMM placed the backing,
-the host already knows where the window is: **no guest→host GPA-publish
-handshake**, and no dynamic-placement nondeterminism. Placement rule: put
-`mem1` in `mem0`'s **last section** (not merely adjacent) so no new
-SPARSEMEM `memmap` PMD is created — otherwise you pay one 2 MiB vmemmap
-chunk. See the design doc §12 for the full VM deployment (including the
+The `@<base>` form reserves at exactly that address or fails — never
+relocating. On x86 it is honoured **early in `setup_arch()`, before
+`init_mem_mapping()`**, so a top-of-RAM base survives the kernel's own
+top-down page-table allocations (a naive top-of-RAM `reserve_mem` fails
+without this). Because the VMM placed the backing, the host already knows
+where the window is: **no guest→host GPA-publish handshake**, and no
+dynamic-placement nondeterminism. Placement rule: put `mem1` in `mem0`'s
+**last section** (not merely adjacent) so no new SPARSEMEM `memmap` PMD is
+created — otherwise you pay one 2 MiB vmemmap chunk. See the design doc §12
+for the full VM deployment (including the
 `notify_fd` → host-doorbell wiring) and §10.8 for why a ZONE_DEVICE-backed
 PCI BAR is *not* used here.
 
