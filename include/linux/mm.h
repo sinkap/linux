@@ -4532,6 +4532,7 @@ void vma_pgtable_walk_begin(struct vm_area_struct *vma);
 void vma_pgtable_walk_end(struct vm_area_struct *vma);
 
 int reserve_mem_find_by_name(const char *name, phys_addr_t *start, phys_addr_t *size);
+void reserve_mem_init_fixed(void);
 int reserve_mem_release_by_name(const char *name);
 
 #ifdef CONFIG_64BIT
