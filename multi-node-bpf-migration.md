@@ -118,6 +118,46 @@ allocating **once, as early in boot as possible**, then holding it — a
 mitigation, not a guarantee. The carveout heap removes the failure mode
 entirely, which is why it is preferred.
 
+## 2b. Memory source without a device tree (x86, VMs)
+
+x86 has no `/reserved-memory` device tree, so the DT path above does not
+apply. Use the arch-generic **`reserve_mem=`** kernel command line, which
+reserves RAM early and keeps its struct pages (the same page-backed shape a
+DT reserved-memory node without `no-map` has). Opt in by naming the region:
+
+```
+reserve_mem=2M:2M:agent_win  carveout_heap.export=agent_win
+```
+→ `/dev/dma_heap/agent_win`. The DT walk no-ops cleanly when there is no
+device tree, so the same driver serves both.
+
+**Dev / test VMs.** Back the *whole* guest RAM with one `share=on`
+`memory-backend-file` so the host can map the carveout's bytes; the guest
+publishes the reserved guest-physical base and the host maps the matching
+offset. Simple, but only acceptable where sharing/pinning all of VM RAM is
+fine.
+
+**Production VMs — a second small shared zone (`mem1`).** Do **not** back
+all of VM RAM with a shared memfd (it breaks overcommit/isolation for a
+tiny window). Instead give the window its *own* small `share=on`
+`memory-backend-file` (`mem1`, ≈512 KiB–2 MiB), placed **in `mem0`'s last
+section** and the same `guest_numa_id=0`; `mem0` (bulk VM RAM) stays
+private, demand-paged, overcommitted. Reserve the window at a **fixed
+guest-physical base** the VMM chose:
+
+```
+reserve_mem=2M:2M:agent_win@0x<base>  carveout_heap.export=agent_win
+```
+The `@<base>` form (added alongside this branch) reserves at exactly that
+address or fails — never relocating. Because the VMM placed the backing,
+the host already knows where the window is: **no guest→host GPA-publish
+handshake**, and no dynamic-placement nondeterminism. Placement rule: put
+`mem1` in `mem0`'s **last section** (not merely adjacent) so no new
+SPARSEMEM `memmap` PMD is created — otherwise you pay one 2 MiB vmemmap
+chunk. See the design doc §12 for the full VM deployment (including the
+`notify_fd` → host-doorbell wiring) and §10.8 for why a ZONE_DEVICE-backed
+PCI BAR is *not* used here.
+
 ## 3. Ringbuf: placed in the arena, discovered via `arena_off`
 
 A ring buffer no longer imports its own dma-buf. Create it with
