@@ -162,8 +162,38 @@ dynamic-placement nondeterminism. Placement rule: put `mem1` in `mem0`'s
 **last section** (not merely adjacent) so no new SPARSEMEM `memmap` PMD is
 created — otherwise you pay one 2 MiB vmemmap chunk. See the design doc §12
 for the full VM deployment (including the
-`notify_fd` → host-doorbell wiring) and §10.8 for why a ZONE_DEVICE-backed
-PCI BAR is *not* used here.
+`notify_fd` → host-doorbell wiring). §2c is a simpler alternative that skips
+the shared-zone placement rules entirely.
+
+## 2c. Memory source in a VM: virtio-pmem → devdax → `device_dax` exporter
+
+Instead of a shared RAM zone (§2b), let the VMM hand the guest a host-file-backed
+**virtio-pmem** device and back the arena with **device pages**. This drops the
+`reserve_mem=@base` / `mem1` section-placement gymnastics — the VMM owns
+placement by construction — at the cost of a devdax `ndctl` step and device-page
+semantics (handled by the arena's `vmf_insert_mixed()` fault path; ordinary-RAM
+arenas are unchanged).
+
+```
+# host (Cloud Hypervisor): a share=on file becomes the guest's pmem window
+cloud-hypervisor --pmem file=/dev/shm/agent_win ... --kernel vmlinux ...
+
+# guest: pmem -> devdax -> dma-buf -> arena
+ndctl create-namespace -m devdax --map=mem -f -e namespace0.0   # /dev/dax0.0
+int dax    = open("/dev/dax0.0", O_RDWR);
+int dmabuf = ioctl(dax, DAX_IOC_EXPORT_DMABUF);   /* device_dax exporter */
+attr.map_extra = dmabuf;                          /* BPF_F_DMABUF arena */
+```
+
+The guest's BPF writes through the arena land in the host file; the host/NIC
+reads the same bytes. **Caveat:** `ndctl` writes a devdax **info block** at the
+start of the region, so the usable window begins **2 MiB into the backing file**
+(`--map=mem` keeps the page-struct array in guest RAM, not in the window). The
+VMM/consumer must offset its view of the file past the info block. Requires the
+`DAX_IOC_EXPORT_DMABUF` patch (`drivers/dax/device.c`,
+`feature/bpf-next/dax_dmabuf_export`) and, in the guest config, `VIRTIO_PMEM`,
+`DEV_DAX`/`DEV_DAX_PMEM`, `FS_DAX`, `ND_PFN`. No `carveout_heap`, no
+`reserve_mem`.
 
 ## 3. Ringbuf: placed in the arena, discovered via `arena_off`
 
