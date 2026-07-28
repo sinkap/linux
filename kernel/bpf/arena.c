@@ -70,6 +70,11 @@ struct bpf_arena {
 	 * arena, kept attached for the map's lifetime
 	 */
 	bool dmabuf_backed;
+	/* set when the dma-buf backing pages are ZONE_DEVICE: they are not
+	 * rmap-able, so the user fault maps them by pfn (VM_MIXEDMAP) instead
+	 * of handing a struct page to the core rmap path
+	 */
+	bool backing_is_device;
 	struct bpf_dmabuf_backing dmabuf;
 };
 
@@ -358,6 +363,9 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 		if (err)
 			goto err_destroy_rt;
 
+		arena->backing_is_device = arena->dmabuf.nr_pages &&
+			is_zone_device_page(arena->dmabuf.pages[0]);
+
 		err = vm_area_map_pages(arena->kern_vm, kstart,
 					kstart + nr_pages * PAGE_SIZE,
 					arena->dmabuf.pages);
@@ -577,6 +585,14 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
 	flush_vmap_cache(kaddr, PAGE_SIZE);
 	bpf_map_memcg_exit(old_memcg, new_memcg);
 out:
+	if (arena->backing_is_device) {
+		/* Not rmap-able: insert by pfn, no page ref on the user PTE.
+		 * The dma-buf attachment owns page lifetime.
+		 */
+		raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
+		return vmf_insert_mixed(vmf->vma, vmf->address,
+					page_to_pfn(page));
+	}
 	page_ref_add(page, 1);
 	raw_res_spin_unlock_irqrestore(&arena->spinlock, flags);
 	vmf->page = page;
@@ -672,6 +688,11 @@ static int arena_map_mmap(struct bpf_map *map, struct vm_area_struct *vma)
 	 * being copied into the child process on fork.
 	 */
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTCOPY);
+	/* Device-backed pages are inserted by pfn at fault time; mark the VMA
+	 * mixed so the special ptes are accepted.
+	 */
+	if (arena->backing_is_device)
+		vm_flags_set(vma, VM_MIXEDMAP);
 	vma->vm_ops = &arena_vm_ops;
 	return 0;
 }
