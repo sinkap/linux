@@ -10,6 +10,8 @@
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/mman.h>
+#include <linux/dma-buf.h>
+#include <linux/scatterlist.h>
 #include "dax-private.h"
 #include "bus.h"
 
@@ -330,6 +332,166 @@ static const struct address_space_operations dev_dax_aops = {
 	.dirty_folio	= noop_dirty_folio,
 };
 
+/*
+ * DAX_IOC_EXPORT_DMABUF: export this device-dax instance as a dma-buf so it
+ * can back a BPF arena (BPF_F_DMABUF) or feed any dma-buf importer.  The
+ * dma-buf reuses dev_dax->pgmap's existing ZONE_DEVICE pages -- no second
+ * memremap_pages() -- and pins the dev_dax device for the buffer's lifetime.
+ * upstream: move the ioctl number to include/uapi/linux/dax.h
+ */
+#define DAX_IOC_EXPORT_DMABUF _IO('d', 0x01)
+
+struct dev_dax_dmabuf {
+	struct dev_dax *dev_dax;
+	struct page **pages;
+	unsigned long nr_pages;
+};
+
+struct dev_dax_dmabuf_attach {
+	struct sg_table sgt;
+};
+
+static int dev_dax_dmabuf_attach(struct dma_buf *dmabuf,
+				 struct dma_buf_attachment *at)
+{
+	struct dev_dax_dmabuf *dd = dmabuf->priv;
+	struct dev_dax_dmabuf_attach *a;
+	int rc;
+
+	a = kzalloc(sizeof(*a), GFP_KERNEL);
+	if (!a)
+		return -ENOMEM;
+	rc = sg_alloc_table_from_pages(&a->sgt, dd->pages, dd->nr_pages, 0,
+				       (u64)dd->nr_pages << PAGE_SHIFT, GFP_KERNEL);
+	if (rc) {
+		kfree(a);
+		return rc;
+	}
+	at->priv = a;
+	return 0;
+}
+
+static void dev_dax_dmabuf_detach(struct dma_buf *dmabuf,
+				  struct dma_buf_attachment *at)
+{
+	struct dev_dax_dmabuf_attach *a = at->priv;
+
+	sg_free_table(&a->sgt);
+	kfree(a);
+}
+
+static struct sg_table *dev_dax_dmabuf_map(struct dma_buf_attachment *at,
+					   enum dma_data_direction dir)
+{
+	struct dev_dax_dmabuf_attach *a = at->priv;
+
+	if (dma_map_sgtable(at->dev, &a->sgt, dir, 0))
+		return ERR_PTR(-ENOMEM);
+	return &a->sgt;
+}
+
+static void dev_dax_dmabuf_unmap(struct dma_buf_attachment *at,
+				 struct sg_table *sgt,
+				 enum dma_data_direction dir)
+{
+	dma_unmap_sgtable(at->dev, sgt, dir, 0);
+}
+
+static int dev_dax_dmabuf_mmap(struct dma_buf *dmabuf,
+			       struct vm_area_struct *vma)
+{
+	struct dev_dax_dmabuf *dd = dmabuf->priv;
+	unsigned long len = vma->vm_end - vma->vm_start;
+	unsigned long pfn;
+
+	/* direct CPU mapping supported for single-range devices */
+	if (dd->dev_dax->nr_range != 1)
+		return -EOPNOTSUPP;
+	pfn = PHYS_PFN(dd->dev_dax->ranges[0].range.start) + vma->vm_pgoff;
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	return remap_pfn_range(vma, vma->vm_start, pfn, len, vma->vm_page_prot);
+}
+
+static void dev_dax_dmabuf_release(struct dma_buf *dmabuf)
+{
+	struct dev_dax_dmabuf *dd = dmabuf->priv;
+
+	put_device(&dd->dev_dax->dev);
+	kfree(dd->pages);
+	kfree(dd);
+}
+
+static const struct dma_buf_ops dev_dax_dmabuf_ops = {
+	.attach		= dev_dax_dmabuf_attach,
+	.detach		= dev_dax_dmabuf_detach,
+	.map_dma_buf	= dev_dax_dmabuf_map,
+	.unmap_dma_buf	= dev_dax_dmabuf_unmap,
+	.mmap		= dev_dax_dmabuf_mmap,
+	.release	= dev_dax_dmabuf_release,
+};
+
+static long dev_dax_export_dmabuf(struct dev_dax *dev_dax)
+{
+	DEFINE_DMA_BUF_EXPORT_INFO(exp);
+	struct dev_dax_dmabuf *dd;
+	struct dma_buf *dmabuf;
+	unsigned long i, pfn, idx = 0;
+	int r;
+
+	if (!dev_dax->pgmap)
+		return -ENXIO;
+
+	dd = kzalloc(sizeof(*dd), GFP_KERNEL);
+	if (!dd)
+		return -ENOMEM;
+	dd->dev_dax = dev_dax;
+
+	for (r = 0; r < dev_dax->nr_range; r++)
+		dd->nr_pages += PHYS_PFN(range_len(&dev_dax->ranges[r].range));
+
+	dd->pages = kcalloc(dd->nr_pages, sizeof(*dd->pages), GFP_KERNEL);
+	if (!dd->pages) {
+		kfree(dd);
+		return -ENOMEM;
+	}
+	for (r = 0; r < dev_dax->nr_range; r++) {
+		struct range *range = &dev_dax->ranges[r].range;
+		unsigned long n = PHYS_PFN(range_len(range));
+
+		pfn = PHYS_PFN(range->start);
+		for (i = 0; i < n; i++)
+			dd->pages[idx++] = pfn_to_page(pfn + i);
+	}
+
+	get_device(&dev_dax->dev);
+	exp.exp_name = "device_dax";
+	exp.owner = THIS_MODULE;
+	exp.ops = &dev_dax_dmabuf_ops;
+	exp.size = (u64)dd->nr_pages << PAGE_SHIFT;
+	exp.flags = O_RDWR | O_CLOEXEC;
+	exp.priv = dd;
+	dmabuf = dma_buf_export(&exp);
+	if (IS_ERR(dmabuf)) {
+		put_device(&dev_dax->dev);
+		kfree(dd->pages);
+		kfree(dd);
+		return PTR_ERR(dmabuf);
+	}
+	return dma_buf_fd(dmabuf, O_RDWR | O_CLOEXEC);
+}
+
+static long dev_dax_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	struct dev_dax *dev_dax = filp->private_data;
+
+	switch (cmd) {
+	case DAX_IOC_EXPORT_DMABUF:
+		return dev_dax_export_dmabuf(dev_dax);
+	default:
+		return -ENOTTY;
+	}
+}
+
 static int dax_open(struct inode *inode, struct file *filp)
 {
 	struct dax_device *dax_dev = inode_dax(inode);
@@ -364,6 +526,8 @@ static const struct file_operations dax_fops = {
 	.release = dax_release,
 	.get_unmapped_area = dax_get_unmapped_area,
 	.mmap_prepare = dax_mmap_prepare,
+	.unlocked_ioctl = dev_dax_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 	.fop_flags = FOP_MMAP_SYNC,
 };
 
@@ -471,6 +635,7 @@ static void __exit dax_exit(void)
 MODULE_AUTHOR("Intel Corporation");
 MODULE_DESCRIPTION("Device DAX: direct access device driver");
 MODULE_LICENSE("GPL v2");
+MODULE_IMPORT_NS("DMA_BUF");
 module_init(dax_init);
 module_exit(dax_exit);
 MODULE_ALIAS_DAX_DEVICE(0);
