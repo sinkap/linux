@@ -268,6 +268,137 @@ static void test_ringbuf(void)
 	close(dmabuf);
 }
 
+
+/*
+ * One dma-buf arena hosting two ring buffers -- a "host" ring and a "vm"
+ * ring (the slice a guest would create over its shared view of the same
+ * arena) -- drained by a *single* consumer that polls both. This is the
+ * multi-producer / single-consumer shape of the VM deployment, minus the
+ * VM boundary: the consumer sees one dma-buf and both rings live in it at
+ * distinct arena offsets.
+ */
+struct rb_consumer {
+	volatile uint64_t *consumer_pos;
+	volatile uint64_t *producer_pos;
+	const volatile unsigned char *data;
+	uint64_t mask;
+	uint64_t cons;		/* our consumer position */
+	uint64_t got;		/* records drained */
+	uint64_t expect;	/* next expected payload value */
+	bool seq_ok, busy_ok;
+};
+
+static void rb_consumer_init(struct rb_consumer *c, unsigned char *m,
+			     int64_t arena_off, uint32_t data_sz)
+{
+	c->consumer_pos = (volatile uint64_t *)(m + arena_off);
+	c->producer_pos = (volatile uint64_t *)(m + arena_off + PAGE);
+	c->data = m + arena_off + 2 * PAGE;
+	c->mask = data_sz - 1;
+	c->cons = c->got = c->expect = 0;
+	c->seq_ok = c->busy_ok = true;
+}
+
+/* Poll one ring: drain whatever the producer has committed so far. */
+static void rb_consumer_poll(struct rb_consumer *c)
+{
+	uint64_t prod = __atomic_load_n(c->producer_pos, __ATOMIC_ACQUIRE);
+
+	while (c->cons < prod) {
+		uint32_t len = *(const volatile uint32_t *)
+			(c->data + (c->cons & c->mask));
+		if (len & BUSY_BIT) { c->busy_ok = false; break; }
+		uint32_t slen = len & ~DISCARD_BIT;
+		if (!(len & DISCARD_BIT)) {
+			uint64_t v = read_payload8(c->data, c->mask,
+						  c->cons + HDR_SZ);
+			if (v != c->expect)
+				c->seq_ok = false;
+			c->expect++;
+			c->got++;
+		}
+		c->cons += round_up8(slen + HDR_SZ);
+		__atomic_store_n(c->consumer_pos, c->cons, __ATOMIC_RELEASE);
+	}
+}
+
+static void test_multi_ringbuf(void)
+{
+	printf("== multi ringbuf (one arena, two rings, single poll consumer) ==\n");
+	const uint32_t data_sz = PAGE;
+	const unsigned long npages = 32;		/* room for two rings */
+
+	int dmabuf = dmabuf_alloc(npages);
+	int arena = dmabuf >= 0 ? create_arena(npages, dmabuf) : -1;
+	CHECK(arena >= 0, "dma-buf arena for two rings");
+	if (arena < 0)
+		return;
+
+	/* Two ring buffers carved from the same arena by the kernel. */
+	int rb_host = create_ringbuf(data_sz, arena);
+	int rb_vm   = create_ringbuf(data_sz, arena);
+	CHECK(rb_host >= 0 && rb_vm >= 0, "create host + vm rings in one arena");
+	if (rb_host < 0 || rb_vm < 0)
+		return;
+
+	int64_t off_host = get_arena_off(rb_host);
+	int64_t off_vm   = get_arena_off(rb_vm);
+	CHECK(off_host >= 0 && off_vm >= 0 && off_host != off_vm,
+	      "two distinct arena offsets (host 0x%llx, vm 0x%llx)",
+	      (unsigned long long)off_host, (unsigned long long)off_vm);
+	if (off_host < 0 || off_vm < 0)
+		return;
+
+	int prog_host = load_producer(rb_host);
+	int prog_vm   = load_producer(rb_vm);
+	CHECK(prog_host >= 0 && prog_vm >= 0, "load both producers");
+	if (prog_host < 0 || prog_vm < 0)
+		return;
+
+	unsigned char *m = (unsigned char *)mmap(NULL, npages * PAGE,
+			PROT_READ | PROT_WRITE, MAP_SHARED, dmabuf, 0);
+	CHECK(m != MAP_FAILED, "mmap dma-buf for the single consumer");
+	if (m == MAP_FAILED)
+		return;
+
+	struct rb_consumer ch, cv;
+	rb_consumer_init(&ch, m, off_host, data_sz);
+	rb_consumer_init(&cv, m, off_vm, data_sz);
+
+	/*
+	 * Interleave production into both rings, and after each step the one
+	 * consumer polls both -- more records than a ring holds, so each data
+	 * area wraps several times.
+	 */
+	const uint64_t total = 1000;
+	bool prod_ok = true;
+	for (uint64_t seq = 0; seq < total; seq++) {
+		if (produce_one(prog_host, seq) < 0 ||
+		    produce_one(prog_vm, seq) < 0) {
+			prod_ok = false;
+			break;
+		}
+		rb_consumer_poll(&ch);
+		rb_consumer_poll(&cv);
+	}
+	/* Final drain in case the last commits landed after the last poll. */
+	rb_consumer_poll(&ch);
+	rb_consumer_poll(&cv);
+
+	CHECK(prod_ok, "both producers ran");
+	CHECK(ch.busy_ok && cv.busy_ok, "no stale BUSY bit on either ring");
+	CHECK(ch.seq_ok && cv.seq_ok, "records in order on both rings");
+	CHECK(ch.got == total, "host ring fully drained (%llu/%llu)",
+	      (unsigned long long)ch.got, (unsigned long long)total);
+	CHECK(cv.got == total, "vm ring fully drained (%llu/%llu)",
+	      (unsigned long long)cv.got, (unsigned long long)total);
+
+	munmap(m, npages * PAGE);
+	close(prog_host); close(prog_vm);
+	close(rb_host); close(rb_vm);
+	close(arena); close(dmabuf);
+}
+
 static void test_arena(void)
 {
 	printf("== arena ==\n");
@@ -951,6 +1082,7 @@ int main(void)
 		init_setup();
 
 	test_ringbuf();
+	test_multi_ringbuf();
 	test_arena();
 	test_array();
 	test_mixed();
