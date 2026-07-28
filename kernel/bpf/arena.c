@@ -8,6 +8,7 @@
 #include <linux/vmalloc.h>
 #include <linux/pagemap.h>
 #include "range_tree.h"
+#include <linux/pfn_t.h>
 #include "dmabuf_backing.h"
 
 /*
@@ -55,6 +56,11 @@ struct bpf_arena {
 	/* set for BPF_F_DMABUF: the dma-buf whose pages back the
 	 * arena, kept attached for the map's lifetime
 	 */
+	/* set when the dma-buf backing pages are ZONE_DEVICE: they are not
+	 * rmap-able, so the user fault maps them by pfn (VM_MIXEDMAP) instead
+	 * of handing a struct page to the core rmap path
+	 */
+	bool backing_is_device;
 	struct bpf_dmabuf_backing dmabuf;
 };
 
@@ -187,6 +193,9 @@ static struct bpf_map *arena_map_alloc(union bpf_attr *attr)
 			err = ret;
 			goto err_destroy_rt;
 		}
+
+		arena->backing_is_device = arena->dmabuf.nr_pages &&
+			is_zone_device_page(arena->dmabuf.pages[0]);
 
 		ret = vm_area_map_pages(arena->kern_vm, kstart,
 					kstart + nr_pages * PAGE_SIZE,
@@ -369,6 +378,13 @@ static vm_fault_t arena_vm_fault(struct vm_fault *vmf)
 		return VM_FAULT_SIGSEGV;
 	}
 out:
+	if (arena->backing_is_device)
+		/* Not rmap-able: insert by pfn, no page ref on the user PTE
+		 * (guard(mutex) unlocks on return). The dma-buf attachment
+		 * owns page lifetime.
+		 */
+		return vmf_insert_mixed(vmf->vma, vmf->address,
+					pfn_to_pfn_t(page_to_pfn(page)));
 	page_ref_add(page, 1);
 	vmf->page = page;
 	return 0;
@@ -455,6 +471,11 @@ static int arena_map_mmap(struct bpf_map *map, struct vm_area_struct *vma)
 	 * potential change of user_vm_start.
 	 */
 	vm_flags_set(vma, VM_DONTEXPAND);
+	/* Device-backed pages are inserted by pfn at fault time; mark the VMA
+	 * mixed so the special ptes are accepted.
+	 */
+	if (arena->backing_is_device)
+		vm_flags_set(vma, VM_MIXEDMAP);
 	vma->vm_ops = &arena_vm_ops;
 	return 0;
 }

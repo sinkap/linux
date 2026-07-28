@@ -100,7 +100,12 @@ int bpf_dmabuf_backing_get(int fd, unsigned long nr_pages,
 	for_each_sgtable_page(b->sgt, &piter, 0) {
 		struct page *page = sg_page_iter_page(&piter);
 
-		if (!page || !pfn_valid(page_to_pfn(page)))
+		/* Accept ordinary RAM pages and ZONE_DEVICE pages (e.g. a
+		 * host-memory region shared into a guest as a device); reject
+		 * only true MMIO with no struct page.
+		 */
+		if (!page ||
+		    (!pfn_valid(page_to_pfn(page)) && !is_zone_device_page(page)))
 			goto err_free;
 		b->pages[i++] = page;
 		if (i == nr_pages)
