@@ -502,6 +502,8 @@ struct module {
 	unsigned int btf_base_data_size;
 	void *btf_data;
 	void *btf_base_data;
+	unsigned int btf_fmodret_ids_size;
+	void *btf_fmodret_ids;
 #endif
 #if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	unsigned int btf_inline_data_size;

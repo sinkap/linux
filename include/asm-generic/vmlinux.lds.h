@@ -715,6 +715,10 @@
 	. = ALIGN(PAGE_SIZE);						\
 	.BTF_ids : AT(ADDR(.BTF_ids) - LOAD_OFFSET) {			\
 		*(.BTF_ids)						\
+	}								\
+	. = ALIGN(PAGE_SIZE);						\
+	.BTF_fmodret_ids : AT(ADDR(.BTF_fmodret_ids) - LOAD_OFFSET) {	\
+		BOUNDED_SECTION_BY(.BTF_fmodret_ids, _btf_fmodret_ids)	\
 	}
 #else
 #define BTF
@@ -859,7 +863,8 @@
 		.debug_macro	0 : { *(.debug_macro) }			\
 		.debug_names	0 : { *(.debug_names) }			\
 		.debug_rnglists	0 : { *(.debug_rnglists) }		\
-		.debug_str_offsets	0 : { *(.debug_str_offsets) }
+		.debug_str_offsets	0 : { *(.debug_str_offsets) }	\
+		.BTF_fmodret_candidates 0 : { KEEP(*(.BTF_fmodret_candidates)) }
 
 /* Stabs debugging sections. */
 #define STABS_DEBUG							\

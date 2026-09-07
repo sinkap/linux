@@ -136,7 +136,7 @@ typedef int (*btf_kfunc_filter_t)(const struct bpf_prog *prog, u32 kfunc_id);
 
 struct btf_kfunc_id_set {
 	struct module *owner;
-	struct btf_id_set8 *set;
+	const struct btf_id_set8 *set;
 	btf_kfunc_filter_t filter;
 };
 

@@ -2722,6 +2722,8 @@ static int find_module_sections(struct module *mod, struct load_info *info)
 	mod->btf_data = any_section_objs(info, ".BTF", 1, &mod->btf_data_size);
 	mod->btf_base_data = any_section_objs(info, ".BTF.base", 1,
 					      &mod->btf_base_data_size);
+	mod->btf_fmodret_ids = section_objs(info, ".BTF_fmodret_ids", 1,
+					    &mod->btf_fmodret_ids_size);
 #endif
 #if IS_ENABLED(CONFIG_DEBUG_INFO_BTF_INLINE)
 	mod->btf_inline_data = any_section_objs(info, ".BTF.inline", 1,
