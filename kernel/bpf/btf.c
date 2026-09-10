@@ -1842,7 +1842,7 @@ static void btf_free_kfunc_set_tab(struct btf *btf)
 	if (!tab)
 		return;
 	for (hook = 0; hook < ARRAY_SIZE(tab->sets); hook++)
-		kfree(tab->sets[hook]);
+		kvfree(tab->sets[hook]);
 	kfree(tab);
 	btf->kfunc_set_tab = NULL;
 }
@@ -9842,7 +9842,8 @@ static int btf_populate_kfunc_set(struct btf *btf, enum btf_kfunc_hook hook,
 	bool add_filter = !!kset->filter;
 	struct btf_kfunc_set_tab *tab;
 	struct btf_id_set8 *set;
-	u32 set_cnt, i;
+	size_t set_size;
+	u32 set_cnt, new_cnt, i;
 	int ret;
 
 	if (hook >= BTF_KFUNC_HOOK_MAX) {
@@ -9905,15 +9906,20 @@ static int btf_populate_kfunc_set(struct btf *btf, enum btf_kfunc_hook hook,
 		goto end;
 	}
 
-	if (set_cnt + add_set->cnt > BTF_KFUNC_SET_MAX_CNT) {
+	new_cnt = set_cnt + add_set->cnt;
+	if (hook != BTF_KFUNC_HOOK_FMODRET && new_cnt > BTF_KFUNC_SET_MAX_CNT) {
 		ret = -E2BIG;
 		goto end;
 	}
 
+	set_size = struct_size(set, pairs, new_cnt);
+	if (set_size == SIZE_MAX) {
+		ret = -EOVERFLOW;
+		goto end;
+	}
+
 	/* Grow set */
-	set = krealloc(tab->sets[hook],
-		       struct_size(set, pairs, set_cnt + add_set->cnt),
-		       GFP_KERNEL | __GFP_NOWARN);
+	set = kvrealloc(tab->sets[hook], set_size, GFP_KERNEL | __GFP_NOWARN);
 	if (!set) {
 		ret = -ENOMEM;
 		goto end;
