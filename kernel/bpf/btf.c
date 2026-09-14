@@ -10215,6 +10215,251 @@ int register_btf_fmodret_id_set(const struct btf_kfunc_id_set *kset)
 }
 EXPORT_SYMBOL_GPL(register_btf_fmodret_id_set);
 
+struct bpf_fmodret_info {
+	u32 btf_obj_id;
+	u32 btf_id;
+	u32 flags;
+};
+
+struct bpf_fmodret_source {
+	struct btf *btf;
+	struct module *module;
+	const struct btf_id_set8 *set;
+	u64 first_pos;
+};
+
+struct bpf_fmodret_iter_priv {
+	struct bpf_fmodret_info info;
+	struct bpf_fmodret_source *sources;
+	u32 source_cnt;
+};
+
+static const struct btf_id_set8 *btf_fmodret_set(const struct btf *btf)
+{
+	struct btf_kfunc_set_tab *tab;
+
+	tab = btf->kfunc_set_tab;
+	if (!tab)
+		return NULL;
+	return tab->sets[BTF_KFUNC_HOOK_FMODRET];
+}
+
+static int bpf_fmodret_source_cmp(const void *a, const void *b)
+{
+	const struct bpf_fmodret_source *source_a = a;
+	const struct bpf_fmodret_source *source_b = b;
+	u32 id_a = btf_obj_id(source_a->btf);
+	u32 id_b = btf_obj_id(source_b->btf);
+
+	return id_a < id_b ? -1 : id_a > id_b ? 1 : 0;
+}
+
+static int bpf_fmodret_seq_init(void *priv, struct bpf_iter_aux_info *aux)
+{
+	struct bpf_fmodret_iter_priv *iter = priv;
+	const struct btf_id_set8 *set;
+	struct bpf_fmodret_source *source;
+	struct btf *vmlinux_btf;
+	u32 source_cnt = 0;
+	u64 first_pos = 0;
+	int err = 0;
+#ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+	struct btf_module *btf_mod;
+#endif
+
+	vmlinux_btf = bpf_get_btf_vmlinux();
+	if (IS_ERR(vmlinux_btf))
+		return PTR_ERR(vmlinux_btf);
+	if (!vmlinux_btf)
+		return 0;
+
+	set = btf_fmodret_set(vmlinux_btf);
+	if (set && set->cnt)
+		source_cnt++;
+
+#ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+	mutex_lock(&btf_module_mutex);
+	list_for_each_entry(btf_mod, &btf_modules, list) {
+		set = btf_fmodret_set(btf_mod->btf);
+		if ((btf_mod->flags & BTF_MODULE_F_LIVE) && set && set->cnt)
+			source_cnt++;
+	}
+#endif
+
+	if (!source_cnt)
+		goto unlock;
+
+	iter->sources = kcalloc(source_cnt, sizeof(*iter->sources), GFP_KERNEL);
+	if (!iter->sources) {
+		err = -ENOMEM;
+		goto unlock;
+	}
+
+	set = btf_fmodret_set(vmlinux_btf);
+	if (set && set->cnt) {
+		btf_get(vmlinux_btf);
+		source = &iter->sources[iter->source_cnt++];
+		source->btf = vmlinux_btf;
+		source->set = set;
+	}
+
+#ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+	list_for_each_entry(btf_mod, &btf_modules, list) {
+		set = btf_fmodret_set(btf_mod->btf);
+		if (!(btf_mod->flags & BTF_MODULE_F_LIVE) || !set || !set->cnt ||
+		    !try_module_get(btf_mod->module))
+			continue;
+
+		btf_get(btf_mod->btf);
+		source = &iter->sources[iter->source_cnt++];
+		source->btf = btf_mod->btf;
+		source->module = btf_mod->module;
+		source->set = set;
+	}
+#endif
+
+unlock:
+#ifdef CONFIG_DEBUG_INFO_BTF_MODULES
+	mutex_unlock(&btf_module_mutex);
+#endif
+	if (err)
+		return err;
+	if (!iter->source_cnt)
+		return 0;
+
+	sort(iter->sources, iter->source_cnt, sizeof(*iter->sources),
+	     bpf_fmodret_source_cmp, NULL);
+	for (source_cnt = 0; source_cnt < iter->source_cnt; source_cnt++) {
+		source = &iter->sources[source_cnt];
+		source->first_pos = first_pos;
+		first_pos += source->set->cnt;
+	}
+
+	return 0;
+}
+
+static void bpf_fmodret_seq_fini(void *priv)
+{
+	struct bpf_fmodret_iter_priv *iter = priv;
+	u32 i;
+
+	for (i = 0; i < iter->source_cnt; i++) {
+		btf_put(iter->sources[i].btf);
+		if (iter->sources[i].module)
+			module_put(iter->sources[i].module);
+	}
+	kfree(iter->sources);
+}
+
+static void *bpf_fmodret_get_info(struct seq_file *seq, loff_t pos)
+{
+	struct bpf_fmodret_iter_priv *iter = seq->private;
+	struct bpf_fmodret_source *source;
+	u64 source_pos;
+	u32 i;
+
+	if (pos < 0)
+		return NULL;
+
+	for (i = 0; i < iter->source_cnt; i++) {
+		source = &iter->sources[i];
+		if ((u64)pos < source->first_pos)
+			return NULL;
+		source_pos = pos - source->first_pos;
+		if (source_pos >= source->set->cnt)
+			continue;
+
+		iter->info.btf_obj_id = btf_obj_id(source->btf);
+		iter->info.btf_id = source->set->pairs[source_pos].id;
+		iter->info.flags = source->set->pairs[source_pos].flags;
+		return &iter->info;
+	}
+
+	return NULL;
+}
+
+static void *bpf_fmodret_seq_start(struct seq_file *seq, loff_t *pos)
+{
+	return bpf_fmodret_get_info(seq, *pos);
+}
+
+static void *bpf_fmodret_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+{
+	return bpf_fmodret_get_info(seq, ++*pos);
+}
+
+struct bpf_iter__bpf_fmodret {
+	__bpf_md_ptr(struct bpf_iter_meta *, meta);
+	__bpf_md_ptr(struct bpf_fmodret_info *, fmodret_info);
+};
+
+DEFINE_BPF_ITER_FUNC(bpf_fmodret, struct bpf_iter_meta *meta,
+		     struct bpf_fmodret_info *fmodret_info)
+
+static int __bpf_fmodret_seq_show(struct seq_file *seq, void *v, bool in_stop)
+{
+	struct bpf_iter__bpf_fmodret ctx;
+	struct bpf_iter_meta meta;
+	struct bpf_prog *prog;
+	int ret = 0;
+
+	ctx.meta = &meta;
+	ctx.fmodret_info = v;
+	meta.seq = seq;
+	prog = bpf_iter_get_info(&meta, in_stop);
+	if (prog)
+		ret = bpf_iter_run_prog(prog, &ctx);
+	return ret;
+}
+
+static int bpf_fmodret_seq_show(struct seq_file *seq, void *v)
+{
+	return __bpf_fmodret_seq_show(seq, v, false);
+}
+
+static void bpf_fmodret_seq_stop(struct seq_file *seq, void *v)
+{
+	if (!v)
+		(void)__bpf_fmodret_seq_show(seq, NULL, true);
+}
+
+static const struct seq_operations bpf_fmodret_seq_ops = {
+	.start	= bpf_fmodret_seq_start,
+	.next	= bpf_fmodret_seq_next,
+	.stop	= bpf_fmodret_seq_stop,
+	.show	= bpf_fmodret_seq_show,
+};
+
+BTF_ID_LIST_SINGLE(btf_bpf_fmodret_info_id, struct, bpf_fmodret_info)
+
+static const struct bpf_iter_seq_info bpf_fmodret_seq_info = {
+	.seq_ops		= &bpf_fmodret_seq_ops,
+	.init_seq_private	= bpf_fmodret_seq_init,
+	.fini_seq_private	= bpf_fmodret_seq_fini,
+	.seq_priv_size		= sizeof(struct bpf_fmodret_iter_priv),
+};
+
+static struct bpf_iter_reg bpf_fmodret_reg_info = {
+	.target			= "bpf_fmodret",
+	.ctx_arg_info_size	= 1,
+	.ctx_arg_info		= {
+		{
+			offsetof(struct bpf_iter__bpf_fmodret, fmodret_info),
+			PTR_TO_BTF_ID_OR_NULL,
+		},
+	},
+	.seq_info		= &bpf_fmodret_seq_info,
+};
+
+static int __init bpf_fmodret_iter_init(void)
+{
+	bpf_fmodret_reg_info.ctx_arg_info[0].btf_id =
+		*btf_bpf_fmodret_info_id;
+	return bpf_iter_reg_target(&bpf_fmodret_reg_info);
+}
+
+late_initcall(bpf_fmodret_iter_init);
+
 s32 btf_find_dtor_kfunc(struct btf *btf, u32 btf_id)
 {
 	struct btf_id_dtor_kfunc_tab *tab = btf->dtor_kfunc_tab;
