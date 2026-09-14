@@ -276,6 +276,8 @@ $(OUTPUT)prog.o: $(OUTPUT)profiler.skel.h
 
 $(OUTPUT)pids.o: $(OUTPUT)pid_iter.skel.h
 
+$(OUTPUT)fmodret.o: $(OUTPUT)fmodret_iter.skel.h
+
 endif
 endif
 
