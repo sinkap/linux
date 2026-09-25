@@ -33,6 +33,8 @@ export BTF_INLINE := $(btf-inline)
 
 resolve-btfids-flags-y :=
 resolve-btfids-flags-$(CONFIG_WERROR) += --fatal_warnings
+resolve-btfids-flags-$(CONFIG_CLANG_PLUGIN_FMODRET_CANDIDATES) += --fmodret_candidates
+resolve-btfids-flags-$(CONFIG_GCC_PLUGIN_FMODRET_CANDIDATES) += --fmodret_candidates
 resolve-btfids-flags-$(if $(KBUILD_EXTMOD),y) += --distill_base
 resolve-btfids-flags-$(if $(KBUILD_VERBOSE),y) += --verbose
 

@@ -7,7 +7,7 @@
 # Kernel BTF generation involves these conceptual steps:
 #   1. pahole generates BTF from DWARF data
 #   2. resolve_btfids applies kernel-specific btf2btf
-#      transformations and computes data for .BTF_ids section
+#      transformations and computes .BTF_ids and .BTF_fmodret_ids data
 #   3. the result gets linked/objcopied into the target binary
 #
 # How step (3) should be done differs between vmlinux, and
@@ -15,12 +15,13 @@
 # of this script.
 #
 # For modules the script expects vmlinux passed in as --btf_base.
-# Generated .BTF, .BTF.base and .BTF_ids sections become embedded
-# into the input ELF file with objcopy.
+# Generated .BTF, .BTF.base, .BTF_ids and .BTF_fmodret_ids sections
+# become embedded into the input ELF file with objcopy.
 #
-# For vmlinux the input file remains unchanged and two files are produced:
-#   - ${1}.btf.o ready for linking into vmlinux
+# For vmlinux the input file remains unchanged and these files are produced:
+#   - ${1}.btf.o with .BTF and any .BTF_fmodret_ids data, ready for linking
 #   - ${1}.BTF_ids with .BTF_ids data blob
+#   - ${1}.BTF_fmodret_ids with the optional fmodret ID set
 # This output is consumed by scripts/link-vmlinux.sh
 
 set -e
@@ -84,15 +85,15 @@ gen_btf_data()
 gen_btf_o()
 {
 	btf_data=${ELF_FILE}.btf.o
+	btf_o_sections="--only-section=.BTF"
 
-	# Create ${btf_data} which contains just BTF sections but no symbols. Add
-	# SHF_ALLOC because .BTF will be part of the vmlinux image. --strip-all
-	# deletes all symbols including __start_BTF and __stop_BTF, which will
-	# be redefined in the linker script.
+	# Create ${btf_data} with BTF sections and any generated fmodret IDs.
+	# Mark the sections SHF_ALLOC for the vmlinux image. --strip-all removes
+	# symbols, including __start_BTF and __stop_BTF, which the linker script
+	# redefines.
 	echo "" | ${CC} ${CLANG_FLAGS} ${KBUILD_CPPFLAGS} ${KBUILD_CFLAGS} -fno-lto -c -x c -o ${btf_data} -
 	${OBJCOPY} --add-section .BTF=${ELF_FILE}.BTF \
 		--set-section-flags .BTF=alloc,readonly ${btf_data}
-	ONLY_SEC="--only-section=.BTF"
 	btf_inline=${ELF_FILE}.BTF.inline
 	if [ "${BTF_INLINE}" = "m" ]; then
 		if [ -f "${btf_inline}" ]; then
@@ -104,9 +105,15 @@ gen_btf_o()
 	if [ "${BTF_INLINE}" = "y" ] && [ -f "${btf_inline}" ]; then
 		${OBJCOPY} --add-section .BTF.inline=${btf_inline} \
 			--set-section-flags .BTF.inline=alloc,readonly ${btf_data}
-		ONLY_SEC="${ONLY_SEC} --only-section=.BTF.inline"
+		btf_o_sections="${btf_o_sections} --only-section=.BTF.inline"
 	fi
-	${OBJCOPY} ${ONLY_SEC} --strip-all ${btf_data}
+	if [ -f "${ELF_FILE}.BTF_fmodret_ids" ]; then
+		${OBJCOPY} --add-section .BTF_fmodret_ids=${ELF_FILE}.BTF_fmodret_ids \
+			--set-section-flags .BTF_fmodret_ids=alloc,readonly ${btf_data}
+		${OBJCOPY} --set-section-alignment .BTF_fmodret_ids=8 ${btf_data}
+		btf_o_sections="${btf_o_sections} --only-section=.BTF_fmodret_ids"
+	fi
+	${OBJCOPY} ${btf_o_sections} --strip-all ${btf_data}
 
 	# Change e_type to ET_REL so that it can be used to link final vmlinux.
 	# GNU ld 2.35+ and lld do not allow an ET_EXEC input.
@@ -140,6 +147,11 @@ embed_btf_data()
 	if [ -f "${btf_ids}" ]; then
 		${RESOLVE_BTFIDS} --patch_btfids ${btf_ids} ${ELF_FILE}
 	fi
+	if [ -f "${ELF_FILE}.BTF_fmodret_ids" ]; then
+		${OBJCOPY} --add-section .BTF_fmodret_ids=${ELF_FILE}.BTF_fmodret_ids \
+			--set-section-flags .BTF_fmodret_ids=alloc,readonly ${ELF_FILE}
+		${OBJCOPY} --set-section-alignment .BTF_fmodret_ids=8 ${ELF_FILE}
+	fi
 }
 
 cleanup()
@@ -151,6 +163,7 @@ cleanup()
 	if [ "${BTFGEN_MODE}" = "module" ]; then
 		rm -f "${ELF_FILE}.BTF.base"
 		rm -f "${ELF_FILE}.BTF_ids"
+		rm -f "${ELF_FILE}.BTF_fmodret_ids"
 	fi
 }
 trap cleanup EXIT

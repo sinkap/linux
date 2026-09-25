@@ -91,6 +91,9 @@
 #include <bpf/libbpf.h>
 #include "btf_colors.h"
 #include <subcmd/parse-options.h>
+#include <subcmd/run-command.h>
+
+#include "fmodret.h"
 
 #define BTF_IDS_SECTION	".BTF_ids"
 #define BTF_LINK_MODULE_NAME_MAX	64
@@ -2075,6 +2078,23 @@ out:
 	return err;
 }
 
+static int remove_fmodret_candidates(const char *elf_path)
+{
+	const char *argv[] = {
+		getenv("OBJCOPY") ?: "objcopy",
+		"--remove-section=.BTF_fmodret_candidates",
+		"--",
+		elf_path,
+		NULL,
+	};
+	int err;
+
+	err = run_command_v_opt(argv, 0);
+	if (err)
+		pr_err("FAILED to remove fmod-ret candidates from %s\n", elf_path);
+	return err;
+}
+
 static const char * const resolve_btfids_usage[] = {
 	"resolve_btfids [<options>] <ELF object>",
 	"resolve_btfids --patch_btfids <.BTF_ids file> [--btf_link <section:module:btf-file>] <ELF object>",
@@ -2097,6 +2117,7 @@ int main(int argc, const char **argv)
 	const char *btfids_path = NULL;
 	struct btf_links btf_links = {};
 	bool fatal_warnings = false;
+	bool fmodret_candidates = false;
 	bool resolve_btfids = true;
 	char out_path[PATH_MAX];
 
@@ -2109,6 +2130,8 @@ int main(int argc, const char **argv)
 			   "path of file providing base BTF"),
 		OPT_BOOLEAN(0, "fatal_warnings", &fatal_warnings,
 			    "turn warnings into errors"),
+		OPT_BOOLEAN(0, "fmodret_candidates", &fmodret_candidates,
+			    "generate IDs for fmod_ret candidates"),
 		OPT_BOOLEAN(0, "distill_base", &obj.distill_base,
 			    "distill --btf_base and emit .BTF.base section data"),
 		OPT_BOOLEAN(0, "inline", &obj.extract_inline,
@@ -2177,6 +2200,19 @@ int main(int argc, const char **argv)
 	if (finalize_btf(&obj))
 		goto out;
 
+	err = make_out_path(out_path, sizeof(out_path), obj.path,
+			    ".BTF_fmodret_ids");
+	if (err)
+		goto out;
+	if (fmodret_candidates)
+		err = fmodret_ids_generate(obj.path, obj.btf,
+					   obj.efile.encoding, out_path,
+					   verbose);
+	else if (unlink(out_path) && errno != ENOENT)
+		err = -errno;
+	if (err)
+		goto out;
+
 	if (!resolve_btfids)
 		goto dump_btf;
 
@@ -2233,5 +2269,7 @@ out:
 		elf_end(obj.efile.elf);
 		close(obj.efile.fd);
 	}
+	if (!err)
+		err = remove_fmodret_candidates(obj.path);
 	return err;
 }
