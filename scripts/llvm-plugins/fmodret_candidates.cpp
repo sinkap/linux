@@ -148,6 +148,47 @@ static bool isErrnoConstant(const Value *V)
 	return N >= -MaxErrno && N < 0;
 }
 
+// XXX this is next
+// XXX draw the picture with CleanBBs and Seen
+static bool valueMayBeErrno(Value *V,
+			    BasicBlock *BB,
+			    LazyValueInfo &LVI,
+			    DominatorTree &DT, // XXX theory: what is DominatorTree exactly
+			    const SmallPtrSetImpl<BasicBlock *> &CleanBBs,
+			    SmallPtrSetImpl<const Value *> &Seen,
+			    unsigned Depth)
+{
+	if (!V || Depth == MaxValueDepth)
+		return false;
+
+	if (isErrnoConstant(V) || dominatedByIsErr(V, BB, DT))
+		return true;
+
+	if (!Seen.insert(V).second) // XXX: is there a "exists" alternative? I don't like "insert"; XXX also should it go here or before returning true above?
+		return false;
+
+	if (auto *Phi = dyn_cast<PHINode>(V)) {
+		for (unsigned i = 0; i < Phi->getNumIncomingValues(); i++) {
+			Value *Incoming = Phi->getIncomingValue(i);
+			BasicBlock *Pred = Phi->getIncomingBlock(i);
+
+			if (!CleanBBs.contains(Pred))
+				continue;
+
+			if (Incoming->getType()->isIntegerTy() &&
+			    isErrnoRange(LVI.getConstantRangeOnEdge(Incoming, Pred, Phi->getParent()))) // why do we know the range here? Because of isIntegerTy()?
+				return true;
+
+			if (valueMayBeErrno(Incoming, Pred, LVI, DT, CleanBBs, Seen, Depth + 1))
+				return true;
+		}
+	}
+	Seen.erase(V); // XXX why erase?
+	return false;
+}
+
+// review above this XXX
+
 // XXX: I still do not understand precisely what it does
 static bool isCleanInstruction(const Instruction &I)
 {
@@ -205,9 +246,9 @@ static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI, Dominator
 		if (!Return || !Return->getReturnValue())
 			continue;
 
+		SmallPtrSet<const Value *, 32> Seen;
 		if (rangeAtUseIsErrno(Return->getOperandUse(0), LVI) ||
-		    isErrnoConstant(Return->getReturnValue()) ||
-		    dominatedByIsErr(Return->getReturnValue(), BB, DT))
+		    valueMayBeErrno(Return->getReturnValue(), BB, LVI, DT, CleanBBs, Seen, 0))
 			return true;
 	}
 	return false;
