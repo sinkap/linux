@@ -2,6 +2,7 @@
 
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/IR/Analysis.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
@@ -17,6 +18,27 @@
 using namespace llvm;
 
 static constexpr unsigned MaxErrno = 4095;
+
+// is Range in [-4095, 0) ?
+static bool isErrnoRange(const ConstantRange &Range)
+{
+	unsigned Width = Range.getBitWidth();
+
+	if (Width != 32 && Width != 64)
+		return false;
+
+	auto L = APInt(Width, 0) - APInt(Width, MaxErrno);
+	auto R = APInt(Width, 0);
+	return !Range.isEmptySet() && ConstantRange(L, R).contains(Range);
+}
+
+static bool rangeAtUseIsErrno(const Use &U, LazyValueInfo &LVI)
+{
+	Value *V = U.get();
+
+	return V->getType()->isIntegerTy() &&
+	       isErrnoRange(LVI.getConstantRangeAtUse(U, false));
+}
 
 static bool isErrnoConstant(const Value *V)
 {
@@ -57,7 +79,7 @@ static bool cleanBB(BasicBlock *BB)
 	return true;
 }
 
-static bool functionHasCleanErrnoPath(Function &F)
+static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI)
 {
 	SmallPtrSet<BasicBlock *, 32> CleanEntries; // XXX: don't like 32
 	SmallPtrSet<BasicBlock *, 32> CleanBBs;
@@ -87,7 +109,8 @@ static bool functionHasCleanErrnoPath(Function &F)
 		if (!Return || !Return->getReturnValue())
 			continue;
 
-		if (isErrnoConstant(Return->getReturnValue()))
+		if (rangeAtUseIsErrno(Return->getOperandUse(0), LVI) ||
+		    isErrnoConstant(Return->getReturnValue()))
 			return true;
 	}
 	return false;
@@ -110,7 +133,7 @@ static void emitCandidates(Module &M, ArrayRef<Constant *> Fns)
 class FmodretCandidatesPass : public PassInfoMixin<FmodretCandidatesPass>
 {
 public:
-	PreservedAnalyses run(Module &M, ModuleAnalysisManager &)
+	PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM)
 	{
 		// LTO can run this twice, do a smarter processing later,
 		// for now do not duplicate the section
@@ -118,6 +141,7 @@ public:
 			return PreservedAnalyses::all();
 
 		SmallVector<Constant *> Fns; // XXX: why small vector? Is 10K small?
+		auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
 
 		for (Function &F : M) {
 			if (F.isDeclaration() ||
@@ -130,7 +154,8 @@ public:
 			if (Width != 32 && Width != 64)
 				continue;
 
-			if (functionHasCleanErrnoPath(F))
+			auto &LVI = FAM.getResult<LazyValueAnalysis>(F);
+			if (functionHasCleanErrnoPath(F, LVI))
 				Fns.push_back(&F);
 		}
 
@@ -141,7 +166,9 @@ public:
 		M.getOrInsertNamedMetadata("fmodret_candidates.done");
 
 		PreservedAnalyses PA;
+		PA.preserve<FunctionAnalysisManagerModuleProxy>();
 		PA.preserveSet<CFGAnalyses>();
+		PA.preserve<LazyValueAnalysis>();
 		return PA;
 	}
 
