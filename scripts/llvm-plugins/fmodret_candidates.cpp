@@ -182,6 +182,12 @@ static bool valueMayBeErrno(Value *V,
 			if (valueMayBeErrno(Incoming, Pred, LVI, DT, CleanBBs, Seen, Depth + 1))
 				return true;
 		}
+	} else if (auto *Cast = dyn_cast<CastInst>(V)) { // XXX what does this mean exactly?
+		// Zero extension does not preserve a negative bit pattern
+		if (!isa<ZExtInst>(Cast) &&
+		    (rangeAtUseIsErrno(Cast->getOperandUse(0), LVI) ||
+		     valueMayBeErrno(Cast->getOperand(0), BB, LVI, DT, CleanBBs, Seen, Depth + 1)))
+			return true;
 	}
 	Seen.erase(V); // XXX why erase?
 	return false;
