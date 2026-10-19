@@ -863,8 +863,7 @@
 		.debug_macro	0 : { *(.debug_macro) }			\
 		.debug_names	0 : { *(.debug_names) }			\
 		.debug_rnglists	0 : { *(.debug_rnglists) }		\
-		.debug_str_offsets	0 : { *(.debug_str_offsets) }	\
-		.BTF_fmodret_candidates 0 : { KEEP(*(.BTF_fmodret_candidates)) }
+		.debug_str_offsets	0 : { *(.debug_str_offsets) }
 
 /* Stabs debugging sections. */
 #define STABS_DEBUG							\
@@ -890,8 +889,10 @@
 		.shstrtab 0 : { *(.shstrtab) }				\
 		KLP_SYMID
 
+/* The candidate section resets the VMA, so place it after .modinfo. */
 #define MODINFO								\
-		.modinfo : { *(.modinfo) . = ALIGN(8); }
+		.modinfo : { *(.modinfo) . = ALIGN(8); }	\
+		.BTF_fmodret_candidates 0 (INFO) : { KEEP(*(.BTF_fmodret_candidates)) }
 
 #ifdef CONFIG_GENERIC_BUG
 #define BUG_TABLE							\

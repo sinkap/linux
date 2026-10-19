@@ -90,6 +90,11 @@ vmlinux_link()
 	fi
 
 	ldflags="${ldflags} ${wl}--script=${objtree}/${KBUILD_LDS}"
+	# Keep relocations for the non-allocatable candidate section.
+	if [ "${output}" = ".tmp_vmlinux1" ] &&
+	   is_enabled CONFIG_CLANG_PLUGIN_FMODRET_CANDIDATES; then
+		ldflags="${ldflags} ${wl}--emit-relocs"
+	fi
 
 	# The kallsyms linking does not need debug symbols included.
 	if [ -n "${strip_debug}" ] ; then
