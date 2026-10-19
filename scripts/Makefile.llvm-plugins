@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
+llvm-plugin-$(CONFIG_CLANG_PLUGIN_FMODRET_CANDIDATES) += fmodret_candidates.so
+
 LLVM_PLUGIN := $(llvm-plugin-y)
 LLVM_PLUGINS_CFLAGS := $(strip $(addprefix -fpass-plugin=$(objtree)/scripts/llvm-plugins/, $(LLVM_PLUGIN))) -DLLVM_PLUGINS
 export LLVM_PLUGIN LLVM_PLUGINS_CFLAGS

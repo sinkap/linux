@@ -12,4 +12,13 @@ menuconfig LLVM_PLUGINS
 
 if LLVM_PLUGINS
 
+config CLANG_PLUGIN_FMODRET_CANDIDATES
+	bool "Generate fmod_ret candidate metadata with LLVM"
+	depends on DEBUG_INFO_BTF
+	default y
+	help
+	  Emit compiler-derived references to functions which may return errno.
+	  The resolve_btfids tool uses this metadata to construct the fmod_ret
+	  allow-list.
+
 endif
