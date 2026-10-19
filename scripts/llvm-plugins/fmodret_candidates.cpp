@@ -7,6 +7,7 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -18,6 +19,101 @@
 using namespace llvm;
 
 static constexpr unsigned MaxErrno = 4095;
+static constexpr unsigned MaxValueDepth = 64;
+
+// XXX, here, I believe, we follow the chain to see if this was casted from a pointer
+static const Value *convertedPointer(const Value *V)
+{
+	for (unsigned Depth = 0; V && Depth < MaxValueDepth; Depth++) {
+		if (auto *C = dyn_cast<PtrToIntInst>(V))
+			return C->getPointerOperand();
+		if (auto *C = dyn_cast<CastInst>(V)) {
+			V = C->getOperand(0);
+			continue;
+		}
+		break;
+	}
+	return nullptr;
+}
+
+static bool matchesPointer(const Value *V, const Value *Pointer)
+{
+	return V == Pointer || convertedPointer(V) == Pointer;
+}
+
+static const ConstantInt *comparisonThreshold(const Value *V)
+{
+	if (auto *C = dyn_cast<ConstantInt>(V))
+		return C;
+	if (auto *Expr = dyn_cast<ConstantExpr>(V))
+		if (Expr->getOpcode() == Instruction::IntToPtr)
+			return dyn_cast<ConstantInt>(Expr->getOperand(0));
+	return nullptr;
+}
+
+static bool conditionImpliesIsErr(Value *Condition, bool Truth, const Value *Pointer)
+{
+	auto *Cmp = dyn_cast<ICmpInst>(Condition);
+	CmpInst::Predicate Pred;
+	const Value *Integer;
+	const ConstantInt *Threshold;
+	APInt Limit;
+
+	if (!Cmp)
+		return false;
+	Pred = Cmp->getPredicate();
+	Integer = Cmp->getOperand(0);
+	Threshold = comparisonThreshold(Cmp->getOperand(1));
+	if (!matchesPointer(Integer, Pointer)) {
+		Integer = Cmp->getOperand(1);
+		Threshold = comparisonThreshold(Cmp->getOperand(0));
+		Pred = CmpInst::getSwappedPredicate(Pred);
+	}
+	if (!Threshold || !matchesPointer(Integer, Pointer))
+		return false;
+	if (Threshold->getBitWidth() != 32 && Threshold->getBitWidth() != 64)
+		return false;
+	if (!Truth)
+		Pred = CmpInst::getInversePredicate(Pred);
+	if (Pred != CmpInst::ICMP_UGE && Pred != CmpInst::ICMP_UGT)
+		return false;
+
+	Limit = APInt(Threshold->getBitWidth(), 0) -
+		APInt(Threshold->getBitWidth(), MaxErrno);
+	if (Pred == CmpInst::ICMP_UGT)
+		--Limit;
+	return Threshold->getValue().uge(Limit);
+}
+
+// XXX this is we are checking if (IS_ERR(ptr)) --> return PTR_ERR(ptr), but how?
+static bool dominatedByIsErr(const Value *V, BasicBlock *BB, DominatorTree &DT)
+{
+	const Value *Pointer = convertedPointer(V);
+
+	if (!Pointer)
+		return false;
+
+	while (BB) {
+		BasicBlock *Dom = DT.getNode(BB)->getIDom() ?
+			DT.getNode(BB)->getIDom()->getBlock() : nullptr;
+		auto *Branch = Dom ? dyn_cast<BranchInst>(Dom->getTerminator()) : nullptr;
+		bool TruePath, FalsePath;
+
+		if (!Dom)
+			break;
+		if (!Branch || !Branch->isConditional()) {
+			BB = Dom;
+			continue;
+		}
+		TruePath = DT.dominates(Branch->getSuccessor(0), BB);
+		FalsePath = DT.dominates(Branch->getSuccessor(1), BB);
+		if (TruePath != FalsePath &&
+		    conditionImpliesIsErr(Branch->getCondition(), TruePath, Pointer))
+			return true;
+		BB = Dom;
+	}
+	return false;
+}
 
 // is Range in [-4095, 0) ?
 static bool isErrnoRange(const ConstantRange &Range)
@@ -79,7 +175,7 @@ static bool cleanBB(BasicBlock *BB)
 	return true;
 }
 
-static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI)
+static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI, DominatorTree &DT)
 {
 	SmallPtrSet<BasicBlock *, 32> CleanEntries; // XXX: don't like 32
 	SmallPtrSet<BasicBlock *, 32> CleanBBs;
@@ -110,7 +206,8 @@ static bool functionHasCleanErrnoPath(Function &F, LazyValueInfo &LVI)
 			continue;
 
 		if (rangeAtUseIsErrno(Return->getOperandUse(0), LVI) ||
-		    isErrnoConstant(Return->getReturnValue()))
+		    isErrnoConstant(Return->getReturnValue()) ||
+		    dominatedByIsErr(Return->getReturnValue(), BB, DT))
 			return true;
 	}
 	return false;
@@ -155,7 +252,8 @@ public:
 				continue;
 
 			auto &LVI = FAM.getResult<LazyValueAnalysis>(F);
-			if (functionHasCleanErrnoPath(F, LVI))
+			auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+			if (functionHasCleanErrnoPath(F, LVI, DT))
 				Fns.push_back(&F);
 		}
 
