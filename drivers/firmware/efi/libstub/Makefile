@@ -7,7 +7,7 @@
 #
 
 # non-x86 reuses KBUILD_CFLAGS, x86 does not
-cflags-y			:= $(KBUILD_CFLAGS)
+cflags-y			:= $(filter-out $(LLVM_PLUGINS_CFLAGS),$(KBUILD_CFLAGS))
 
 cflags-$(CONFIG_X86_32)		:= -march=i386
 cflags-$(CONFIG_X86_64)		:= -mcmodel=small
