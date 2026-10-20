@@ -57,6 +57,19 @@ objtool-args = $(vmlinux-objtool-args-y) --link
 
 vmlinux-o-ld-args-$(CONFIG_BUILTIN_MODULE_RANGES)	+= -Map=$@.map
 
+# The fmod_ret candidates LLVM plugin emits .BTF_fmodret_candidates as
+# allocated data.  The linker scripts put it in a non-allocated (INFO)
+# output section at address 0, but lld still turns the function pointers
+# of allocated input sections into dynamic relocations, so a -shared
+# vmlinux (arm64, riscv) gets RELR/RELA entries against that zero address
+# which the boot-time relocator applies.  Clear SHF_ALLOC here, and
+# link-vmlinux.sh links from vmlinux.o when the plugin is enabled, so
+# every vmlinux link resolves the references statically; .tmp_vmlinux1
+# keeps them as relocations (--emit-relocs) for resolve_btfids.
+ifdef CONFIG_CLANG_PLUGIN_FMODRET_CANDIDATES
+cmd_fmodret_noalloc = ; $(OBJCOPY) --set-section-flags .BTF_fmodret_candidates=contents,readonly $@
+endif
+
 quiet_cmd_ld_vmlinux.o = LD      $@
       cmd_ld_vmlinux.o = \
 	$(LD) ${KBUILD_LDFLAGS} -r -o $@ \
@@ -64,7 +77,8 @@ quiet_cmd_ld_vmlinux.o = LD      $@
 	$(addprefix -T , $(initcalls-lds)) \
 	--whole-archive vmlinux.a --no-whole-archive \
 	--start-group $(KBUILD_VMLINUX_LIBS) --end-group \
-	$(cmd_objtool)
+	$(cmd_objtool) \
+	$(cmd_fmodret_noalloc)
 
 cmd_check_function_names = $(srctree)/scripts/check-function-names.sh $@
 

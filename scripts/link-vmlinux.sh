@@ -61,8 +61,11 @@ vmlinux_link()
 	shift
 
 	if is_enabled CONFIG_LTO_CLANG || is_enabled CONFIG_X86_KERNEL_IBT ||
-	   is_enabled CONFIG_KLP_BUILD; then
+	   is_enabled CONFIG_KLP_BUILD ||
+	   is_enabled CONFIG_CLANG_PLUGIN_FMODRET_CANDIDATES; then
 		# Use vmlinux.o instead of performing the slow LTO link again.
+		# The fmod_ret candidates are non-allocated only in vmlinux.o,
+		# see scripts/Makefile.vmlinux_o.
 		objs=vmlinux.o
 		libs=
 	else
