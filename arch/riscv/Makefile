@@ -109,6 +109,12 @@ KBUILD_AFLAGS += $(call as-option,-Wa$(comma)-mno-arch-attr)
 KBUILD_CFLAGS_MODULE += $(call cc-option,-mno-relax)
 KBUILD_AFLAGS_MODULE += $(call as-option,-Wa$(comma)-mno-relax)
 
+# LLVM 20 runs GlobalMerge on RISC-V by default and folds static globals,
+# per-CPU ones included, into .L_MergedGlobals with the old names left as
+# aliases.  pahole then describes both at the same .data..percpu offset and
+# the kernel rejects vmlinux BTF as invalid.
+KBUILD_CFLAGS += $(call cc-option,-mllvm -riscv-enable-global-merge=false)
+
 # GCC versions that support the "-mstrict-align" option default to allowing
 # unaligned accesses.  While unaligned accesses are explicitly allowed in the
 # RISC-V ISA, they're emulated by machine mode traps on all extant
