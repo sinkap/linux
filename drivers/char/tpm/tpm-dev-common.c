@@ -13,6 +13,7 @@
  * Device file system interface to the TPM
  */
 #include <linux/poll.h>
+#include <linux/security.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
@@ -171,6 +172,7 @@ ssize_t tpm_common_write(struct file *file, const char __user *buf,
 			 size_t size, loff_t *off)
 {
 	struct file_priv *priv = file->private_data;
+	struct tpm_header *header;
 	int ret = 0;
 
 	if (size > TPM_BUFSIZE)
@@ -193,11 +195,17 @@ ssize_t tpm_common_write(struct file *file, const char __user *buf,
 		goto out;
 	}
 
-	if (size < 6 ||
-	    size < be32_to_cpu(*((__be32 *)(priv->data_buffer + 2)))) {
+	header = (struct tpm_header *)priv->data_buffer;
+	if (size < sizeof(*header) ||
+	    be32_to_cpu(header->length) < sizeof(*header) ||
+	    size < be32_to_cpu(header->length)) {
 		ret = -EINVAL;
 		goto out;
 	}
+
+	ret = security_tpm_command(file, be32_to_cpu(header->ordinal));
+	if (ret)
+		goto out;
 
 	priv->response_length = 0;
 	priv->response_read = false;

@@ -2393,6 +2393,21 @@ int security_file_permission(struct file *file, int mask)
 }
 
 /**
+ * security_tpm_command() - Check a userspace TPM command
+ * @file: TPM device file
+ * @command: TPM command code
+ *
+ * Check a command before the TPM driver queues or sends it.
+ *
+ * Return: Returns 0 if permission is granted.
+ */
+int security_tpm_command(struct file *file, u32 command)
+{
+	return call_int_hook(tpm_command, file, command);
+}
+EXPORT_SYMBOL_GPL(security_tpm_command);
+
+/**
  * security_file_alloc() - Allocate and init a file's LSM blob
  * @file: the file
  *

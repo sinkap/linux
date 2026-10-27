@@ -470,6 +470,7 @@ int security_inode_setintegrity(const struct inode *inode,
 int security_kernfs_init_security(struct kernfs_node *kn_dir,
 				  struct kernfs_node *kn);
 int security_file_permission(struct file *file, int mask);
+int security_tpm_command(struct file *file, u32 command);
 int security_file_alloc(struct file *file);
 void security_file_release(struct file *file);
 void security_file_free(struct file *file);
@@ -1136,6 +1137,11 @@ static inline int security_inode_copy_up_xattr(struct dentry *src, const char *n
 }
 
 static inline int security_file_permission(struct file *file, int mask)
+{
+	return 0;
+}
+
+static inline int security_tpm_command(struct file *file, u32 command)
 {
 	return 0;
 }
